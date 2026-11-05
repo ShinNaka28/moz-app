@@ -24,6 +24,8 @@ interface ToolbarProps {
   hasKeyframeAtCurrentTime: boolean;
   onRunAIFaceDetection: () => void;
   isAIDetecting: boolean;
+  isPreviewMode: boolean;
+  onTogglePreviewMode: () => void;
 }
 
 export const Toolbar: React.FC<ToolbarProps> = ({
@@ -36,6 +38,8 @@ export const Toolbar: React.FC<ToolbarProps> = ({
   hasKeyframeAtCurrentTime,
   onRunAIFaceDetection,
   isAIDetecting,
+  isPreviewMode,
+  onTogglePreviewMode,
 }) => {
   return (
     <div className="bg-slate-900 border-b border-slate-800 px-3 py-2 flex flex-wrap items-center justify-between gap-2 text-xs">
@@ -103,6 +107,21 @@ export const Toolbar: React.FC<ToolbarProps> = ({
         >
           <UserCheck size={14} />
           <span>{isAIDetecting ? 'AI解析中...' : 'AI顔自動検出'}</span>
+        </button>
+
+        <div className="w-px h-5 bg-slate-800 mx-1" />
+
+        <button
+          onClick={onTogglePreviewMode}
+          className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-md font-semibold transition ${
+            isPreviewMode
+              ? 'bg-amber-600 text-white shadow'
+              : 'bg-slate-900 hover:bg-slate-800 text-slate-300 border border-slate-800'
+          }`}
+          title="編集ガイド枠や選択枠を隠して、完成時の見た目のまま再生・確認します"
+        >
+          {isPreviewMode ? <EyeOff size={14} /> : <Eye size={14} />}
+          <span>{isPreviewMode ? 'ガイド表示に戻す' : '枠非表示プレビュー'}</span>
         </button>
       </div>
 

@@ -1,5 +1,5 @@
 import React from 'react';
-import { ShieldCheck, Video, Image as ImageIcon, Sparkles, Download } from 'lucide-react';
+import { ShieldCheck, Video, Image as ImageIcon, Sparkles, Download, PlayCircle } from 'lucide-react';
 
 interface HeaderProps {
   onOpenFile: (e: React.ChangeEvent<HTMLInputElement>) => void;
@@ -68,9 +68,10 @@ export const Header: React.FC<HeaderProps> = ({
           onClick={onExport}
           disabled={!hasMedia || isProcessing}
           className="flex items-center gap-1.5 px-3.5 py-1.5 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 disabled:opacity-40 disabled:cursor-not-allowed text-white text-xs font-bold rounded-lg transition shadow-md"
+          title="完成動画をローカル生成し、プレビュー確認後にダウンロードします"
         >
-          <Download size={14} />
-          <span>書き出し</span>
+          <PlayCircle size={15} />
+          <span>プレビュー＆保存</span>
         </button>
       </div>
     </header>

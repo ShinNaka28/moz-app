@@ -12,6 +12,7 @@ interface VideoCanvasProps {
   editorMode: EditorMode;
   currentTime: number;
   isPlaying: boolean;
+  isPreviewMode?: boolean;
   onSelectTrack: (id: string | null) => void;
   onAddTrack: (newTrack: MosaicTrack) => void;
   onUpdateTrackKeyframe: (trackId: string, box: { x: number; y: number; width: number; height: number; points?: Point[] }) => void;
@@ -28,6 +29,7 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
   editorMode,
   currentTime,
   isPlaying,
+  isPreviewMode = false,
   onSelectTrack,
   onAddTrack,
   onUpdateTrackKeyframe,
@@ -167,21 +169,23 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
       }
     }
 
-    // 各トラックのオーバーレイ（選択枠・ラベル・ハンドル）を描画
-    for (const track of tracks) {
-      if (currentTime < track.startTime || currentTime > track.endTime) continue;
-      if (track.trackingData?.isOutOfFrame) continue;
+    // 各トラックのオーバーレイ（選択枠・ラベル・ハンドル）を描画（プレビューモード時は非表示）
+    if (!isPreviewMode) {
+      for (const track of tracks) {
+        if (currentTime < track.startTime || currentTime > track.endTime) continue;
+        if (track.trackingData?.isOutOfFrame) continue;
 
-      const pos = interpolateKeyframes(track.keyframes, currentTime);
-      if (pos) {
-        const isSelected = track.id === selectedTrackId;
-        const hasKey = track.keyframes.some((k) => Math.abs(k.time - currentTime) < 0.1);
-        renderTrackOverlay(ctx, track, pos, isSelected, hasKey);
+        const pos = interpolateKeyframes(track.keyframes, currentTime);
+        if (pos) {
+          const isSelected = track.id === selectedTrackId;
+          const hasKey = track.keyframes.some((k) => Math.abs(k.time - currentTime) < 0.1);
+          renderTrackOverlay(ctx, track, pos, isSelected, hasKey);
+        }
       }
     }
 
     // 現在描画中のガイド（矩形、ブラシ、ポリゴン）
-    if (drawingState && drawingState.isDrawing) {
+    if (!isPreviewMode && drawingState && drawingState.isDrawing) {
       ctx.save();
       ctx.strokeStyle = '#38bdf8';
       ctx.fillStyle = 'rgba(56, 189, 248, 0.25)';

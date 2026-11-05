@@ -24,6 +24,7 @@ export const App: React.FC = () => {
   const [tracks, setTracks] = useState<MosaicTrack[]>([]);
   const [selectedTrackId, setSelectedTrackId] = useState<string | null>(null);
   const [editorMode, setEditorMode] = useState<EditorMode>('select');
+  const [isPreviewMode, setIsPreviewMode] = useState<boolean>(false);
 
   // AIおよびエクスポート進行状態
   const [isAIDetecting, setIsAIDetecting] = useState<boolean>(false);
@@ -478,6 +479,8 @@ export const App: React.FC = () => {
         hasKeyframeAtCurrentTime={hasKeyframeAtCurrentTime}
         onRunAIFaceDetection={handleRunAIFaceDetection}
         isAIDetecting={isAIDetecting}
+        isPreviewMode={isPreviewMode}
+        onTogglePreviewMode={() => setIsPreviewMode((prev) => !prev)}
       />
 
       {/* メインプレビュー＆サイドパネルエリア */}
@@ -524,6 +527,7 @@ export const App: React.FC = () => {
               editorMode={editorMode}
               currentTime={currentTime}
               isPlaying={isPlaying}
+              isPreviewMode={isPreviewMode}
               onSelectTrack={setSelectedTrackId}
               onAddTrack={handleAddTrack}
               onUpdateTrackKeyframe={handleUpdateTrackKeyframe}
@@ -562,12 +566,13 @@ export const App: React.FC = () => {
         />
       )}
 
-      {/* エクスポート進行モーダル */}
+      {/* エクスポート進行＆完成プレビューモーダル */}
       <ExportModal
         isOpen={isExportModalOpen}
         onClose={() => setIsExportModalOpen(false)}
         progress={exportProgress}
         exportedBlob={exportedBlob}
+        isImage={isImage}
       />
     </div>
   );
