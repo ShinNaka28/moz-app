@@ -5,11 +5,12 @@ import { VideoCanvas } from './components/VideoCanvas';
 import { Timeline } from './components/Timeline';
 import { PersonListPanel } from './components/PersonListPanel';
 import { ExportModal } from './components/ExportModal';
-import { EditorMode, MosaicTrack, Point } from './types';
-import { initFaceDetector, updatePersonTracks } from './utils/aiDetector';
+import { EditorMode, MosaicTrack, MosaicType, Point, Keyframe } from './types';
+import { initFaceDetector, updatePersonTracks, expandBoxWithMargin } from './utils/aiDetector';
 import { exportMosaicVideo, ExportProgress, saveOrShareBlob } from './utils/videoExporter';
 import { generateDemoVideoBlob } from './utils/sampleGenerator';
-import { renderTrackMosaic } from './utils/mosaicRenderer';
+import { renderTrackMosaic, renderInverseMosaic, ProtectedRegion } from './utils/mosaicRenderer';
+import { extractFeaturePoints, toGrayscale, trackBox } from './utils/tracking';
 
 export const App: React.FC = () => {
   // メディア状態
@@ -26,8 +27,14 @@ export const App: React.FC = () => {
   const [editorMode, setEditorMode] = useState<EditorMode>('select');
   const [isPreviewMode, setIsPreviewMode] = useState<boolean>(false);
 
+  // 反転モザイク（選択した人物やPC画面以外の『背景全体』にモザイクをかける機能）
+  const [isInverseMosaic, setIsInverseMosaic] = useState<boolean>(false);
+  const [inverseMosaicType, setInverseMosaicType] = useState<MosaicType>('blur');
+  const [inverseStrength, setInverseStrength] = useState<number>(18);
+
   // AIおよびエクスポート進行状態
   const [isAIDetecting, setIsAIDetecting] = useState<boolean>(false);
+  const [isTrackingProcessing, setIsTrackingProcessing] = useState<boolean>(false);
   const [exportProgress, setExportProgress] = useState<ExportProgress | null>(null);
   const [exportedBlob, setExportedBlob] = useState<Blob | null>(null);
   const [isExportModalOpen, setIsExportModalOpen] = useState<boolean>(false);
@@ -119,6 +126,13 @@ export const App: React.FC = () => {
   const handleAddTrack = (newTrack: MosaicTrack) => {
     setTracks((prev) => [...prev, newTrack]);
     setSelectedTrackId(newTrack.id);
+
+    // ユーザー指定追跡トラックの場合、直後に自動追従解析を実行
+    if (!isImage && newTrack.type === 'tracked') {
+      setTimeout(() => {
+        runTrackingForTrack(newTrack.id, newTrack);
+      }, 50);
+    }
   };
 
   // トラック削除
@@ -127,7 +141,7 @@ export const App: React.FC = () => {
     if (selectedTrackId === id) setSelectedTrackId(null);
   };
 
-  // トラック更新
+  // トラック設定更新
   const handleUpdateTrackSettings = (updates: Partial<MosaicTrack>) => {
     if (!selectedTrackId) return;
     setTracks((prev) =>
@@ -182,8 +196,7 @@ export const App: React.FC = () => {
     const track = tracks.find((t) => t.id === selectedTrackId);
     if (!track) return;
 
-    // 現在の補間位置を取得しキーフレームとして固定
-    const pos = track.keyframes[0]; // 直近
+    const pos = track.keyframes[0];
     if (!pos) return;
 
     setTracks((prev) =>
@@ -216,7 +229,6 @@ export const App: React.FC = () => {
       prev.map((t) => {
         if (t.id !== trackId) return t;
 
-        // 既存のキーフレームのうち、現在時刻に近いものを更新、なければ追加
         const existingIdx = t.keyframes.findIndex(
           (k) => Math.abs(k.time - currentTime) < 0.15
         );
@@ -260,7 +272,106 @@ export const App: React.FC = () => {
     );
   };
 
-  // MediaPipe によるAI人物・顔の自動検出＆追跡
+  // 高精度・自動追従区間解析（大域探索SAD + Lucas-Kanade + Median Flow）
+  const runTrackingForTrack = async (targetTrackId: string, currentTrackData?: MosaicTrack) => {
+    if (!videoRef.current || isImage) return;
+    const track = currentTrackData || tracks.find((t) => t.id === targetTrackId);
+    if (!track || track.keyframes.length === 0) return;
+
+    setIsTrackingProcessing(true);
+    const video = videoRef.current;
+    const origTime = video.currentTime;
+    const width = video.videoWidth;
+    const height = video.videoHeight;
+
+    const offCanvas = document.createElement('canvas');
+    offCanvas.width = width;
+    offCanvas.height = height;
+    const offCtx = offCanvas.getContext('2d', { willReadFrequently: true })!;
+
+    try {
+      const startT = track.startTime;
+      const endT = track.endTime;
+      const step = 0.08; // 12.5fpsの高密度サンプリング
+
+      // 開始フレームにシーク
+      video.currentTime = startT;
+      await new Promise<void>((r) => {
+        const onSeeked = () => {
+          video.removeEventListener('seeked', onSeeked);
+          r();
+        };
+        video.addEventListener('seeked', onSeeked);
+      });
+
+      offCtx.drawImage(video, 0, 0, width, height);
+      let prevGray = toGrayscale(offCtx.getImageData(0, 0, width, height));
+
+      const initialPos = track.keyframes[0];
+      let curBox = { x: initialPos.x, y: initialPos.y, width: initialPos.width, height: initialPos.height };
+      let featPoints = extractFeaturePoints(prevGray, width, height, curBox, 36);
+
+      const generatedKeyframes: Keyframe[] = [
+        {
+          time: startT,
+          x: curBox.x,
+          y: curBox.y,
+          width: curBox.width,
+          height: curBox.height,
+          points: initialPos.points,
+        },
+      ];
+
+      const totalSteps = Math.floor((endT - startT) / step);
+      for (let s = 1; s <= totalSteps; s++) {
+        const curT = Math.min(endT, startT + s * step);
+        video.currentTime = curT;
+
+        await new Promise<void>((r) => {
+          const onSeeked = () => {
+            video.removeEventListener('seeked', onSeeked);
+            r();
+          };
+          video.addEventListener('seeked', onSeeked);
+        });
+
+        offCtx.drawImage(video, 0, 0, width, height);
+        const currGray = toGrayscale(offCtx.getImageData(0, 0, width, height));
+
+        const res = trackBox(curBox, featPoints, prevGray, currGray, width, height);
+        if (res.isOutOfFrame) {
+          break;
+        }
+
+        curBox = res.newBox;
+        featPoints = res.newPoints;
+        prevGray = currGray;
+
+        generatedKeyframes.push({
+          time: curT,
+          x: curBox.x,
+          y: curBox.y,
+          width: curBox.width,
+          height: curBox.height,
+          points: initialPos.points?.map((p) => ({
+            x: p.x + (curBox.x - initialPos.x),
+            y: p.y + (curBox.y - initialPos.y),
+          })),
+        });
+      }
+
+      setTracks((prev) =>
+        prev.map((t) => (t.id === targetTrackId ? { ...t, keyframes: generatedKeyframes } : t))
+      );
+    } catch (err) {
+      console.error('Auto tracking failed', err);
+    } finally {
+      video.currentTime = origTime;
+      setIsTrackingProcessing(false);
+    }
+  };
+
+  // MediaPipe による高密度・AI人物顔自動検出＆追跡（安全マージン付き）
   const handleRunAIFaceDetection = async () => {
     if (!videoRef.current && !imageRef.current) return;
     setIsAIDetecting(true);
@@ -273,10 +384,15 @@ export const App: React.FC = () => {
         const result = detector.detect(imageRef.current);
         const newAITracks: MosaicTrack[] = (result.detections || []).map((det, idx) => {
           const bb = det.boundingBox;
-          const x = bb ? bb.originX : 0;
-          const y = bb ? bb.originY : 0;
-          const w = bb ? bb.width : 50;
-          const h = bb ? bb.height : 50;
+          const rawBox = {
+            x: bb ? bb.originX : 0,
+            y: bb ? bb.originY : 0,
+            width: bb ? bb.width : 50,
+            height: bb ? bb.height : 50,
+          };
+          // 35%の安全マージン拡張
+          const padded = expandBoxWithMargin(rawBox, 0.35);
+
           return {
             id: `ai-face-${Date.now()}-${idx}`,
             name: `AI人物 #${idx + 1}`,
@@ -287,16 +403,16 @@ export const App: React.FC = () => {
             strength: 14,
             startTime: 0,
             endTime: 1,
-            keyframes: [{ time: 0, x, y, width: w, height: h }],
+            keyframes: [{ time: 0, ...padded }],
           };
         });
         setTracks((prev) => [...prev, ...newAITracks]);
       } else if (videoRef.current) {
-        // 動画の場合: 全体をスキャンし各人物のキーフレーム列を構築
+        // 動画の場合: 0.08秒間隔（約12.5fps）の超高密度スキャンで追従性を圧倒的向上
         const video = videoRef.current;
         const origTime = video.currentTime;
         const totalDuration = video.duration || 5;
-        const step = 0.25; // 0.25秒間隔でサンプリング
+        const step = 0.08;
         const totalSteps = Math.floor(totalDuration / step);
 
         let currentDetectedPersons: any[] = [];
@@ -317,11 +433,17 @@ export const App: React.FC = () => {
           const result = detector.detect(video);
           const rawBoxes = (result.detections || []).map((det) => {
             const bb = det.boundingBox!;
-            return {
+            const rawBox = {
               x: bb.originX,
               y: bb.originY,
               width: bb.width,
               height: bb.height,
+            };
+            // 35%安全マージンを付加して素顔チラ見えを防止
+            const padded = expandBoxWithMargin(rawBox, 0.35);
+
+            return {
+              ...padded,
               score: det.categories?.[0]?.score || 0.9,
             };
           });
@@ -331,7 +453,7 @@ export const App: React.FC = () => {
             currentDetectedPersons,
             rawBoxes,
             sampleTime,
-            6 // 6フレーム見失いバッファ
+            8 // 8フレーム見失いバッファ
           );
 
           for (const p of currentDetectedPersons) {
@@ -361,7 +483,7 @@ export const App: React.FC = () => {
               mosaicType: 'pixel',
               strength: 14,
               startTime: kfs[0].time,
-              endTime: kfs[kfs.length - 1].time + 0.5,
+              endTime: kfs[kfs.length - 1].time + 0.3,
               keyframes: kfs,
               aiPersonId: personId,
             });
@@ -394,13 +516,38 @@ export const App: React.FC = () => {
       const ctx = canvas.getContext('2d')!;
       ctx.drawImage(imageRef.current, 0, 0);
 
-      // モザイク適用
-      tracks.forEach((track) => {
-        if (track.enabled && track.keyframes[0]) {
-          const k = track.keyframes[0];
-          renderTrackMosaic(ctx, track, k, canvas);
-        }
-      });
+      const sourceCanvas = document.createElement('canvas');
+      sourceCanvas.width = canvas.width;
+      sourceCanvas.height = canvas.height;
+      sourceCanvas.getContext('2d')!.drawImage(imageRef.current, 0, 0);
+
+      if (isInverseMosaic) {
+        // 反転モザイク適用
+        const protectedRegions: ProtectedRegion[] = [];
+        tracks.forEach((track) => {
+          if (track.enabled && track.keyframes[0]) {
+            const k = track.keyframes[0];
+            protectedRegions.push({
+              shape: track.shape,
+              x: k.x,
+              y: k.y,
+              width: k.width,
+              height: k.height,
+              points: k.points,
+            });
+          }
+        });
+        renderInverseMosaic(ctx, protectedRegions, canvas.width, canvas.height, inverseMosaicType, inverseStrength, sourceCanvas);
+      } else {
+        // 通常モザイク適用
+        tracks.forEach((track) => {
+          if (track.enabled && track.keyframes[0]) {
+            const k = track.keyframes[0];
+            renderTrackMosaic(ctx, track, k, sourceCanvas);
+          }
+        });
+      }
+
       canvas.toBlob((blob) => {
         if (blob) {
           setExportedBlob(blob);
@@ -416,6 +563,11 @@ export const App: React.FC = () => {
           mediaFile,
           videoRef.current,
           tracks,
+          {
+            isInverseMosaic,
+            inverseMosaicType,
+            inverseStrength,
+          },
           (prog) => setExportProgress(prog)
         );
         setExportedBlob(blob);
@@ -459,13 +611,13 @@ export const App: React.FC = () => {
         </>
       )}
 
-      {/* ヘッダー（完全ローカルセキュリティバッジ & ファイル読み込み & 書き出し） */}
+      {/* ヘッダー */}
       <Header
         onOpenFile={handleOpenFile}
         onLoadDemo={handleLoadDemo}
         onExport={handleExport}
         hasMedia={Boolean(mediaFile)}
-        isProcessing={isAIDetecting}
+        isProcessing={isAIDetecting || isTrackingProcessing}
       />
 
       {/* ツールバー */}
@@ -481,6 +633,14 @@ export const App: React.FC = () => {
         isAIDetecting={isAIDetecting}
         isPreviewMode={isPreviewMode}
         onTogglePreviewMode={() => setIsPreviewMode((prev) => !prev)}
+        isInverseMosaic={isInverseMosaic}
+        onToggleInverseMosaic={() => setIsInverseMosaic((prev) => !prev)}
+        inverseMosaicType={inverseMosaicType}
+        onUpdateInverseMosaicType={setInverseMosaicType}
+        inverseStrength={inverseStrength}
+        onUpdateInverseStrength={setInverseStrength}
+        onRunTrackingForSelectedTrack={() => selectedTrackId && runTrackingForTrack(selectedTrackId)}
+        isTrackingProcessing={isTrackingProcessing}
       />
 
       {/* メインプレビュー＆サイドパネルエリア */}
@@ -528,6 +688,9 @@ export const App: React.FC = () => {
               currentTime={currentTime}
               isPlaying={isPlaying}
               isPreviewMode={isPreviewMode}
+              isInverseMosaic={isInverseMosaic}
+              inverseMosaicType={inverseMosaicType}
+              inverseStrength={inverseStrength}
               onSelectTrack={setSelectedTrackId}
               onAddTrack={handleAddTrack}
               onUpdateTrackKeyframe={handleUpdateTrackKeyframe}

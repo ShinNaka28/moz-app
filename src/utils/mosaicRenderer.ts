@@ -124,6 +124,79 @@ export function renderTrackMosaic(
   }
 }
 
+export interface ProtectedRegion {
+  shape: 'rect' | 'brush' | 'polygon';
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  points?: Point[];
+}
+
+/**
+ * 反転モザイク（選択した人物やPC画面以外の「背景全体」にモザイクをかける）
+ */
+export function renderInverseMosaic(
+  ctx: CanvasRenderingContext2D,
+  protectedRegions: ProtectedRegion[],
+  canvasWidth: number,
+  canvasHeight: number,
+  type: MosaicType,
+  strength: number,
+  sourceCanvas: HTMLCanvasElement
+) {
+  if (canvasWidth <= 0 || canvasHeight <= 0) return;
+
+  ctx.save();
+  ctx.beginPath();
+
+  // 外枠: 画面全体
+  ctx.rect(0, 0, canvasWidth, canvasHeight);
+
+  // 内枠: 保護対象領域（くり抜き）
+  for (const reg of protectedRegions) {
+    if (reg.shape === 'polygon' && reg.points && reg.points.length >= 3) {
+      ctx.moveTo(reg.points[0].x, reg.points[0].y);
+      for (let i = 1; i < reg.points.length; i++) {
+        ctx.lineTo(reg.points[i].x, reg.points[i].y);
+      }
+      ctx.closePath();
+    } else {
+      ctx.rect(reg.x, reg.y, reg.width, reg.height);
+    }
+  }
+
+  // evenodd 規則でくり抜いて背景全体のみをクリッピング
+  ctx.clip('evenodd');
+
+  if (type === 'black') {
+    ctx.fillStyle = '#000000';
+    ctx.fillRect(0, 0, canvasWidth, canvasHeight);
+  } else if (type === 'blur') {
+    ctx.filter = `blur(${Math.max(2, strength)}px)`;
+    ctx.drawImage(sourceCanvas, 0, 0, canvasWidth, canvasHeight);
+  } else if (type === 'pixel') {
+    const pixelSize = Math.max(4, Math.round(strength));
+    const smallW = Math.max(1, Math.floor(canvasWidth / pixelSize));
+    const smallH = Math.max(1, Math.floor(canvasHeight / pixelSize));
+
+    const offscreen = document.createElement('canvas');
+    offscreen.width = smallW;
+    offscreen.height = smallH;
+    const offCtx = offscreen.getContext('2d');
+    if (offCtx) {
+      offCtx.imageSmoothingEnabled = true;
+      offCtx.drawImage(sourceCanvas, 0, 0, smallW, smallH);
+
+      ctx.imageSmoothingEnabled = false;
+      ctx.drawImage(offscreen, 0, 0, smallW, smallH, 0, 0, canvasWidth, canvasHeight);
+      ctx.imageSmoothingEnabled = true;
+    }
+  }
+
+  ctx.restore();
+}
+
 /**
  * 編集UI用のガイド枠・選択枠描画
  */

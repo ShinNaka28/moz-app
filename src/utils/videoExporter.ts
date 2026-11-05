@@ -1,13 +1,19 @@
 import { Muxer, ArrayBufferTarget } from 'mp4-muxer';
-import { MosaicTrack } from '../types';
+import { MosaicTrack, MosaicType } from '../types';
 import { interpolateKeyframes } from './tracking';
-import { renderTrackMosaic } from './mosaicRenderer';
+import { renderTrackMosaic, renderInverseMosaic, ProtectedRegion } from './mosaicRenderer';
 
 export interface ExportProgress {
   currentFrame: number;
   totalFrames: number;
   percent: number;
   status: string;
+}
+
+export interface ExportOptions {
+  isInverseMosaic?: boolean;
+  inverseMosaicType?: MosaicType;
+  inverseStrength?: number;
 }
 
 /**
@@ -17,6 +23,7 @@ export async function exportMosaicVideo(
   videoFile: File,
   videoElement: HTMLVideoElement,
   tracks: MosaicTrack[],
+  options: ExportOptions = {},
   onProgress: (p: ExportProgress) => void
 ): Promise<Blob> {
   const duration = videoElement.duration;
@@ -66,6 +73,7 @@ export async function exportMosaicVideo(
       videoWidth,
       videoHeight,
       audioBuffer,
+      options,
       onProgress
     );
   } else {
@@ -80,6 +88,7 @@ export async function exportMosaicVideo(
       fps,
       totalFrames,
       duration,
+      options,
       onProgress
     );
   }
@@ -99,6 +108,7 @@ async function exportWithWebCodecs(
   width: number,
   height: number,
   audioBuffer: AudioBuffer | null,
+  options: ExportOptions,
   onProgress: (p: ExportProgress) => void
 ): Promise<Blob> {
   const muxerTarget = new ArrayBufferTarget();
@@ -199,14 +209,42 @@ async function exportWithWebCodecs(
     srcCtx.drawImage(videoElement, 0, 0, width, height);
     ctx.drawImage(sourceCanvas, 0, 0, width, height);
 
-    // 各モザイクの適用
-    for (const track of tracks) {
-      if (!track.enabled) continue;
-      if (currentTime < track.startTime || currentTime > track.endTime) continue;
+    // モザイク適用（反転モザイクまたは通常モザイク）
+    if (options.isInverseMosaic) {
+      const protectedRegions: ProtectedRegion[] = [];
+      for (const track of tracks) {
+        if (!track.enabled) continue;
+        if (currentTime < track.startTime || currentTime > track.endTime) continue;
+        const pos = interpolateKeyframes(track.keyframes, currentTime);
+        if (pos && !track.trackingData?.isOutOfFrame) {
+          protectedRegions.push({
+            shape: track.shape,
+            x: pos.x,
+            y: pos.y,
+            width: pos.width,
+            height: pos.height,
+            points: pos.points,
+          });
+        }
+      }
+      renderInverseMosaic(
+        ctx,
+        protectedRegions,
+        width,
+        height,
+        options.inverseMosaicType || 'blur',
+        options.inverseStrength || 18,
+        sourceCanvas
+      );
+    } else {
+      for (const track of tracks) {
+        if (!track.enabled) continue;
+        if (currentTime < track.startTime || currentTime > track.endTime) continue;
 
-      const pos = interpolateKeyframes(track.keyframes, currentTime);
-      if (pos && !track.trackingData?.isOutOfFrame) {
-        renderTrackMosaic(ctx, track, pos, sourceCanvas);
+        const pos = interpolateKeyframes(track.keyframes, currentTime);
+        if (pos && !track.trackingData?.isOutOfFrame) {
+          renderTrackMosaic(ctx, track, pos, sourceCanvas);
+        }
       }
     }
 
@@ -247,6 +285,7 @@ async function exportWithMediaRecorder(
   fps: number,
   totalFrames: number,
   duration: number,
+  options: ExportOptions,
   onProgress: (p: ExportProgress) => void
 ): Promise<Blob> {
   const stream = exportCanvas.captureStream(fps);
@@ -290,12 +329,40 @@ async function exportWithMediaRecorder(
     srcCtx.drawImage(videoElement, 0, 0, exportCanvas.width, exportCanvas.height);
     ctx.drawImage(sourceCanvas, 0, 0, exportCanvas.width, exportCanvas.height);
 
-    for (const track of tracks) {
-      if (!track.enabled) continue;
-      if (curTime < track.startTime || curTime > track.endTime) continue;
-      const pos = interpolateKeyframes(track.keyframes, curTime);
-      if (pos && !track.trackingData?.isOutOfFrame) {
-        renderTrackMosaic(ctx, track, pos, sourceCanvas);
+    if (options.isInverseMosaic) {
+      const protectedRegions: ProtectedRegion[] = [];
+      for (const track of tracks) {
+        if (!track.enabled) continue;
+        if (curTime < track.startTime || curTime > track.endTime) continue;
+        const pos = interpolateKeyframes(track.keyframes, curTime);
+        if (pos && !track.trackingData?.isOutOfFrame) {
+          protectedRegions.push({
+            shape: track.shape,
+            x: pos.x,
+            y: pos.y,
+            width: pos.width,
+            height: pos.height,
+            points: pos.points,
+          });
+        }
+      }
+      renderInverseMosaic(
+        ctx,
+        protectedRegions,
+        exportCanvas.width,
+        exportCanvas.height,
+        options.inverseMosaicType || 'blur',
+        options.inverseStrength || 18,
+        sourceCanvas
+      );
+    } else {
+      for (const track of tracks) {
+        if (!track.enabled) continue;
+        if (curTime < track.startTime || curTime > track.endTime) continue;
+        const pos = interpolateKeyframes(track.keyframes, curTime);
+        if (pos && !track.trackingData?.isOutOfFrame) {
+          renderTrackMosaic(ctx, track, pos, sourceCanvas);
+        }
       }
     }
 

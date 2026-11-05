@@ -1,6 +1,6 @@
 import React, { useRef, useEffect, useState, useCallback } from 'react';
-import { EditorMode, MosaicTrack, Point } from '../types';
-import { renderTrackMosaic, renderTrackOverlay } from '../utils/mosaicRenderer';
+import { EditorMode, MosaicTrack, MosaicType, Point } from '../types';
+import { renderTrackMosaic, renderInverseMosaic, renderTrackOverlay, ProtectedRegion } from '../utils/mosaicRenderer';
 import { interpolateKeyframes, extractFeaturePoints, toGrayscale, trackBox } from '../utils/tracking';
 
 interface VideoCanvasProps {
@@ -13,6 +13,9 @@ interface VideoCanvasProps {
   currentTime: number;
   isPlaying: boolean;
   isPreviewMode?: boolean;
+  isInverseMosaic?: boolean;
+  inverseMosaicType?: MosaicType;
+  inverseStrength?: number;
   onSelectTrack: (id: string | null) => void;
   onAddTrack: (newTrack: MosaicTrack) => void;
   onUpdateTrackKeyframe: (trackId: string, box: { x: number; y: number; width: number; height: number; points?: Point[] }) => void;
@@ -30,6 +33,9 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
   currentTime,
   isPlaying,
   isPreviewMode = false,
+  isInverseMosaic = false,
+  inverseMosaicType = 'blur',
+  inverseStrength = 18,
   onSelectTrack,
   onAddTrack,
   onUpdateTrackKeyframe,
@@ -157,15 +163,45 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
       prevTimeRef.current = currentTime;
     }
 
-    // 各トラックのモザイクを描画
-    for (const track of tracks) {
-      if (!track.enabled) continue;
-      if (currentTime < track.startTime || currentTime > track.endTime) continue;
-      if (track.trackingData?.isOutOfFrame) continue;
+    // モザイクを描画（反転モザイク または 通常モザイク）
+    if (isInverseMosaic) {
+      const protectedRegions: ProtectedRegion[] = [];
+      for (const track of tracks) {
+        if (!track.enabled) continue;
+        if (currentTime < track.startTime || currentTime > track.endTime) continue;
+        if (track.trackingData?.isOutOfFrame) continue;
 
-      const pos = interpolateKeyframes(track.keyframes, currentTime);
-      if (pos) {
-        renderTrackMosaic(ctx, track, pos, sourceCanvasRef.current);
+        const pos = interpolateKeyframes(track.keyframes, currentTime);
+        if (pos) {
+          protectedRegions.push({
+            shape: track.shape,
+            x: pos.x,
+            y: pos.y,
+            width: pos.width,
+            height: pos.height,
+            points: pos.points,
+          });
+        }
+      }
+      renderInverseMosaic(
+        ctx,
+        protectedRegions,
+        mediaWidth,
+        mediaHeight,
+        inverseMosaicType,
+        inverseStrength,
+        sourceCanvasRef.current
+      );
+    } else {
+      for (const track of tracks) {
+        if (!track.enabled) continue;
+        if (currentTime < track.startTime || currentTime > track.endTime) continue;
+        if (track.trackingData?.isOutOfFrame) continue;
+
+        const pos = interpolateKeyframes(track.keyframes, currentTime);
+        if (pos) {
+          renderTrackMosaic(ctx, track, pos, sourceCanvasRef.current);
+        }
       }
     }
 
@@ -225,6 +261,10 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
     selectedTrackId,
     editorMode,
     drawingState,
+    isPreviewMode,
+    isInverseMosaic,
+    inverseMosaicType,
+    inverseStrength,
     onUpdateTrackFrameOut,
     onUpdateTrackKeyframe,
   ]);

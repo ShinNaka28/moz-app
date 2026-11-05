@@ -73,6 +73,21 @@ function calcIoU(
   return interArea / (area1 + area2 - interArea);
 }
 
+// 顔の検出枠に安全マージン（35%拡張）を付与して素顔のはみ出し・チラ見えを防止
+export function expandBoxWithMargin(
+  box: { x: number; y: number; width: number; height: number },
+  margin = 0.35
+): { x: number; y: number; width: number; height: number } {
+  const padW = box.width * margin;
+  const padH = box.height * margin;
+  return {
+    x: Math.max(0, box.x - padW / 2),
+    y: Math.max(0, box.y - padH / 2),
+    width: box.width + padW,
+    height: box.height + padH,
+  };
+}
+
 let nextPersonId = 1;
 
 /**
