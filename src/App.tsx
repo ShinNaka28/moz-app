@@ -141,6 +141,25 @@ export const App: React.FC = () => {
     if (selectedTrackId === id) setSelectedTrackId(null);
   };
 
+  // ユーザー指定領域（フリー囲み等）を一括全削除
+  const handleDeleteAllUserTracks = () => {
+    setTracks((prev) => prev.filter((t) => t.type === 'ai'));
+    setSelectedTrackId(null);
+  };
+
+  // キーボードショートカット（Delete / Backspace で選択枠を即削除）
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if ((e.key === 'Delete' || e.key === 'Backspace') && selectedTrackId) {
+        if (['INPUT', 'TEXTAREA'].includes((e.target as HTMLElement)?.tagName)) return;
+        e.preventDefault();
+        handleDeleteTrack(selectedTrackId);
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [selectedTrackId]);
+
   // トラック設定更新
   const handleUpdateTrackSettings = (updates: Partial<MosaicTrack>) => {
     if (!selectedTrackId) return;
@@ -696,6 +715,7 @@ export const App: React.FC = () => {
               onUpdateTrackKeyframe={handleUpdateTrackKeyframe}
               onToggleTrackEnabled={handleToggleTrackEnabled}
               onUpdateTrackFrameOut={handleUpdateTrackFrameOut}
+              onDeleteTrack={handleDeleteTrack}
             />
 
             {/* 人物・指定領域リスト サイドパネル */}
@@ -705,6 +725,8 @@ export const App: React.FC = () => {
               onSelectTrack={setSelectedTrackId}
               onToggleTrackEnabled={handleToggleTrackEnabled}
               onToggleAllAITracks={handleToggleAllAITracks}
+              onDeleteTrack={handleDeleteTrack}
+              onDeleteAllUserTracks={handleDeleteAllUserTracks}
             />
           </>
         )}

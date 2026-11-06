@@ -21,6 +21,7 @@ interface VideoCanvasProps {
   onUpdateTrackKeyframe: (trackId: string, box: { x: number; y: number; width: number; height: number; points?: Point[] }) => void;
   onToggleTrackEnabled: (trackId: string) => void;
   onUpdateTrackFrameOut: (trackId: string, isOutOfFrame: boolean) => void;
+  onDeleteTrack?: (trackId: string) => void;
 }
 
 export const VideoCanvas: React.FC<VideoCanvasProps> = ({
@@ -41,6 +42,7 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
   onUpdateTrackKeyframe,
   onToggleTrackEnabled,
   onUpdateTrackFrameOut,
+  onDeleteTrack,
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -300,6 +302,22 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
         if (currentTime < track.startTime || currentTime > track.endTime) continue;
         const pos = interpolateKeyframes(track.keyframes, currentTime);
         if (!pos) continue;
+
+        // 選択中の場合の「✕ 削除」ボタン判定
+        if (track.id === selectedTrackId && onDeleteTrack) {
+          const badgeH = 22;
+          const badgeY = Math.max(0, pos.y - badgeH - 4);
+          // ラベルバッジの右側に表示される削除ボタン（幅約50px）
+          if (
+            pt.x >= pos.x + 60 &&
+            pt.x <= pos.x + 190 &&
+            pt.y >= badgeY - 6 &&
+            pt.y <= badgeY + badgeH + 6
+          ) {
+            onDeleteTrack(track.id);
+            return;
+          }
+        }
 
         // ハンドル判定（選択中の場合）
         if (track.id === selectedTrackId) {

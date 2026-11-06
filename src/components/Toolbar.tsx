@@ -303,13 +303,14 @@ export const Toolbar: React.FC<ToolbarProps> = ({
             {selectedTrack.enabled ? <Eye size={15} /> : <EyeOff size={15} />}
           </button>
 
-          {/* 削除 */}
+          {/* 削除ボタン */}
           <button
             onClick={onDeleteSelectedTrack}
-            className="p-1.5 text-rose-400 hover:text-rose-300 hover:bg-rose-950/50 rounded transition"
-            title="このモザイクを削除"
+            className="flex items-center gap-1 px-2 py-1 bg-rose-950/80 hover:bg-rose-900 border border-rose-600/70 text-rose-200 font-bold rounded transition text-[11px] shadow-sm"
+            title="選択中の枠を削除します (Deleteキーでも削除可)"
           >
-            <Trash2 size={15} />
+            <Trash2 size={13} className="text-rose-400" />
+            <span>削除</span>
           </button>
         </div>
       ) : (

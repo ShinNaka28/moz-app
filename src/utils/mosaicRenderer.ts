@@ -274,6 +274,25 @@ export function renderTrackOverlay(
   ctx.textBaseline = 'middle';
   ctx.fillText(label, badgeX + 6, badgeY + badgeH / 2);
 
+  // 選択中の場合はバッジ横に直接タップできる「✕ 削除」ボタンを描画
+  if (isSelected) {
+    const delBtnW = 48;
+    const delBtnH = badgeH;
+    const delBtnX = badgeX + badgeW + 4;
+    const delBtnY = badgeY;
+
+    ctx.fillStyle = '#b91c1c'; // 赤色
+    ctx.fillRect(delBtnX, delBtnY, delBtnW, delBtnH);
+    ctx.strokeStyle = '#f87171';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(delBtnX, delBtnY, delBtnW, delBtnH);
+
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 10px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('✕ 削除', delBtnX + delBtnW / 2, delBtnY + delBtnH / 2);
+  }
+
   ctx.restore();
 }
 
