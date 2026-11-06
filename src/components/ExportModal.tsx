@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { ExportProgress, saveOrShareBlob } from '../utils/videoExporter';
-import { Download, Share2, CheckCircle2, Loader2, X, ArrowLeft, Play, Eye } from 'lucide-react';
+import { Download, Share2, CheckCircle2, Loader2, X, ArrowLeft, Play, Eye, Sun } from 'lucide-react';
 
 interface ExportModalProps {
   isOpen: boolean;
@@ -109,7 +109,15 @@ export const ExportModal: React.FC<ExportModalProps> = ({
               </span>
             </div>
 
-            <p className="text-[11px] text-slate-500 bg-slate-950 p-3 rounded-lg border border-slate-800/80">
+            {/* 画面消灯防止バッジ */}
+            <div className="flex items-center gap-2 p-2.5 bg-indigo-950/70 border border-indigo-700/60 rounded-xl text-indigo-200 text-[11px] leading-relaxed">
+              <Sun size={16} className="text-amber-400 shrink-0 animate-pulse" />
+              <span>
+                <strong className="text-amber-300">画面スリープ防止が作動中:</strong> 処理完了まで画面は自動消灯しません。別のアプリへ切り替えずにそのままお待ちください。
+              </span>
+            </div>
+
+            <p className="text-[11px] text-slate-500 bg-slate-950 p-2.5 rounded-lg border border-slate-800/80">
               🔒 外部送信は一切行われていません。すべて端末内のプロセッサとメモリで直接処理されています。
             </p>
           </div>

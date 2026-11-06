@@ -2,6 +2,7 @@ import { Muxer, ArrayBufferTarget } from 'mp4-muxer';
 import { MosaicTrack, MosaicType } from '../types';
 import { interpolateKeyframes } from './tracking';
 import { renderTrackMosaic, renderInverseMosaic, ProtectedRegion } from './mosaicRenderer';
+import { requestScreenWakeLock, releaseScreenWakeLock } from './wakeLock';
 
 export interface ExportProgress {
   currentFrame: number;
@@ -17,7 +18,7 @@ export interface ExportOptions {
 }
 
 /**
- * 動画の完全ローカルMP4書き出し（音声トラック維持）
+ * 動画の完全ローカルMP4書き出し（音声トラック維持 ＆ 画面スリープ防止）
  */
 export async function exportMosaicVideo(
   videoFile: File,
@@ -26,71 +27,87 @@ export async function exportMosaicVideo(
   options: ExportOptions = {},
   onProgress: (p: ExportProgress) => void
 ): Promise<Blob> {
-  const duration = videoElement.duration;
-  const videoWidth = videoElement.videoWidth;
-  const videoHeight = videoElement.videoHeight;
-  const fps = 30;
-  const totalFrames = Math.max(1, Math.floor(duration * fps));
+  // 画面スリープ（消灯）を防止
+  await requestScreenWakeLock();
 
-  // キャンバス準備
-  const exportCanvas = document.createElement('canvas');
-  exportCanvas.width = videoWidth;
-  exportCanvas.height = videoHeight;
-  const ctx = exportCanvas.getContext('2d', { willReadFrequently: true });
-  if (!ctx) throw new Error('Canvas context could not be created');
+  // 画面復帰時の自動再取得ハンドラ
+  const handleVisibilityChange = () => {
+    if (document.visibilityState === 'visible') {
+      requestScreenWakeLock();
+    }
+  };
+  document.addEventListener('visibilitychange', handleVisibilityChange);
 
-  const sourceCanvas = document.createElement('canvas');
-  sourceCanvas.width = videoWidth;
-  sourceCanvas.height = videoHeight;
-  const srcCtx = sourceCanvas.getContext('2d');
-  if (!srcCtx) throw new Error('Source canvas context error');
-
-  // 音声のデコード（AudioContext を使用）
-  onProgress({ currentFrame: 0, totalFrames, percent: 0, status: '音声を解析中...' });
-  let audioBuffer: AudioBuffer | null = null;
   try {
-    const arrayBuffer = await videoFile.arrayBuffer();
-    const audioCtx = new (window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)();
-    audioBuffer = await audioCtx.decodeAudioData(arrayBuffer.slice(0));
-  } catch (err) {
-    console.warn('音声トラックの取得をスキップまたは音声なし:', err);
-  }
+    const duration = videoElement.duration;
+    const videoWidth = videoElement.videoWidth;
+    const videoHeight = videoElement.videoHeight;
+    const fps = 30;
+    const totalFrames = Math.max(1, Math.floor(duration * fps));
 
-  // WebCodecs が使えるかチェック
-  const hasWebCodecs = typeof window.VideoEncoder !== 'undefined' && typeof window.VideoFrame !== 'undefined';
+    // キャンバス準備
+    const exportCanvas = document.createElement('canvas');
+    exportCanvas.width = videoWidth;
+    exportCanvas.height = videoHeight;
+    const ctx = exportCanvas.getContext('2d', { willReadFrequently: true });
+    if (!ctx) throw new Error('Canvas context could not be created');
 
-  if (hasWebCodecs) {
-    return await exportWithWebCodecs(
-      videoElement,
-      exportCanvas,
-      ctx,
-      sourceCanvas,
-      srcCtx,
-      tracks,
-      fps,
-      totalFrames,
-      duration,
-      videoWidth,
-      videoHeight,
-      audioBuffer,
-      options,
-      onProgress
-    );
-  } else {
-    // フォールバック: MediaRecorder
-    return await exportWithMediaRecorder(
-      videoElement,
-      exportCanvas,
-      ctx,
-      sourceCanvas,
-      srcCtx,
-      tracks,
-      fps,
-      totalFrames,
-      duration,
-      options,
-      onProgress
-    );
+    const sourceCanvas = document.createElement('canvas');
+    sourceCanvas.width = videoWidth;
+    sourceCanvas.height = videoHeight;
+    const srcCtx = sourceCanvas.getContext('2d');
+    if (!srcCtx) throw new Error('Source canvas context error');
+
+    // 音声のデコード（AudioContext を使用）
+    onProgress({ currentFrame: 0, totalFrames, percent: 0, status: '音声を解析中...' });
+    let audioBuffer: AudioBuffer | null = null;
+    try {
+      const arrayBuffer = await videoFile.arrayBuffer();
+      const audioCtx = new (window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)();
+      audioBuffer = await audioCtx.decodeAudioData(arrayBuffer.slice(0));
+    } catch (err) {
+      console.warn('音声トラックの取得をスキップまたは音声なし:', err);
+    }
+
+    // WebCodecs が使えるかチェック
+    const hasWebCodecs = typeof window.VideoEncoder !== 'undefined' && typeof window.VideoFrame !== 'undefined';
+
+    if (hasWebCodecs) {
+      return await exportWithWebCodecs(
+        videoElement,
+        exportCanvas,
+        ctx,
+        sourceCanvas,
+        srcCtx,
+        tracks,
+        fps,
+        totalFrames,
+        duration,
+        videoWidth,
+        videoHeight,
+        audioBuffer,
+        options,
+        onProgress
+      );
+    } else {
+      // フォールバック: MediaRecorder
+      return await exportWithMediaRecorder(
+        videoElement,
+        exportCanvas,
+        ctx,
+        sourceCanvas,
+        srcCtx,
+        tracks,
+        fps,
+        totalFrames,
+        duration,
+        options,
+        onProgress
+      );
+    }
+  } finally {
+    document.removeEventListener('visibilitychange', handleVisibilityChange);
+    await releaseScreenWakeLock();
   }
 }
 
@@ -198,9 +215,22 @@ async function exportWithWebCodecs(
     videoElement.currentTime = currentTime;
 
     await new Promise<void>((resolve) => {
+      let isDone = false;
+      const timer = setTimeout(() => {
+        if (!isDone) {
+          isDone = true;
+          videoElement.removeEventListener('seeked', onSeeked);
+          resolve(); // 画面消灯・スリープ復帰時のイベント欠落でも最大1.5秒で自動回復
+        }
+      }, 1500);
+
       const onSeeked = () => {
-        videoElement.removeEventListener('seeked', onSeeked);
-        resolve();
+        if (!isDone) {
+          isDone = true;
+          clearTimeout(timer);
+          videoElement.removeEventListener('seeked', onSeeked);
+          resolve();
+        }
       };
       videoElement.addEventListener('seeked', onSeeked);
     });
