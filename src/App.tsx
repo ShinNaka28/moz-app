@@ -7,7 +7,7 @@ import { PersonListPanel } from './components/PersonListPanel';
 import { ExportModal } from './components/ExportModal';
 import { EditorMode, MosaicTrack, MosaicType, Point, Keyframe } from './types';
 import { Film, ListFilter, Clock, Play, Pause, RotateCcw, Trash2, Crosshair, Sparkles } from 'lucide-react';
-import { initFaceDetector, initPersonSegmenter, detectFacesSafely, segmentPersonSafely, updatePersonTracks, expandBoxWithMargin, estimateBodyBoxFromFace, createBodySilhouettePolygon, isValidFaceDetection, FaceFilterOptions } from './utils/aiDetector';
+import { initFaceDetector, initPersonSegmenter, detectFacesSafely, segmentPersonSafely, resetBodySegmentationState, updatePersonTracks, expandBoxWithMargin, estimateBodyBoxFromFace, createBodySilhouettePolygon, isValidFaceDetection, FaceFilterOptions } from './utils/aiDetector';
 import { exportMosaicVideo, ExportProgress, saveOrShareBlob } from './utils/videoExporter';
 import { generateDemoVideoBlob } from './utils/sampleGenerator';
 import { renderTrackMosaic, renderInverseMosaic, ProtectedRegion } from './utils/mosaicRenderer';
@@ -467,8 +467,9 @@ export const App: React.FC = () => {
 
     try {
       if (targetMode === 'body') {
-        // 【体のラインに沿った人物輪郭セグメンテーション (Selfie Segmenter)】
-        // 顔が映っていない、後ろ向き、横向きでも全身・上半身の境界をダイレクトに抽出
+        // 【体のラインに沿った人物輪郭セグメンテーション (Multiclass Body-Skin/Clothes + DeepLabV3 + Selfie Segmenter)】
+        // 顔が映っていない、後ろ向き、横向き、身体の一部のみでも境界をダイレクトに抽出
+        resetBodySegmentationState();
         let segmenter = await initPersonSegmenter();
 
         if (isImage && imageRef.current) {
