@@ -18,7 +18,11 @@ interface VideoCanvasProps {
   inverseStrength?: number;
   onSelectTrack: (id: string | null) => void;
   onAddTrack: (newTrack: MosaicTrack) => void;
-  onUpdateTrackKeyframe: (trackId: string, box: { x: number; y: number; width: number; height: number; points?: Point[] }) => void;
+  onUpdateTrackKeyframe: (
+    trackId: string,
+    box: { x: number; y: number; width: number; height: number; points?: Point[] },
+    isPlaybackTracking?: boolean
+  ) => void;
   onToggleTrackEnabled: (trackId: string) => void;
   onUpdateTrackFrameOut: (trackId: string, isOutOfFrame: boolean) => void;
   onDeleteTrack?: (trackId: string) => void;
@@ -154,14 +158,18 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
           onUpdateTrackFrameOut(track.id, trackRes.isOutOfFrame);
 
           if (!trackRes.isOutOfFrame) {
-            // 追従結果をキーフレームとして滑らかに更新
-            onUpdateTrackKeyframe(track.id, {
-              ...trackRes.newBox,
-              points: curPos.points?.map(p => ({
-                x: p.x + (trackRes.newBox.x - curPos.x),
-                y: p.y + (trackRes.newBox.y - curPos.y),
-              })),
-            });
+            // 追従結果をキーフレームとして滑らかに更新（再生中フラグ true）
+            onUpdateTrackKeyframe(
+              track.id,
+              {
+                ...trackRes.newBox,
+                points: curPos.points?.map((p) => ({
+                  x: p.x + (trackRes.newBox.x - curPos.x),
+                  y: p.y + (trackRes.newBox.y - curPos.y),
+                })),
+              },
+              true
+            );
             track.trackingData = {
               ...track.trackingData,
               templateWidth: curPos.width,
@@ -237,7 +245,6 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
       for (const track of tracks) {
         if (!track.enabled) continue;
         if (currentTime < track.startTime || currentTime > track.endTime) continue;
-        if (track.trackingData?.isOutOfFrame) continue;
 
         const pos = getEffectivePos(track);
         if (pos) {
@@ -264,7 +271,6 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
       for (const track of tracks) {
         if (!track.enabled) continue;
         if (currentTime < track.startTime || currentTime > track.endTime) continue;
-        if (track.trackingData?.isOutOfFrame) continue;
 
         const pos = getEffectivePos(track);
         if (pos) {
@@ -277,7 +283,6 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
     if (!isPreviewMode) {
       for (const track of tracks) {
         if (currentTime < track.startTime || currentTime > track.endTime) continue;
-        if (track.trackingData?.isOutOfFrame) continue;
 
         const pos = getEffectivePos(track);
         if (pos) {
@@ -361,67 +366,69 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
     const pt = getCanvasCoords(e);
     if (!pt) return;
 
-    // 1. 選択中のトラックがある場合、そのハンドル・削除ボタン・枠内移動を最優先判定（モード問わず）
+    // 画面上の表示サイズとキャンバス内部解像度の比率（スマホでの4K/1080p動画でもタッチ判定を実寸px基準にする）
+    const canvas = canvasRef.current;
+    const rect = canvas?.getBoundingClientRect();
+    const uiScale = canvas && rect && rect.width > 0 ? Math.max(1, canvas.width / rect.width) : 1;
+    const touchPad = 14 * uiScale;
+
+    // 1. 選択中のトラックがある場合、そのハンドル・枠内移動を最優先判定（モード問わず）
+    // ※キャンバス上の誤タップによる枠消失を防ぐため、キャンバス内での直接削除判定は行わず、移動・リサイズのみに特化
     if (selectedTrackId) {
       const selectedTrack = tracks.find((t) => t.id === selectedTrackId);
       if (selectedTrack && currentTime >= selectedTrack.startTime && currentTime <= selectedTrack.endTime) {
         const pos = interpolateKeyframes(selectedTrack.keyframes, currentTime);
         if (pos) {
-          // 「✕ 削除」ボタン判定
-          if (onDeleteTrack) {
-            const badgeH = 22;
-            const badgeY = Math.max(0, pos.y - badgeH - 4);
-            if (
-              pt.x >= pos.x + 60 &&
-              pt.x <= pos.x + 200 &&
-              pt.y >= badgeY - 6 &&
-              pt.y <= badgeY + badgeH + 6
-            ) {
-              onDeleteTrack(selectedTrack.id);
-              return;
-            }
-          }
+          // 枠の中央付近（内側の移動優先エリア）または上部ラベルバッジを触った場合は、小さい枠でも確実に「移動」を優先
+          const centerX = pos.x + pos.width / 2;
+          const centerY = pos.y + pos.height / 2;
+          const inInnerCenter =
+            Math.abs(pt.x - centerX) <= Math.max(10 * uiScale, pos.width * 0.28) &&
+            Math.abs(pt.y - centerY) <= Math.max(10 * uiScale, pos.height * 0.28);
 
-          // 四隅の変形ハンドル判定
-          const handleSize = 20;
-          const corners: Array<{ type: 'nw' | 'ne' | 'se' | 'sw'; cx: number; cy: number }> = [
-            { type: 'nw', cx: pos.x, cy: pos.y },
-            { type: 'ne', cx: pos.x + pos.width, cy: pos.y },
-            { type: 'se', cx: pos.x + pos.width, cy: pos.y + pos.height },
-            { type: 'sw', cx: pos.x, cy: pos.y + pos.height },
-          ];
-          for (const c of corners) {
-            if (Math.hypot(pt.x - c.cx, pt.y - c.cy) <= handleSize) {
-              try {
-                (e.target as HTMLCanvasElement).setPointerCapture(e.pointerId);
-              } catch (_) {}
-              e.preventDefault();
+          const badgeH = 26 * uiScale;
+          const inBadge =
+            pt.x >= pos.x - touchPad &&
+            pt.x <= pos.x + Math.max(pos.width, 140 * uiScale) + touchPad &&
+            pt.y >= Math.max(0, pos.y - badgeH - 6 * uiScale) &&
+            pt.y <= pos.y;
 
-              transformRef.current = {
-                type: c.type,
-                trackId: selectedTrack.id,
-                startMouse: pt,
-                currentMouse: pt,
-                initialBox: { ...pos, points: pos.points ? [...pos.points] : undefined },
-              };
-              return;
+          if (!inInnerCenter && !inBadge) {
+            // 四隅の変形ハンドル判定
+            const handleSize = Math.min(20 * uiScale, Math.max(14, Math.min(pos.width, pos.height) * 0.38));
+            const corners: Array<{ type: 'nw' | 'ne' | 'se' | 'sw'; cx: number; cy: number }> = [
+              { type: 'nw', cx: pos.x, cy: pos.y },
+              { type: 'ne', cx: pos.x + pos.width, cy: pos.y },
+              { type: 'se', cx: pos.x + pos.width, cy: pos.y + pos.height },
+              { type: 'sw', cx: pos.x, cy: pos.y + pos.height },
+            ];
+            for (const c of corners) {
+              if (Math.hypot(pt.x - c.cx, pt.y - c.cy) <= handleSize) {
+                try {
+                  (e.target as HTMLCanvasElement).setPointerCapture(e.pointerId);
+                } catch (_) {}
+                e.preventDefault();
+
+                transformRef.current = {
+                  type: c.type,
+                  trackId: selectedTrack.id,
+                  startMouse: pt,
+                  currentMouse: pt,
+                  initialBox: { ...pos, points: pos.points ? [...pos.points] : undefined },
+                };
+                return;
+              }
             }
           }
 
           // 枠内（またはバッジエリア）クリック判定 -> 即座にドラッグ移動開始！
-          const badgeH = 24;
-          const inBadge =
-            pt.x >= pos.x - 8 &&
-            pt.x <= pos.x + pos.width + 8 &&
-            pt.y >= Math.max(0, pos.y - badgeH - 6) &&
-            pt.y <= pos.y;
           const inBox =
-            pt.x >= pos.x - 8 &&
-            pt.x <= pos.x + pos.width + 8 &&
-            pt.y >= pos.y - 8 &&
-            pt.y <= pos.y + pos.height + 8;
+            pt.x >= pos.x - touchPad &&
+            pt.x <= pos.x + pos.width + touchPad &&
+            pt.y >= pos.y - touchPad &&
+            pt.y <= pos.y + pos.height + touchPad;
 
-          if (inBadge || inBox) {
+          if (inBadge || inBox || inInnerCenter) {
             try {
               (e.target as HTMLCanvasElement).setPointerCapture(e.pointerId);
             } catch (_) {}
@@ -448,10 +455,10 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
       if (!pos) continue;
 
       if (
-        pt.x >= pos.x - 8 &&
-        pt.x <= pos.x + pos.width + 8 &&
-        pt.y >= pos.y - 8 &&
-        pt.y <= pos.y + pos.height + 8
+        pt.x >= pos.x - touchPad &&
+        pt.x <= pos.x + pos.width + touchPad &&
+        pt.y >= pos.y - touchPad &&
+        pt.y <= pos.y + pos.height + touchPad
       ) {
         onSelectTrack(track.id);
         try {
@@ -471,8 +478,10 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
     }
 
     // 3. 枠外をクリックした場合の処理
+    // ※スマホ等で枠をドラッグしようとして数ミリ外れた際に選択枠（水色の枠・四隅ハンドル）が消えてしまわないよう、
+    //   select モード時は枠外タップでも現在の選択を維持する（枠を非表示にしたい場合は「枠非表示」ボタンを使用）
     if (editorMode === 'select') {
-      onSelectTrack(null);
+      return;
     } else if (editorMode === 'add_rect' || editorMode === 'add_brush' || editorMode === 'add_lasso') {
       try {
         (e.target as HTMLCanvasElement).setPointerCapture(e.pointerId);
@@ -576,6 +585,13 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
       const { type, startMouse, currentMouse, initialBox, trackId } = transformRef.current;
       const dx = currentMouse.x - startMouse.x;
       const dy = currentMouse.y - startMouse.y;
+
+      // 単なるタップ（移動量1px未満）の場合はキーフレームを更新せず選択状態を維持
+      if (Math.hypot(dx, dy) < 1) {
+        transformRef.current = null;
+        return;
+      }
+
       let newBox = { ...initialBox };
 
       if (type === 'move') {
@@ -662,6 +678,8 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
         const maxX = Math.max(...xs);
         const minY = Math.min(...ys);
         const maxY = Math.max(...ys);
+        const width = Math.max(24, maxX - minX);
+        const height = Math.max(24, maxY - minY);
 
         const newTrack: MosaicTrack = {
           id: `track-${Date.now()}`,
@@ -678,8 +696,8 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
               time: currentTime,
               x: minX,
               y: minY,
-              width: maxX - minX,
-              height: maxY - minY,
+              width,
+              height,
               points: drawingState.points,
             },
           ],
@@ -692,10 +710,11 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
       if (drawingState.points.length > 2) {
         const xs = drawingState.points.map((p) => p.x);
         const ys = drawingState.points.map((p) => p.y);
-        const minX = Math.min(...xs);
-        const maxX = Math.max(...xs);
-        const minY = Math.min(...ys);
-        const maxY = Math.max(...ys);
+        const pad = 14;
+        const minX = Math.max(0, Math.min(...xs) - pad);
+        const maxX = Math.max(...xs) + pad;
+        const minY = Math.max(0, Math.min(...ys) - pad);
+        const maxY = Math.max(...ys) + pad;
 
         const newTrack: MosaicTrack = {
           id: `track-${Date.now()}`,
@@ -712,8 +731,8 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
               time: currentTime,
               x: minX,
               y: minY,
-              width: maxX - minX,
-              height: maxY - minY,
+              width: Math.max(28, maxX - minX),
+              height: Math.max(28, maxY - minY),
               points: drawingState.points,
             },
           ],
@@ -748,8 +767,8 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
           time: currentTime,
           x: minX,
           y: minY,
-          width: maxX - minX,
-          height: maxY - minY,
+          width: Math.max(24, maxX - minX),
+          height: Math.max(24, maxY - minY),
           points,
         },
       ],

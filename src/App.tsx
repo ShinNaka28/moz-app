@@ -11,7 +11,7 @@ import { initFaceDetector, updatePersonTracks, expandBoxWithMargin, isValidFaceD
 import { exportMosaicVideo, ExportProgress, saveOrShareBlob } from './utils/videoExporter';
 import { generateDemoVideoBlob } from './utils/sampleGenerator';
 import { renderTrackMosaic, renderInverseMosaic, ProtectedRegion } from './utils/mosaicRenderer';
-import { extractFeaturePoints, toGrayscale, trackBox } from './utils/tracking';
+import { extractFeaturePoints, toGrayscale, trackBox, interpolateKeyframes } from './utils/tracking';
 
 export const App: React.FC = () => {
   // メディア状態
@@ -129,13 +129,9 @@ export const App: React.FC = () => {
   const handleAddTrack = (newTrack: MosaicTrack) => {
     setTracks((prev) => [...prev, newTrack]);
     setSelectedTrackId(newTrack.id);
-
-    // ユーザー指定追跡トラックの場合、直後に自動追従解析を実行
-    if (!isImage && newTrack.type === 'tracked') {
-      setTimeout(() => {
-        runTrackingForTrack(newTrack.id, newTrack);
-      }, 50);
-    }
+    // ※囲んだ直後にユーザーが枠をタップ＆ドラッグして微調整できるよう、
+    //   シークを伴う重い自動解析(runTrackingForTrack)はここでは自動発火させず、
+    //   再生中のリアルタイム追従または「自動追従を解析」ボタン押下時に実行する。
   };
 
   // トラック削除
@@ -218,7 +214,7 @@ export const App: React.FC = () => {
     const track = tracks.find((t) => t.id === selectedTrackId);
     if (!track) return;
 
-    const pos = track.keyframes[0];
+    const pos = interpolateKeyframes(track.keyframes, currentTime) || track.keyframes[0];
     if (!pos) return;
 
     setTracks((prev) =>
@@ -245,17 +241,21 @@ export const App: React.FC = () => {
 
   const handleUpdateTrackKeyframe = (
     trackId: string,
-    box: { x: number; y: number; width: number; height: number; points?: Point[] }
+    box: { x: number; y: number; width: number; height: number; points?: Point[] },
+    isPlaybackTracking: boolean = false
   ) => {
     setTracks((prev) =>
       prev.map((t) => {
         if (t.id !== trackId) return t;
 
-        // キーフレームが1個以下のトラック（手動囲み直後や静止画）は、そのキーフレームを直接更新
+        // 1. キーフレームが1個以下のトラック（手動囲み直後や静止画）は、そのキーフレームを直接更新
         if (t.keyframes.length <= 1) {
           const orig = t.keyframes[0];
           return {
             ...t,
+            trackingData: t.trackingData
+              ? { ...t.trackingData, isOutOfFrame: false, featurePoints: undefined }
+              : undefined,
             keyframes: [
               {
                 time: orig ? orig.time : currentTime,
@@ -269,28 +269,68 @@ export const App: React.FC = () => {
           };
         }
 
-        // 複数キーフレームがあるトラックは、現在位置に近いキーフレームを更新または追加
-        const existingIdx = t.keyframes.findIndex(
-          (k) => Math.abs(k.time - currentTime) < 0.15
-        );
-        let updatedKeyframes = [...t.keyframes];
-
-        if (existingIdx !== -1) {
-          updatedKeyframes[existingIdx] = {
-            ...updatedKeyframes[existingIdx],
-            ...box,
+        // 2. 再生中の自動追従による更新の場合（現在時刻のキーフレームのみ追加/更新）
+        if (isPlaybackTracking) {
+          const filtered = t.keyframes.filter((k) => Math.abs(k.time - currentTime) >= 0.04);
+          return {
+            ...t,
+            keyframes: [
+              ...filtered,
+              {
+                time: currentTime,
+                ...box,
+              },
+            ].sort((a, b) => a.time - b.time),
           };
-        } else {
-          updatedKeyframes.push({
-            time: currentTime,
-            ...box,
-          });
-          updatedKeyframes.sort((a, b) => a.time - b.time);
         }
+
+        // 3. ユーザーが手動でドラッグ移動・リサイズした場合：
+        // 高密度キーフレーム(0.08秒間隔)が存在するトラックでも指を離した瞬間に元の位置へ戻らないよう、
+        // 現在位置からの移動・拡縮差分を全キーフレームに滑らかに適用し、現在時刻にも正確なキーフレームを配置する
+        const curPos = interpolateKeyframes(t.keyframes, currentTime) || t.keyframes[0];
+        const dx = box.x - curPos.x;
+        const dy = box.y - curPos.y;
+        const scaleX = curPos.width > 0 ? box.width / curPos.width : 1;
+        const scaleY = curPos.height > 0 ? box.height / curPos.height : 1;
+
+        const shiftedKeyframes = t.keyframes
+          .filter((k) => Math.abs(k.time - currentTime) >= 0.12)
+          .map((k) => {
+            const newW = Math.max(15, k.width * scaleX);
+            const newH = Math.max(15, k.height * scaleY);
+            const newX = k.x + dx;
+            const newY = k.y + dy;
+            return {
+              ...k,
+              x: newX,
+              y: newY,
+              width: newW,
+              height: newH,
+              points: k.points
+                ? k.points.map((p) => ({
+                    x: newX + (p.x - k.x) * scaleX,
+                    y: newY + (p.y - k.y) * scaleY,
+                  }))
+                : undefined,
+            };
+          });
+
+        shiftedKeyframes.push({
+          time: currentTime,
+          x: box.x,
+          y: box.y,
+          width: box.width,
+          height: box.height,
+          points: box.points,
+        });
+        shiftedKeyframes.sort((a, b) => a.time - b.time);
 
         return {
           ...t,
-          keyframes: updatedKeyframes,
+          trackingData: t.trackingData
+            ? { ...t.trackingData, isOutOfFrame: false, featurePoints: undefined }
+            : undefined,
+          keyframes: shiftedKeyframes,
         };
       })
     );
@@ -348,7 +388,7 @@ export const App: React.FC = () => {
       offCtx.drawImage(video, 0, 0, width, height);
       let prevGray = toGrayscale(offCtx.getImageData(0, 0, width, height));
 
-      const initialPos = track.keyframes[0];
+      const initialPos = interpolateKeyframes(track.keyframes, startT) || track.keyframes[0];
       let curBox = { x: initialPos.x, y: initialPos.y, width: initialPos.width, height: initialPos.height };
       let featPoints = extractFeaturePoints(prevGray, width, height, curBox, 36);
 
@@ -402,7 +442,15 @@ export const App: React.FC = () => {
       }
 
       setTracks((prev) =>
-        prev.map((t) => (t.id === targetTrackId ? { ...t, keyframes: generatedKeyframes } : t))
+        prev.map((t) =>
+          t.id === targetTrackId
+            ? {
+                ...t,
+                keyframes: generatedKeyframes,
+                trackingData: t.trackingData ? { ...t.trackingData, isOutOfFrame: false } : undefined,
+              }
+            : t
+        )
       );
     } catch (err) {
       console.error('Auto tracking failed', err);

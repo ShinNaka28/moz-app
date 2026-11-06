@@ -210,6 +210,9 @@ export function renderTrackOverlay(
   const { x, y, width, height, points } = pos;
   ctx.save();
 
+  // 1080p/4K動画でもスマホ画面上で枠線やハンドルが細すぎて消えたように見えないよう解像度に応じてスケール補正
+  const scale = Math.max(1, Math.min(3.5, ctx.canvas.width / 720));
+
   const strokeColor = !track.enabled
     ? '#94a3b8' // 無効時はグレー
     : isSelected
@@ -219,13 +222,13 @@ export function renderTrackOverlay(
     : '#f59e0b'; // トラッキングはアンバー
 
   ctx.strokeStyle = strokeColor;
-  ctx.lineWidth = isSelected ? 2.5 : 1.5;
-  ctx.setLineDash(isSelected ? [4, 4] : []);
+  ctx.lineWidth = (isSelected ? 3 : 2) * scale;
+  ctx.setLineDash(isSelected ? [5 * scale, 5 * scale] : []);
 
   // 選択枠の内側ハイライト（ドラッグ可能エリアの視覚化）
   if (isSelected) {
     ctx.save();
-    ctx.fillStyle = 'rgba(56, 189, 248, 0.15)';
+    ctx.fillStyle = 'rgba(56, 189, 248, 0.16)';
     if (track.shape === 'rect' || !points) {
       ctx.fillRect(x, y, width, height);
     } else if (points && points.length > 0) {
@@ -251,23 +254,21 @@ export function renderTrackOverlay(
     if (track.shape === 'polygon' || track.shape === 'lasso') ctx.closePath();
     ctx.stroke();
 
-    // フリー囲み選択時は外枠バウンディングボックスも補助描画
-    if (isSelected) {
-      ctx.save();
-      ctx.strokeStyle = 'rgba(56, 189, 248, 0.45)';
-      ctx.lineWidth = 1;
-      ctx.setLineDash([2, 4]);
-      ctx.strokeRect(x, y, width, height);
-      ctx.restore();
-    }
+    // フリー囲み・ブラシ等の外枠バウンディングボックスも補助描画（常に位置と枠を視認しやすくする）
+    ctx.save();
+    ctx.strokeStyle = isSelected ? 'rgba(56, 189, 248, 0.65)' : 'rgba(245, 158, 11, 0.45)';
+    ctx.lineWidth = 1.5 * scale;
+    ctx.setLineDash([3 * scale, 4 * scale]);
+    ctx.strokeRect(x, y, width, height);
+    ctx.restore();
   }
 
   // 選択時の四隅ハンドル ＆ 中央移動アイコン
   if (isSelected) {
-    const handleSize = 12;
+    const handleSize = Math.round(12 * scale);
     ctx.fillStyle = '#ffffff';
     ctx.strokeStyle = strokeColor;
-    ctx.lineWidth = 2;
+    ctx.lineWidth = 2 * scale;
     ctx.setLineDash([]);
     const corners = [
       { cx: x, cy: y },
@@ -280,19 +281,20 @@ export function renderTrackOverlay(
       ctx.strokeRect(c.cx - handleSize / 2, c.cy - handleSize / 2, handleSize, handleSize);
     }
 
-    // 枠の中央に「✥ 枠内をドラッグで移動」を表示
-    if (width >= 40 && height >= 24) {
+    // 枠の中央に「✥ 枠内ドラッグで移動」を表示
+    if (width >= 40 * scale && height >= 24 * scale) {
       ctx.save();
       ctx.fillStyle = 'rgba(15, 23, 42, 0.85)';
       const moveText = '✥ 枠内ドラッグで移動';
-      ctx.font = 'bold 11px sans-serif';
-      const moveW = ctx.measureText(moveText).width + 12;
-      const moveH = 20;
+      const fontSize = Math.round(11 * scale);
+      ctx.font = `bold ${fontSize}px sans-serif`;
+      const moveW = ctx.measureText(moveText).width + 12 * scale;
+      const moveH = 20 * scale;
       const moveX = x + width / 2 - moveW / 2;
       const moveY = y + height / 2 - moveH / 2;
       ctx.fillRect(moveX, moveY, moveW, moveH);
       ctx.strokeStyle = '#38bdf8';
-      ctx.lineWidth = 1.5;
+      ctx.lineWidth = 1.5 * scale;
       ctx.strokeRect(moveX, moveY, moveW, moveH);
 
       ctx.fillStyle = '#38bdf8';
@@ -308,41 +310,23 @@ export function renderTrackOverlay(
   const label = `${track.name} [${track.enabled ? 'ON' : 'OFF'}]${
     hasKeyframeAtCurrentTime ? ' ★Key' : ''
   }`;
-  ctx.font = 'bold 11px sans-serif';
+  const badgeFontSize = Math.round(11 * scale);
+  ctx.font = `bold ${badgeFontSize}px sans-serif`;
   const textWidth = ctx.measureText(label).width;
-  const badgeH = 18;
-  const badgeW = textWidth + 12;
+  const badgeH = 18 * scale;
+  const badgeW = textWidth + 12 * scale;
   const badgeX = x;
-  const badgeY = Math.max(0, y - badgeH - 2);
+  const badgeY = Math.max(0, y - badgeH - 2 * scale);
 
   ctx.fillStyle = track.enabled ? 'rgba(15, 23, 42, 0.85)' : 'rgba(71, 85, 105, 0.85)';
   ctx.fillRect(badgeX, badgeY, badgeW, badgeH);
   ctx.strokeStyle = strokeColor;
-  ctx.lineWidth = 1;
+  ctx.lineWidth = 1.5 * scale;
   ctx.strokeRect(badgeX, badgeY, badgeW, badgeH);
 
   ctx.fillStyle = track.enabled ? '#ffffff' : '#cbd5e1';
   ctx.textBaseline = 'middle';
-  ctx.fillText(label, badgeX + 6, badgeY + badgeH / 2);
-
-  // 選択中の場合はバッジ横に直接タップできる「✕ 削除」ボタンを描画
-  if (isSelected) {
-    const delBtnW = 48;
-    const delBtnH = badgeH;
-    const delBtnX = badgeX + badgeW + 4;
-    const delBtnY = badgeY;
-
-    ctx.fillStyle = '#b91c1c'; // 赤色
-    ctx.fillRect(delBtnX, delBtnY, delBtnW, delBtnH);
-    ctx.strokeStyle = '#f87171';
-    ctx.lineWidth = 1;
-    ctx.strokeRect(delBtnX, delBtnY, delBtnW, delBtnH);
-
-    ctx.fillStyle = '#ffffff';
-    ctx.font = 'bold 10px sans-serif';
-    ctx.textAlign = 'center';
-    ctx.fillText('✕ 削除', delBtnX + delBtnW / 2, delBtnY + delBtnH / 2);
-  }
+  ctx.fillText(label, badgeX + 6 * scale, badgeY + badgeH / 2);
 
   ctx.restore();
 }
