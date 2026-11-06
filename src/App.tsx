@@ -12,6 +12,7 @@ import { exportMosaicVideo, ExportProgress, saveOrShareBlob } from './utils/vide
 import { generateDemoVideoBlob } from './utils/sampleGenerator';
 import { renderTrackMosaic, renderInverseMosaic, ProtectedRegion } from './utils/mosaicRenderer';
 import { extractFeaturePoints, toGrayscale, trackBox, interpolateKeyframes } from './utils/tracking';
+import { requestScreenWakeLock, releaseScreenWakeLock, seekVideoSafely } from './utils/wakeLock';
 
 export const App: React.FC = () => {
   // メディア状態
@@ -36,6 +37,7 @@ export const App: React.FC = () => {
 
   // AIおよびエクスポート進行状態
   const [isAIDetecting, setIsAIDetecting] = useState<boolean>(false);
+  const [aiDetectProgress, setAiDetectProgress] = useState<number>(0);
   const [aiSensitivity, setAiSensitivity] = useState<'strict' | 'standard' | 'high'>('strict');
   const [isTrackingProcessing, setIsTrackingProcessing] = useState<boolean>(false);
   const [exportProgress, setExportProgress] = useState<ExportProgress | null>(null);
@@ -360,6 +362,8 @@ export const App: React.FC = () => {
     if (!track || track.keyframes.length === 0) return;
 
     setIsTrackingProcessing(true);
+    await requestScreenWakeLock();
+
     const video = videoRef.current;
     const origTime = video.currentTime;
     const width = video.videoWidth;
@@ -375,15 +379,8 @@ export const App: React.FC = () => {
       const endT = track.endTime;
       const step = 0.08; // 12.5fpsの高密度サンプリング
 
-      // 開始フレームにシーク
-      video.currentTime = startT;
-      await new Promise<void>((r) => {
-        const onSeeked = () => {
-          video.removeEventListener('seeked', onSeeked);
-          r();
-        };
-        video.addEventListener('seeked', onSeeked);
-      });
+      // 開始フレームに安全にシーク
+      await seekVideoSafely(video, startT);
 
       offCtx.drawImage(video, 0, 0, width, height);
       let prevGray = toGrayscale(offCtx.getImageData(0, 0, width, height));
@@ -406,15 +403,7 @@ export const App: React.FC = () => {
       const totalSteps = Math.floor((endT - startT) / step);
       for (let s = 1; s <= totalSteps; s++) {
         const curT = Math.min(endT, startT + s * step);
-        video.currentTime = curT;
-
-        await new Promise<void>((r) => {
-          const onSeeked = () => {
-            video.removeEventListener('seeked', onSeeked);
-            r();
-          };
-          video.addEventListener('seeked', onSeeked);
-        });
+        await seekVideoSafely(video, curT);
 
         offCtx.drawImage(video, 0, 0, width, height);
         const currGray = toGrayscale(offCtx.getImageData(0, 0, width, height));
@@ -455,15 +444,18 @@ export const App: React.FC = () => {
     } catch (err) {
       console.error('Auto tracking failed', err);
     } finally {
-      video.currentTime = origTime;
+      await seekVideoSafely(video, origTime);
+      await releaseScreenWakeLock();
       setIsTrackingProcessing(false);
     }
   };
 
-  // MediaPipe による高密度・AI人物顔自動検出＆追跡（手や物体の誤検出防止フィルタ付き）
+  // MediaPipe による高密度・AI人物顔自動検出＆追跡（手や物体の誤検出防止フィルタ＋画面オフ防止付き）
   const handleRunAIFaceDetection = async () => {
     if (!videoRef.current && !imageRef.current) return;
     setIsAIDetecting(true);
+    setAiDetectProgress(0);
+    await requestScreenWakeLock();
 
     // 感度設定に応じたフィルタパラメータ
     const filterOptions: FaceFilterOptions = {
@@ -508,6 +500,7 @@ export const App: React.FC = () => {
             keyframes: [{ time: 0, ...padded }],
           };
         });
+        setAiDetectProgress(100);
         setTracks((prev) => [...prev, ...newAITracks]);
       } else if (videoRef.current) {
         // 動画の場合: 0.08秒間隔（約12.5fps）の超高密度スキャン
@@ -515,7 +508,7 @@ export const App: React.FC = () => {
         const origTime = video.currentTime;
         const totalDuration = video.duration || 5;
         const step = 0.08;
-        const totalSteps = Math.floor(totalDuration / step);
+        const totalSteps = Math.max(1, Math.floor(totalDuration / step));
 
         let currentDetectedPersons: any[] = [];
         const personKeyframesMap = new Map<number, any[]>();
@@ -523,15 +516,9 @@ export const App: React.FC = () => {
 
         for (let i = 0; i <= totalSteps; i++) {
           const sampleTime = Math.min(totalDuration, i * step);
-          video.currentTime = sampleTime;
+          await seekVideoSafely(video, sampleTime);
 
-          await new Promise<void>((res) => {
-            const onSeeked = () => {
-              video.removeEventListener('seeked', onSeeked);
-              res();
-            };
-            video.addEventListener('seeked', onSeeked);
-          });
+          setAiDetectProgress(Math.round((i / totalSteps) * 100));
 
           const result = detector.detect(video);
           // 手や背景などの誤検出を幾何学・スコアで除外
@@ -609,14 +596,16 @@ export const App: React.FC = () => {
           }
         });
 
-        video.currentTime = origTime;
+        await seekVideoSafely(video, origTime);
         setTracks((prev) => [...prev, ...newTracks]);
       }
     } catch (err) {
       console.error('AI Detection failed', err);
       alert('AI検出の実行に失敗しました: ' + (err as Error).message);
     } finally {
+      await releaseScreenWakeLock();
       setIsAIDetecting(false);
+      setAiDetectProgress(0);
     }
   };
 
@@ -771,6 +760,23 @@ export const App: React.FC = () => {
         onRunTrackingForSelectedTrack={() => selectedTrackId && runTrackingForTrack(selectedTrackId)}
         isTrackingProcessing={isTrackingProcessing}
       />
+
+      {/* AI顔検出・自動追従解析中のスリープ防止＆進捗ステータスバー */}
+      {(isAIDetecting || isTrackingProcessing) && (
+        <div className="bg-emerald-950/90 border-b border-emerald-500/40 px-3 py-1.5 flex items-center justify-between gap-3 text-xs text-emerald-200 z-30">
+          <div className="flex items-center gap-2 font-semibold">
+            <span className="inline-block w-2 h-2 rounded-full bg-emerald-400 animate-ping" />
+            <span>
+              {isAIDetecting
+                ? `AI顔自動検出を実行中... (${aiDetectProgress}%)`
+                : '自動追従区間を解析中...'}
+            </span>
+          </div>
+          <span className="text-[11px] bg-emerald-900/80 border border-emerald-600/50 text-emerald-300 px-2 py-0.5 rounded-full font-medium shrink-0">
+            ⚡ 画面オフ（スリープ）防止作動中
+          </span>
+        </div>
+      )}
 
       {/* スマホ専用ビュー切り替えタブ（PCでは非表示） */}
       {mediaUrl && (
