@@ -65,8 +65,11 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
     type: 'move' | 'nw' | 'ne' | 'se' | 'sw';
     trackId: string;
     startMouse: Point;
-    initialBox: { x: number; y: number; width: number; height: number };
+    initialBox: { x: number; y: number; width: number; height: number; points?: Point[] };
   } | null>(null);
+
+  // マウスカーソル状態
+  const [cursorStyle, setCursorStyle] = useState<string>('cursor-crosshair');
 
   // キャンバス座標系への変換
   const getCanvasCoords = (e: React.MouseEvent | React.TouchEvent): Point | null => {
@@ -295,33 +298,29 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
     const pt = getCanvasCoords(e);
     if (!pt) return;
 
-    if (editorMode === 'select') {
-      // 既存トラックまたはハンドルのヒットテスト
-      for (let i = tracks.length - 1; i >= 0; i--) {
-        const track = tracks[i];
-        if (currentTime < track.startTime || currentTime > track.endTime) continue;
-        const pos = interpolateKeyframes(track.keyframes, currentTime);
-        if (!pos) continue;
-
-        // 選択中の場合の「✕ 削除」ボタン判定
-        if (track.id === selectedTrackId && onDeleteTrack) {
-          const badgeH = 22;
-          const badgeY = Math.max(0, pos.y - badgeH - 4);
-          // ラベルバッジの右側に表示される削除ボタン（幅約50px）
-          if (
-            pt.x >= pos.x + 60 &&
-            pt.x <= pos.x + 190 &&
-            pt.y >= badgeY - 6 &&
-            pt.y <= badgeY + badgeH + 6
-          ) {
-            onDeleteTrack(track.id);
-            return;
+    // 1. 選択中のトラックがある場合、そのハンドル・削除ボタン・枠内移動を最優先判定（モード問わず）
+    if (selectedTrackId) {
+      const selectedTrack = tracks.find((t) => t.id === selectedTrackId);
+      if (selectedTrack && currentTime >= selectedTrack.startTime && currentTime <= selectedTrack.endTime) {
+        const pos = interpolateKeyframes(selectedTrack.keyframes, currentTime);
+        if (pos) {
+          // 「✕ 削除」ボタン判定
+          if (onDeleteTrack) {
+            const badgeH = 22;
+            const badgeY = Math.max(0, pos.y - badgeH - 4);
+            if (
+              pt.x >= pos.x + 60 &&
+              pt.x <= pos.x + 200 &&
+              pt.y >= badgeY - 6 &&
+              pt.y <= badgeY + badgeH + 6
+            ) {
+              onDeleteTrack(selectedTrack.id);
+              return;
+            }
           }
-        }
 
-        // ハンドル判定（選択中の場合）
-        if (track.id === selectedTrackId) {
-          const handleSize = 16;
+          // 四隅の変形ハンドル判定
+          const handleSize = 18;
           const corners: Array<{ type: 'nw' | 'ne' | 'se' | 'sw'; cx: number; cy: number }> = [
             { type: 'nw', cx: pos.x, cy: pos.y },
             { type: 'ne', cx: pos.x + pos.width, cy: pos.y },
@@ -332,33 +331,66 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
             if (Math.hypot(pt.x - c.cx, pt.y - c.cy) <= handleSize) {
               setTransformState({
                 type: c.type,
-                trackId: track.id,
+                trackId: selectedTrack.id,
                 startMouse: pt,
-                initialBox: { ...pos },
+                initialBox: { ...pos, points: pos.points ? [...pos.points] : undefined },
               });
               return;
             }
           }
-        }
 
-        // 枠内クリック判定
-        if (
-          pt.x >= pos.x &&
-          pt.x <= pos.x + pos.width &&
-          pt.y >= pos.y &&
-          pt.y <= pos.y + pos.height
-        ) {
-          onSelectTrack(track.id);
-          setTransformState({
-            type: 'move',
-            trackId: track.id,
-            startMouse: pt,
-            initialBox: { ...pos },
-          });
-          return;
+          // 枠内（またはバッジエリア）クリック判定 -> 即座にドラッグ移動開始！
+          const badgeH = 22;
+          const inBadge =
+            pt.x >= pos.x &&
+            pt.x <= pos.x + pos.width &&
+            pt.y >= Math.max(0, pos.y - badgeH - 4) &&
+            pt.y <= pos.y;
+          const inBox =
+            pt.x >= pos.x - 6 &&
+            pt.x <= pos.x + pos.width + 6 &&
+            pt.y >= pos.y - 6 &&
+            pt.y <= pos.y + pos.height + 6;
+
+          if (inBadge || inBox) {
+            setTransformState({
+              type: 'move',
+              trackId: selectedTrack.id,
+              startMouse: pt,
+              initialBox: { ...pos, points: pos.points ? [...pos.points] : undefined },
+            });
+            return;
+          }
         }
       }
+    }
 
+    // 2. 他の既存トラックをクリックしたか判定（枠の上を触ればいつでもその枠を選択して移動開始）
+    for (let i = tracks.length - 1; i >= 0; i--) {
+      const track = tracks[i];
+      if (currentTime < track.startTime || currentTime > track.endTime) continue;
+      const pos = interpolateKeyframes(track.keyframes, currentTime);
+      if (!pos) continue;
+
+      if (
+        pt.x >= pos.x - 4 &&
+        pt.x <= pos.x + pos.width + 4 &&
+        pt.y >= pos.y - 4 &&
+        pt.y <= pos.y + pos.height + 4
+      ) {
+        onSelectTrack(track.id);
+        setTransformState({
+          type: 'move',
+          trackId: track.id,
+          startMouse: pt,
+          initialBox: { ...pos, points: pos.points ? [...pos.points] : undefined },
+        });
+        return;
+      }
+    }
+
+    // 3. 枠外をクリックした場合の処理
+    if (editorMode === 'select') {
       onSelectTrack(null);
     } else if (editorMode === 'add_rect' || editorMode === 'add_brush' || editorMode === 'add_lasso') {
       setDrawingState({
@@ -376,7 +408,6 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
           points: [pt],
         });
       } else {
-        // 始点近くならポリゴンを閉じて確定
         const first = drawingState.points[0];
         if (drawingState.points.length >= 3 && Math.hypot(pt.x - first.x, pt.y - first.y) < 20) {
           finishDrawingPolygon(drawingState.points);
@@ -396,6 +427,7 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
     const pt = getCanvasCoords(e);
     if (!pt) return;
 
+    // ドラッグ変形・位置移動処理
     if (transformState) {
       const dx = pt.x - transformState.startMouse.x;
       const dy = pt.y - transformState.startMouse.y;
@@ -404,30 +436,88 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
       let newBox = { ...init };
 
       if (transformState.type === 'move') {
+        // 枠全体のドラッグ移動
         newBox.x = init.x + dx;
         newBox.y = init.y + dy;
-      } else if (transformState.type === 'se') {
-        newBox.width = Math.max(10, init.width + dx);
-        newBox.height = Math.max(10, init.height + dy);
-      } else if (transformState.type === 'sw') {
-        newBox.x = init.x + dx;
-        newBox.width = Math.max(10, init.width - dx);
-        newBox.height = Math.max(10, init.height + dy);
-      } else if (transformState.type === 'ne') {
-        newBox.y = init.y + dy;
-        newBox.width = Math.max(10, init.width + dx);
-        newBox.height = Math.max(10, init.height - dy);
-      } else if (transformState.type === 'nw') {
-        newBox.x = init.x + dx;
-        newBox.y = init.y + dy;
-        newBox.width = Math.max(10, init.width - dx);
-        newBox.height = Math.max(10, init.height - dy);
+
+        // フリー囲み（投げ縄・ブラシ・ポリゴン）の頂点群もすべて同期平行移動！
+        if (init.points) {
+          newBox.points = init.points.map((p) => ({
+            x: p.x + dx,
+            y: p.y + dy,
+          }));
+        }
+      } else {
+        // 四隅ハンドルのリサイズ変形
+        if (transformState.type === 'se') {
+          newBox.width = Math.max(15, init.width + dx);
+          newBox.height = Math.max(15, init.height + dy);
+        } else if (transformState.type === 'sw') {
+          newBox.x = init.x + dx;
+          newBox.width = Math.max(15, init.width - dx);
+          newBox.height = Math.max(15, init.height + dy);
+        } else if (transformState.type === 'ne') {
+          newBox.y = init.y + dy;
+          newBox.width = Math.max(15, init.width + dx);
+          newBox.height = Math.max(15, init.height - dy);
+        } else if (transformState.type === 'nw') {
+          newBox.x = init.x + dx;
+          newBox.y = init.y + dy;
+          newBox.width = Math.max(15, init.width - dx);
+          newBox.height = Math.max(15, init.height - dy);
+        }
+
+        // リサイズ時のフリー囲み頂点群のスケーリング
+        if (init.points && init.width > 0 && init.height > 0) {
+          const scaleX = newBox.width / init.width;
+          const scaleY = newBox.height / init.height;
+          newBox.points = init.points.map((p) => ({
+            x: newBox.x + (p.x - init.x) * scaleX,
+            y: newBox.y + (p.y - init.y) * scaleY,
+          }));
+        }
       }
 
       onUpdateTrackKeyframe(transformState.trackId, newBox);
       return;
     }
 
+    // ホバー時のカーソルスタイル更新（マウス操作時）
+    if (!('touches' in e)) {
+      if (selectedTrackId) {
+        const selectedTrack = tracks.find((t) => t.id === selectedTrackId);
+        if (selectedTrack) {
+          const pos = interpolateKeyframes(selectedTrack.keyframes, currentTime);
+          if (pos) {
+            const handleSize = 16;
+            const corners = [
+              { type: 'nw', cx: pos.x, cy: pos.y },
+              { type: 'ne', cx: pos.x + pos.width, cy: pos.y },
+              { type: 'se', cx: pos.x + pos.width, cy: pos.y + pos.height },
+              { type: 'sw', cx: pos.x, cy: pos.y + pos.height },
+            ];
+            const hitCorner = corners.find((c) => Math.hypot(pt.x - c.cx, pt.y - c.cy) <= handleSize);
+            if (hitCorner) {
+              if (hitCorner.type === 'nw' || hitCorner.type === 'se') {
+                setCursorStyle('cursor-nwse-resize');
+              } else {
+                setCursorStyle('cursor-nesw-resize');
+              }
+              return;
+            }
+
+            if (pt.x >= pos.x && pt.x <= pos.x + pos.width && pt.y >= pos.y && pt.y <= pos.y + pos.height) {
+              setCursorStyle('cursor-move');
+              return;
+            }
+          }
+        }
+      }
+
+      setCursorStyle(editorMode === 'select' ? 'cursor-default' : 'cursor-crosshair');
+    }
+
+    // 新規囲みの描画中
     if (drawingState && drawingState.isDrawing) {
       setDrawingState({
         ...drawingState,
@@ -595,7 +685,7 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
         onTouchStart={handlePointerDown}
         onTouchMove={handlePointerMove}
         onTouchEnd={handlePointerUp}
-        className="max-w-full max-h-[55vh] sm:max-h-[70vh] object-contain shadow-2xl rounded border border-slate-800 touch-none cursor-crosshair"
+        className={`max-w-full max-h-[55vh] sm:max-h-[70vh] object-contain shadow-2xl rounded border border-slate-800 touch-none ${cursorStyle}`}
       />
     </div>
   );

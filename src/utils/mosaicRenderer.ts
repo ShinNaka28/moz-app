@@ -224,24 +224,6 @@ export function renderTrackOverlay(
 
   if (track.shape === 'rect' || !points) {
     ctx.strokeRect(x, y, width, height);
-
-    // 四隅のハンドル（選択時）
-    if (isSelected) {
-      const handleSize = 8;
-      ctx.fillStyle = '#ffffff';
-      ctx.strokeStyle = strokeColor;
-      ctx.setLineDash([]);
-      const corners = [
-        { cx: x, cy: y },
-        { cx: x + width, cy: y },
-        { cx: x, cy: y + height },
-        { cx: x + width, cy: y + height },
-      ];
-      for (const c of corners) {
-        ctx.fillRect(c.cx - handleSize / 2, c.cy - handleSize / 2, handleSize, handleSize);
-        ctx.strokeRect(c.cx - handleSize / 2, c.cy - handleSize / 2, handleSize, handleSize);
-      }
-    }
   } else if (points && points.length > 0) {
     ctx.beginPath();
     ctx.moveTo(points[0].x, points[0].y);
@@ -250,6 +232,57 @@ export function renderTrackOverlay(
     }
     if (track.shape === 'polygon' || track.shape === 'lasso') ctx.closePath();
     ctx.stroke();
+
+    // フリー囲み選択時は外枠バウンディングボックスも補助描画
+    if (isSelected) {
+      ctx.save();
+      ctx.strokeStyle = 'rgba(56, 189, 248, 0.45)';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([2, 4]);
+      ctx.strokeRect(x, y, width, height);
+      ctx.restore();
+    }
+  }
+
+  // 選択時の四隅ハンドル ＆ 中央移動アイコン
+  if (isSelected) {
+    const handleSize = 10;
+    ctx.fillStyle = '#ffffff';
+    ctx.strokeStyle = strokeColor;
+    ctx.lineWidth = 2;
+    ctx.setLineDash([]);
+    const corners = [
+      { cx: x, cy: y },
+      { cx: x + width, cy: y },
+      { cx: x + width, cy: y + height },
+      { cx: x, cy: y + height },
+    ];
+    for (const c of corners) {
+      ctx.fillRect(c.cx - handleSize / 2, c.cy - handleSize / 2, handleSize, handleSize);
+      ctx.strokeRect(c.cx - handleSize / 2, c.cy - handleSize / 2, handleSize, handleSize);
+    }
+
+    // 枠の中央に「✥ ドラッグで移動」を表示
+    if (width >= 40 && height >= 30) {
+      ctx.save();
+      ctx.fillStyle = 'rgba(15, 23, 42, 0.75)';
+      const moveText = '✥ ドラッグで移動';
+      ctx.font = 'bold 10px sans-serif';
+      const moveW = ctx.measureText(moveText).width + 10;
+      const moveH = 18;
+      const moveX = x + width / 2 - moveW / 2;
+      const moveY = y + height / 2 - moveH / 2;
+      ctx.fillRect(moveX, moveY, moveW, moveH);
+      ctx.strokeStyle = 'rgba(56, 189, 248, 0.7)';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(moveX, moveY, moveW, moveH);
+
+      ctx.fillStyle = '#38bdf8';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(moveText, x + width / 2, y + height / 2);
+      ctx.restore();
+    }
   }
 
   // ラベルバッジ（トラック名 + ON/OFFステータス）
