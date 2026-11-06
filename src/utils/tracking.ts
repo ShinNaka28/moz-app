@@ -331,11 +331,37 @@ export function interpolateKeyframes(
   const height = prev.height + (next.height - prev.height) * alpha;
 
   let points: Point[] | undefined = undefined;
-  if (prev.points && next.points && prev.points.length === next.points.length) {
-    points = prev.points.map((p, idx) => ({
-      x: p.x + (next.points![idx].x - p.x) * alpha,
-      y: p.y + (next.points![idx].y - p.y) * alpha,
-    }));
+  if (prev.points && prev.points.length > 0 && next.points && next.points.length > 0) {
+    if (prev.points.length === next.points.length) {
+      points = prev.points.map((p, idx) => ({
+        x: p.x + (next.points![idx].x - p.x) * alpha,
+        y: p.y + (next.points![idx].y - p.y) * alpha,
+      }));
+    } else {
+      // 頂点数が異なるフレーム間でも輪郭ポリゴンが決して消えて矩形(rect)に退化しないよう、比率インデックスで線形補間
+      const count = prev.points.length;
+      const nextLen = next.points.length;
+      points = prev.points.map((p, idx) => {
+        const nextF = (idx / count) * nextLen;
+        const nIdx0 = Math.floor(nextF) % nextLen;
+        const nIdx1 = (nIdx0 + 1) % nextLen;
+        const frac = nextF - Math.floor(nextF);
+        const npX = next.points![nIdx0].x + (next.points![nIdx1].x - next.points![nIdx0].x) * frac;
+        const npY = next.points![nIdx0].y + (next.points![nIdx1].y - next.points![nIdx0].y) * frac;
+        return {
+          x: p.x + (npX - p.x) * alpha,
+          y: p.y + (npY - p.y) * alpha,
+        };
+      });
+    }
+  } else if (prev.points && prev.points.length > 0) {
+    const dx = x - prev.x;
+    const dy = y - prev.y;
+    points = prev.points.map((p) => ({ x: p.x + dx, y: p.y + dy }));
+  } else if (next.points && next.points.length > 0) {
+    const dx = x - next.x;
+    const dy = y - next.y;
+    points = next.points.map((p) => ({ x: p.x + dx, y: p.y + dy }));
   }
 
   return { x, y, width, height, points };

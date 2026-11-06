@@ -254,13 +254,15 @@ export function renderTrackOverlay(
     if (track.shape === 'polygon' || track.shape === 'lasso') ctx.closePath();
     ctx.stroke();
 
-    // フリー囲み・ブラシ等の外枠バウンディングボックスも補助描画（常に位置と枠を視認しやすくする）
-    ctx.save();
-    ctx.strokeStyle = isSelected ? 'rgba(56, 189, 248, 0.65)' : 'rgba(245, 158, 11, 0.45)';
-    ctx.lineWidth = 1.5 * scale;
-    ctx.setLineDash([3 * scale, 4 * scale]);
-    ctx.strokeRect(x, y, width, height);
-    ctx.restore();
+    // 選択中のみリサイズハンドル操作の目安として外枠バウンディングボックスを補助描画（非選択時は体のラインの輪郭線のみをクリアに表示）
+    if (isSelected) {
+      ctx.save();
+      ctx.strokeStyle = 'rgba(56, 189, 248, 0.55)';
+      ctx.lineWidth = 1.5 * scale;
+      ctx.setLineDash([3 * scale, 4 * scale]);
+      ctx.strokeRect(x, y, width, height);
+      ctx.restore();
+    }
   }
 
   // 選択時の四隅ハンドル ＆ 中央移動アイコン

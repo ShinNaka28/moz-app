@@ -7,7 +7,7 @@ import { PersonListPanel } from './components/PersonListPanel';
 import { ExportModal } from './components/ExportModal';
 import { EditorMode, MosaicTrack, MosaicType, Point, Keyframe } from './types';
 import { Film, ListFilter, Clock, Play, Pause, RotateCcw, Trash2, Crosshair, Sparkles } from 'lucide-react';
-import { initFaceDetector, initPersonSegmenter, detectFacesSafely, segmentPersonSafely, updatePersonTracks, expandBoxWithMargin, estimateBodyBoxFromFace, isValidFaceDetection, FaceFilterOptions } from './utils/aiDetector';
+import { initFaceDetector, initPersonSegmenter, detectFacesSafely, segmentPersonSafely, updatePersonTracks, expandBoxWithMargin, estimateBodyBoxFromFace, createBodySilhouettePolygon, isValidFaceDetection, FaceFilterOptions } from './utils/aiDetector';
 import { exportMosaicVideo, ExportProgress, saveOrShareBlob } from './utils/videoExporter';
 import { generateDemoVideoBlob } from './utils/sampleGenerator';
 import { renderTrackMosaic, renderInverseMosaic, ProtectedRegion } from './utils/mosaicRenderer';
@@ -539,7 +539,7 @@ export const App: React.FC = () => {
 
           await seekVideoSafely(video, origTime);
 
-          if (keyframes.length >= 2) {
+          if (keyframes.length >= 1) {
             const newTrack: MosaicTrack = {
               id: `ai-body-${Date.now()}`,
               name: 'AI人物 (体ライン)',
@@ -548,8 +548,8 @@ export const App: React.FC = () => {
               enabled: true,
               mosaicType: 'pixel',
               strength: 14,
-              startTime: keyframes[0].time,
-              endTime: keyframes[keyframes.length - 1].time + 0.3,
+              startTime: 0,
+              endTime: Math.max(totalDuration, keyframes[keyframes.length - 1].time + 0.3),
               keyframes,
               aiTarget: 'body',
             };
@@ -617,18 +617,21 @@ export const App: React.FC = () => {
         const finalBox = targetMode === 'body'
           ? estimateBodyBoxFromFace(rawBox, width, height)
           : expandBoxWithMargin(rawBox, 0.35, width, height);
+        const bodyPoints = targetMode === 'body'
+          ? createBodySilhouettePolygon(finalBox, width, height)
+          : undefined;
 
         return {
           id: `ai-person-${Date.now()}-${idx}`,
-          name: targetMode === 'body' ? `AI人物 #${idx + 1}` : `AI顔 #${idx + 1}`,
+          name: targetMode === 'body' ? `AI人物 (体ライン) #${idx + 1}` : `AI顔 #${idx + 1}`,
           type: 'ai',
-          shape: 'rect',
+          shape: targetMode === 'body' ? 'polygon' : 'rect',
           enabled: true,
           mosaicType: 'pixel',
           strength: 14,
           startTime: 0,
           endTime: 1,
-          keyframes: [{ time: 0, ...finalBox }],
+          keyframes: [{ time: 0, ...finalBox, points: bodyPoints }],
           aiTarget: targetMode,
         };
       });
@@ -691,6 +694,9 @@ export const App: React.FC = () => {
           const boxToStore = targetMode === 'body'
             ? estimateBodyBoxFromFace(p.box, videoWidth, videoHeight)
             : p.box;
+          const bodyPoints = targetMode === 'body'
+            ? createBodySilhouettePolygon(boxToStore, videoWidth, videoHeight)
+            : undefined;
 
           personKeyframesMap.get(p.trackId)!.push({
             time: sampleTime,
@@ -698,6 +704,7 @@ export const App: React.FC = () => {
             y: boxToStore.y,
             width: boxToStore.width,
             height: boxToStore.height,
+            points: bodyPoints,
           });
           personScoresMap.get(p.trackId)!.push(p.score);
         }
@@ -713,9 +720,9 @@ export const App: React.FC = () => {
           if (avgScore >= filterOptions.minScore! * 0.95) {
             newTracks.push({
               id: `ai-track-${personId}-${Date.now()}`,
-              name: targetMode === 'body' ? `AI人物 #${personId}` : `AI顔 #${personId}`,
+              name: targetMode === 'body' ? `AI人物 (体ライン) #${personId}` : `AI顔 #${personId}`,
               type: 'ai',
-              shape: 'rect',
+              shape: targetMode === 'body' ? 'polygon' : 'rect',
               enabled: true,
               mosaicType: 'pixel',
               strength: 14,
