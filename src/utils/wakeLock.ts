@@ -82,6 +82,13 @@ export async function seekVideoSafely(
     return;
   }
 
+  // スマホブラウザで初期状態 (currentTime=0, readyState<2) のまま currentTime=0 を代入しても
+  // seeked やフレームデコードが発火しないケースを防ぐため、微小オフセット(0.001秒)を与えて確実にデコードさせる
+  const effectiveTime =
+    Math.abs(video.currentTime - targetTime) < 0.001 && video.readyState < 2
+      ? Math.min(video.duration || 0.1, targetTime + 0.001)
+      : targetTime;
+
   return new Promise<void>((resolve) => {
     let settled = false;
     const finish = () => {
@@ -89,6 +96,7 @@ export async function seekVideoSafely(
       settled = true;
       clearTimeout(timer);
       video.removeEventListener('seeked', finish);
+      video.removeEventListener('loadeddata', finish);
       document.removeEventListener('visibilitychange', onVisChange);
       resolve();
     };
@@ -96,17 +104,18 @@ export async function seekVideoSafely(
     const onVisChange = () => {
       if (document.visibilityState === 'visible' && !settled) {
         try {
-          video.currentTime = targetTime;
+          video.currentTime = effectiveTime;
         } catch (_) {}
       }
     };
 
     const timer = setTimeout(finish, timeoutMs);
     video.addEventListener('seeked', finish, { once: true });
+    video.addEventListener('loadeddata', finish, { once: true });
     document.addEventListener('visibilitychange', onVisChange);
 
     try {
-      video.currentTime = targetTime;
+      video.currentTime = effectiveTime;
     } catch (_) {
       finish();
     }

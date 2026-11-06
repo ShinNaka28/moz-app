@@ -7,7 +7,7 @@ import { PersonListPanel } from './components/PersonListPanel';
 import { ExportModal } from './components/ExportModal';
 import { EditorMode, MosaicTrack, MosaicType, Point, Keyframe } from './types';
 import { Film, ListFilter, Clock, Play, Pause, RotateCcw, Trash2, Crosshair, Sparkles } from 'lucide-react';
-import { initFaceDetector, updatePersonTracks, expandBoxWithMargin, isValidFaceDetection, FaceFilterOptions } from './utils/aiDetector';
+import { initFaceDetector, detectFacesSafely, updatePersonTracks, expandBoxWithMargin, isValidFaceDetection, FaceFilterOptions } from './utils/aiDetector';
 import { exportMosaicVideo, ExportProgress, saveOrShareBlob } from './utils/videoExporter';
 import { generateDemoVideoBlob } from './utils/sampleGenerator';
 import { renderTrackMosaic, renderInverseMosaic, ProtectedRegion } from './utils/mosaicRenderer';
@@ -114,6 +114,12 @@ export const App: React.FC = () => {
   const handleLoadedMetadata = () => {
     if (videoRef.current) {
       setDuration(videoRef.current.duration || 1);
+      // スマホブラウザで初期フレームが未デコード(readyState < 2)のままになるのを防ぐため微小シークで先頭フレームをデコード
+      if (videoRef.current.readyState < 2 && videoRef.current.currentTime === 0) {
+        try {
+          videoRef.current.currentTime = 0.001;
+        } catch (_) {}
+      }
     }
   };
 
@@ -467,11 +473,13 @@ export const App: React.FC = () => {
     const minPersistenceFrames = aiSensitivity === 'strict' ? 4 : aiSensitivity === 'standard' ? 3 : 2;
 
     try {
-      const detector = await initFaceDetector(filterOptions.minScore! * 0.9);
+      const confidence = filterOptions.minScore! * 0.9;
+      let detector = await initFaceDetector(confidence);
 
       if (isImage && imageRef.current) {
-        // 静止画の場合
-        const result = detector.detect(imageRef.current);
+        // 静止画の場合（2D Canvas転写経由でWebGL2エラーを防止）
+        const result = await detectFacesSafely(imageRef.current, detector, confidence);
+        detector = result.activeDetector;
         const validDetections = (result.detections || []).filter((det) =>
           isValidFaceDetection(det, filterOptions)
         );
@@ -520,7 +528,9 @@ export const App: React.FC = () => {
 
           setAiDetectProgress(Math.round((i / totalSteps) * 100));
 
-          const result = detector.detect(video);
+          // <video> を直接 WebGL2 texImage2D に渡さず、2D Canvas に転写してから安全に検出
+          const result = await detectFacesSafely(video, detector, confidence);
+          detector = result.activeDetector;
           // 手や背景などの誤検出を幾何学・スコアで除外
           const validDetections = (result.detections || []).filter((det) =>
             isValidFaceDetection(det, filterOptions)
@@ -702,7 +712,7 @@ export const App: React.FC = () => {
 
   return (
     <div className="flex flex-col min-h-screen md:h-screen w-screen overflow-x-hidden overflow-y-auto md:overflow-hidden bg-slate-950 text-slate-100">
-      {/* 隠しメディア要素 */}
+      {/* 隠しメディア要素（display:none だとスマホのハードウェアデコーダがフレーム描画を省略することがあるため画面外1px配置） */}
       {mediaUrl && (
         <>
           {isImage ? (
@@ -710,18 +720,18 @@ export const App: React.FC = () => {
               ref={imageRef}
               src={mediaUrl}
               alt="Source"
-              className="hidden"
+              className="fixed -left-[9999px] -top-[9999px] w-px h-px opacity-0 pointer-events-none"
             />
           ) : (
             <video
               ref={videoRef}
               src={mediaUrl}
+              preload="auto"
               onLoadedMetadata={handleLoadedMetadata}
               onTimeUpdate={handleTimeUpdate}
               onEnded={handleEnded}
               playsInline
-              crossOrigin="anonymous"
-              className="hidden"
+              className="fixed -left-[9999px] -top-[9999px] w-px h-px opacity-0 pointer-events-none"
             />
           )}
         </>

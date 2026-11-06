@@ -67,8 +67,17 @@ export function isValidFaceDetection(
 }
 
 // 完全ローカルから MediaPipe Face Detector を初期化
-export async function initFaceDetector(confidence = 0.45): Promise<FaceDetector> {
-  if (faceDetectorInstance) return faceDetectorInstance;
+export async function initFaceDetector(
+  confidence = 0.45,
+  forceCpu = false
+): Promise<FaceDetector> {
+  if (faceDetectorInstance && !forceCpu) return faceDetectorInstance;
+  if (forceCpu && faceDetectorInstance) {
+    try {
+      faceDetectorInstance.close();
+    } catch (_) {}
+    faceDetectorInstance = null;
+  }
   if (isInitializing) {
     while (isInitializing) {
       await new Promise((r) => setTimeout(r, 100));
@@ -84,17 +93,20 @@ export async function initFaceDetector(confidence = 0.45): Promise<FaceDetector>
 
     // ローカルの wasm を参照
     const vision = await FilesetResolver.forVisionTasks(wasmPath);
-    faceDetectorInstance = await FaceDetector.createFromOptions(vision, {
-      baseOptions: {
-        modelAssetPath: modelPath,
-        delegate: 'GPU',
-      },
-      runningMode: 'IMAGE',
-      minDetectionConfidence: confidence,
-    });
-    return faceDetectorInstance;
+    if (!forceCpu) {
+      faceDetectorInstance = await FaceDetector.createFromOptions(vision, {
+        baseOptions: {
+          modelAssetPath: modelPath,
+          delegate: 'GPU',
+        },
+        runningMode: 'IMAGE',
+        minDetectionConfidence: confidence,
+      });
+      return faceDetectorInstance;
+    }
+    throw new Error('Force CPU delegate');
   } catch (err) {
-    console.warn('GPU delegate failed, fallback to CPU delegate', err);
+    console.warn('GPU delegate skipped or failed, using CPU delegate', err);
     // CPUフォールバック
     const baseUrl = import.meta.env.BASE_URL.replace(/\/$/, '');
     const wasmPath = `${baseUrl}/wasm`;
@@ -113,6 +125,103 @@ export async function initFaceDetector(confidence = 0.45): Promise<FaceDetector>
   } finally {
     isInitializing = false;
   }
+}
+
+// 2D Canvas バッファ（<video> を直接 WebGL2 texImage2D に渡すとスマホ環境で未デコードや cross-origin エラーになる問題を完全回避）
+let sharedDetCanvas: HTMLCanvasElement | null = null;
+
+/**
+ * スマホ・PC問わず安全に顔検出を実行するラッパー関数
+ * - <video> や <img> を一度同一オリジンの2D Canvasに転写してから MediaPipe に渡すことで
+ *   WebGL2 texImage2D の "The video element contains cross-origin data, and may not be loaded" エラーを根絶
+ * - 万が一 WebGL2 実行時エラーが起きた場合も自動的に CPU デリゲートへフォールバックして継続
+ */
+export async function detectFacesSafely(
+  source: HTMLVideoElement | HTMLImageElement,
+  detector: FaceDetector,
+  confidence = 0.45
+): Promise<{
+  detections: Array<{
+    boundingBox?: { originX: number; originY: number; width: number; height: number };
+    categories?: Array<{ score: number }>;
+    keypoints?: Array<{ x: number; y: number; label?: string }>;
+  }>;
+  activeDetector: FaceDetector;
+}> {
+  const isVideo = source instanceof HTMLVideoElement;
+  const origWidth = isVideo ? source.videoWidth : source.naturalWidth;
+  const origHeight = isVideo ? source.videoHeight : source.naturalHeight;
+
+  if (!origWidth || !origHeight) {
+    return { detections: [], activeDetector: detector };
+  }
+
+  // 動画フレームがまだデコードされていない場合（readyState < 2）は安全にスキップ
+  if (isVideo && source.readyState < 2) {
+    return { detections: [], activeDetector: detector };
+  }
+
+  if (!sharedDetCanvas) {
+    sharedDetCanvas = document.createElement('canvas');
+  }
+
+  // BlazeFace の入力解像度に合わせ、長辺最大 640px に縮小して転写（スマホでのWebGLメモリ負荷と処理速度も大幅に改善）
+  const maxDim = 640;
+  const scale = Math.min(1, maxDim / Math.max(origWidth, origHeight));
+  const detWidth = Math.max(16, Math.round(origWidth * scale));
+  const detHeight = Math.max(16, Math.round(origHeight * scale));
+
+  if (sharedDetCanvas.width !== detWidth || sharedDetCanvas.height !== detHeight) {
+    sharedDetCanvas.width = detWidth;
+    sharedDetCanvas.height = detHeight;
+  }
+
+  const ctx = sharedDetCanvas.getContext('2d', { willReadFrequently: true });
+  if (!ctx) {
+    return { detections: [], activeDetector: detector };
+  }
+
+  try {
+    ctx.clearRect(0, 0, detWidth, detHeight);
+    ctx.drawImage(source, 0, 0, detWidth, detHeight);
+  } catch (drawErr) {
+    console.warn('Skipping frame: video frame not ready for drawImage', drawErr);
+    return { detections: [], activeDetector: detector };
+  }
+
+  let currentDetector = detector;
+  let rawResult: ReturnType<FaceDetector['detect']>;
+
+  try {
+    rawResult = currentDetector.detect(sharedDetCanvas);
+  } catch (detectErr) {
+    console.warn('WebGL detect failed on canvas, switching to CPU delegate:', detectErr);
+    currentDetector = await initFaceDetector(confidence, true);
+    rawResult = currentDetector.detect(sharedDetCanvas);
+  }
+
+  const invScaleX = origWidth / detWidth;
+  const invScaleY = origHeight / detHeight;
+
+  const scaledDetections = (rawResult.detections || []).map((det) => {
+    const bb = det.boundingBox;
+    return {
+      ...det,
+      boundingBox: bb
+        ? {
+            originX: bb.originX * invScaleX,
+            originY: bb.originY * invScaleY,
+            width: bb.width * invScaleX,
+            height: bb.height * invScaleY,
+          }
+        : undefined,
+    };
+  });
+
+  return {
+    detections: scaledDetections,
+    activeDetector: currentDetector,
+  };
 }
 
 // IoU (Intersection over Union) 計算
