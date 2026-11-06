@@ -222,6 +222,24 @@ export function renderTrackOverlay(
   ctx.lineWidth = isSelected ? 2.5 : 1.5;
   ctx.setLineDash(isSelected ? [4, 4] : []);
 
+  // 選択枠の内側ハイライト（ドラッグ可能エリアの視覚化）
+  if (isSelected) {
+    ctx.save();
+    ctx.fillStyle = 'rgba(56, 189, 248, 0.15)';
+    if (track.shape === 'rect' || !points) {
+      ctx.fillRect(x, y, width, height);
+    } else if (points && points.length > 0) {
+      ctx.beginPath();
+      ctx.moveTo(points[0].x, points[0].y);
+      for (let i = 1; i < points.length; i++) {
+        ctx.lineTo(points[i].x, points[i].y);
+      }
+      if (track.shape === 'polygon' || track.shape === 'lasso') ctx.closePath();
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
   if (track.shape === 'rect' || !points) {
     ctx.strokeRect(x, y, width, height);
   } else if (points && points.length > 0) {
@@ -246,7 +264,7 @@ export function renderTrackOverlay(
 
   // 選択時の四隅ハンドル ＆ 中央移動アイコン
   if (isSelected) {
-    const handleSize = 10;
+    const handleSize = 12;
     ctx.fillStyle = '#ffffff';
     ctx.strokeStyle = strokeColor;
     ctx.lineWidth = 2;
@@ -262,19 +280,19 @@ export function renderTrackOverlay(
       ctx.strokeRect(c.cx - handleSize / 2, c.cy - handleSize / 2, handleSize, handleSize);
     }
 
-    // 枠の中央に「✥ ドラッグで移動」を表示
-    if (width >= 40 && height >= 30) {
+    // 枠の中央に「✥ 枠内をドラッグで移動」を表示
+    if (width >= 40 && height >= 24) {
       ctx.save();
-      ctx.fillStyle = 'rgba(15, 23, 42, 0.75)';
-      const moveText = '✥ ドラッグで移動';
-      ctx.font = 'bold 10px sans-serif';
-      const moveW = ctx.measureText(moveText).width + 10;
-      const moveH = 18;
+      ctx.fillStyle = 'rgba(15, 23, 42, 0.85)';
+      const moveText = '✥ 枠内ドラッグで移動';
+      ctx.font = 'bold 11px sans-serif';
+      const moveW = ctx.measureText(moveText).width + 12;
+      const moveH = 20;
       const moveX = x + width / 2 - moveW / 2;
       const moveY = y + height / 2 - moveH / 2;
       ctx.fillRect(moveX, moveY, moveW, moveH);
-      ctx.strokeStyle = 'rgba(56, 189, 248, 0.7)';
-      ctx.lineWidth = 1;
+      ctx.strokeStyle = '#38bdf8';
+      ctx.lineWidth = 1.5;
       ctx.strokeRect(moveX, moveY, moveW, moveH);
 
       ctx.fillStyle = '#38bdf8';

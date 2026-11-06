@@ -60,24 +60,33 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
     points: Point[];
   } | null>(null);
 
-  // 選択枠のドラッグ移動・リサイズ
-  const [transformState, setTransformState] = useState<{
+  // ドラッグ変形・位置移動の高速リアルタイムRef（毎フレーム遅延なく描画に反映）
+  const transformRef = useRef<{
     type: 'move' | 'nw' | 'ne' | 'se' | 'sw';
     trackId: string;
     startMouse: Point;
+    currentMouse: Point;
     initialBox: { x: number; y: number; width: number; height: number; points?: Point[] };
   } | null>(null);
 
   // マウスカーソル状態
   const [cursorStyle, setCursorStyle] = useState<string>('cursor-crosshair');
 
-  // キャンバス座標系への変換
-  const getCanvasCoords = (e: React.MouseEvent | React.TouchEvent): Point | null => {
+  // キャンバス座標系への変換（マウス・タッチ・ポインター完全対応）
+  const getCanvasCoords = (e: React.PointerEvent | React.MouseEvent | React.TouchEvent): Point | null => {
     const canvas = canvasRef.current;
     if (!canvas) return null;
     const rect = canvas.getBoundingClientRect();
-    const clientX = 'touches' in e ? e.touches[0].clientX : e.clientX;
-    const clientY = 'touches' in e ? e.touches[0].clientY : e.clientY;
+    let clientX = 0;
+    let clientY = 0;
+
+    if ('touches' in e && e.touches && e.touches.length > 0) {
+      clientX = e.touches[0].clientX;
+      clientY = e.touches[0].clientY;
+    } else if ('clientX' in e) {
+      clientX = e.clientX;
+      clientY = e.clientY;
+    }
 
     const scaleX = canvas.width / rect.width;
     const scaleY = canvas.height / rect.height;
@@ -168,6 +177,60 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
       prevTimeRef.current = currentTime;
     }
 
+    // 現在の表示位置を計算（ドラッグ変形・移動中はリアルタイムに反映）
+    const getEffectivePos = (track: MosaicTrack) => {
+      const pos = interpolateKeyframes(track.keyframes, currentTime);
+      if (!pos) return null;
+
+      if (transformRef.current && transformRef.current.trackId === track.id) {
+        const { type, startMouse, currentMouse, initialBox } = transformRef.current;
+        const dx = currentMouse.x - startMouse.x;
+        const dy = currentMouse.y - startMouse.y;
+        let newBox = { ...initialBox };
+
+        if (type === 'move') {
+          newBox.x = initialBox.x + dx;
+          newBox.y = initialBox.y + dy;
+          if (initialBox.points) {
+            newBox.points = initialBox.points.map((p) => ({
+              x: p.x + dx,
+              y: p.y + dy,
+            }));
+          }
+        } else {
+          if (type === 'se') {
+            newBox.width = Math.max(15, initialBox.width + dx);
+            newBox.height = Math.max(15, initialBox.height + dy);
+          } else if (type === 'sw') {
+            newBox.x = initialBox.x + dx;
+            newBox.width = Math.max(15, initialBox.width - dx);
+            newBox.height = Math.max(15, initialBox.height + dy);
+          } else if (type === 'ne') {
+            newBox.y = initialBox.y + dy;
+            newBox.width = Math.max(15, initialBox.width + dx);
+            newBox.height = Math.max(15, initialBox.height - dy);
+          } else if (type === 'nw') {
+            newBox.x = initialBox.x + dx;
+            newBox.y = initialBox.y + dy;
+            newBox.width = Math.max(15, initialBox.width - dx);
+            newBox.height = Math.max(15, initialBox.height - dy);
+          }
+
+          if (initialBox.points && initialBox.width > 0 && initialBox.height > 0) {
+            const scaleX = newBox.width / initialBox.width;
+            const scaleY = newBox.height / initialBox.height;
+            newBox.points = initialBox.points.map((p) => ({
+              x: newBox.x + (p.x - initialBox.x) * scaleX,
+              y: newBox.y + (p.y - initialBox.y) * scaleY,
+            }));
+          }
+        }
+        return newBox;
+      }
+
+      return pos;
+    };
+
     // モザイクを描画（反転モザイク または 通常モザイク）
     if (isInverseMosaic) {
       const protectedRegions: ProtectedRegion[] = [];
@@ -176,7 +239,7 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
         if (currentTime < track.startTime || currentTime > track.endTime) continue;
         if (track.trackingData?.isOutOfFrame) continue;
 
-        const pos = interpolateKeyframes(track.keyframes, currentTime);
+        const pos = getEffectivePos(track);
         if (pos) {
           protectedRegions.push({
             shape: track.shape,
@@ -203,7 +266,7 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
         if (currentTime < track.startTime || currentTime > track.endTime) continue;
         if (track.trackingData?.isOutOfFrame) continue;
 
-        const pos = interpolateKeyframes(track.keyframes, currentTime);
+        const pos = getEffectivePos(track);
         if (pos) {
           renderTrackMosaic(ctx, track, pos, sourceCanvasRef.current);
         }
@@ -216,7 +279,7 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
         if (currentTime < track.startTime || currentTime > track.endTime) continue;
         if (track.trackingData?.isOutOfFrame) continue;
 
-        const pos = interpolateKeyframes(track.keyframes, currentTime);
+        const pos = getEffectivePos(track);
         if (pos) {
           const isSelected = track.id === selectedTrackId;
           const hasKey = track.keyframes.some((k) => Math.abs(k.time - currentTime) < 0.1);
@@ -293,8 +356,8 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
     return () => cancelAnimationFrame(animId);
   }, [renderFrame]);
 
-  // マウス/タッチ 開始イベント
-  const handlePointerDown = (e: React.MouseEvent | React.TouchEvent) => {
+  // ポインター押下イベント（マウス・タッチ共通、Pointer Capture でキャンバス外も完全に追従）
+  const handlePointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
     const pt = getCanvasCoords(e);
     if (!pt) return;
 
@@ -320,7 +383,7 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
           }
 
           // 四隅の変形ハンドル判定
-          const handleSize = 18;
+          const handleSize = 20;
           const corners: Array<{ type: 'nw' | 'ne' | 'se' | 'sw'; cx: number; cy: number }> = [
             { type: 'nw', cx: pos.x, cy: pos.y },
             { type: 'ne', cx: pos.x + pos.width, cy: pos.y },
@@ -329,36 +392,48 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
           ];
           for (const c of corners) {
             if (Math.hypot(pt.x - c.cx, pt.y - c.cy) <= handleSize) {
-              setTransformState({
+              try {
+                (e.target as HTMLCanvasElement).setPointerCapture(e.pointerId);
+              } catch (_) {}
+              e.preventDefault();
+
+              transformRef.current = {
                 type: c.type,
                 trackId: selectedTrack.id,
                 startMouse: pt,
+                currentMouse: pt,
                 initialBox: { ...pos, points: pos.points ? [...pos.points] : undefined },
-              });
+              };
               return;
             }
           }
 
           // 枠内（またはバッジエリア）クリック判定 -> 即座にドラッグ移動開始！
-          const badgeH = 22;
+          const badgeH = 24;
           const inBadge =
-            pt.x >= pos.x &&
-            pt.x <= pos.x + pos.width &&
-            pt.y >= Math.max(0, pos.y - badgeH - 4) &&
+            pt.x >= pos.x - 8 &&
+            pt.x <= pos.x + pos.width + 8 &&
+            pt.y >= Math.max(0, pos.y - badgeH - 6) &&
             pt.y <= pos.y;
           const inBox =
-            pt.x >= pos.x - 6 &&
-            pt.x <= pos.x + pos.width + 6 &&
-            pt.y >= pos.y - 6 &&
-            pt.y <= pos.y + pos.height + 6;
+            pt.x >= pos.x - 8 &&
+            pt.x <= pos.x + pos.width + 8 &&
+            pt.y >= pos.y - 8 &&
+            pt.y <= pos.y + pos.height + 8;
 
           if (inBadge || inBox) {
-            setTransformState({
+            try {
+              (e.target as HTMLCanvasElement).setPointerCapture(e.pointerId);
+            } catch (_) {}
+            e.preventDefault();
+
+            transformRef.current = {
               type: 'move',
               trackId: selectedTrack.id,
               startMouse: pt,
+              currentMouse: pt,
               initialBox: { ...pos, points: pos.points ? [...pos.points] : undefined },
-            });
+            };
             return;
           }
         }
@@ -373,18 +448,24 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
       if (!pos) continue;
 
       if (
-        pt.x >= pos.x - 4 &&
-        pt.x <= pos.x + pos.width + 4 &&
-        pt.y >= pos.y - 4 &&
-        pt.y <= pos.y + pos.height + 4
+        pt.x >= pos.x - 8 &&
+        pt.x <= pos.x + pos.width + 8 &&
+        pt.y >= pos.y - 8 &&
+        pt.y <= pos.y + pos.height + 8
       ) {
         onSelectTrack(track.id);
-        setTransformState({
+        try {
+          (e.target as HTMLCanvasElement).setPointerCapture(e.pointerId);
+        } catch (_) {}
+        e.preventDefault();
+
+        transformRef.current = {
           type: 'move',
           trackId: track.id,
           startMouse: pt,
+          currentMouse: pt,
           initialBox: { ...pos, points: pos.points ? [...pos.points] : undefined },
-        });
+        };
         return;
       }
     }
@@ -393,6 +474,11 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
     if (editorMode === 'select') {
       onSelectTrack(null);
     } else if (editorMode === 'add_rect' || editorMode === 'add_brush' || editorMode === 'add_lasso') {
+      try {
+        (e.target as HTMLCanvasElement).setPointerCapture(e.pointerId);
+      } catch (_) {}
+      e.preventDefault();
+
       setDrawingState({
         isDrawing: true,
         startPoint: pt,
@@ -422,68 +508,20 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
     }
   };
 
-  // マウス/タッチ 移動イベント
-  const handlePointerMove = (e: React.MouseEvent | React.TouchEvent) => {
+  // ポインター移動イベント
+  const handlePointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
     const pt = getCanvasCoords(e);
     if (!pt) return;
 
-    // ドラッグ変形・位置移動処理
-    if (transformState) {
-      const dx = pt.x - transformState.startMouse.x;
-      const dy = pt.y - transformState.startMouse.y;
-      const init = transformState.initialBox;
-
-      let newBox = { ...init };
-
-      if (transformState.type === 'move') {
-        // 枠全体のドラッグ移動
-        newBox.x = init.x + dx;
-        newBox.y = init.y + dy;
-
-        // フリー囲み（投げ縄・ブラシ・ポリゴン）の頂点群もすべて同期平行移動！
-        if (init.points) {
-          newBox.points = init.points.map((p) => ({
-            x: p.x + dx,
-            y: p.y + dy,
-          }));
-        }
-      } else {
-        // 四隅ハンドルのリサイズ変形
-        if (transformState.type === 'se') {
-          newBox.width = Math.max(15, init.width + dx);
-          newBox.height = Math.max(15, init.height + dy);
-        } else if (transformState.type === 'sw') {
-          newBox.x = init.x + dx;
-          newBox.width = Math.max(15, init.width - dx);
-          newBox.height = Math.max(15, init.height + dy);
-        } else if (transformState.type === 'ne') {
-          newBox.y = init.y + dy;
-          newBox.width = Math.max(15, init.width + dx);
-          newBox.height = Math.max(15, init.height - dy);
-        } else if (transformState.type === 'nw') {
-          newBox.x = init.x + dx;
-          newBox.y = init.y + dy;
-          newBox.width = Math.max(15, init.width - dx);
-          newBox.height = Math.max(15, init.height - dy);
-        }
-
-        // リサイズ時のフリー囲み頂点群のスケーリング
-        if (init.points && init.width > 0 && init.height > 0) {
-          const scaleX = newBox.width / init.width;
-          const scaleY = newBox.height / init.height;
-          newBox.points = init.points.map((p) => ({
-            x: newBox.x + (p.x - init.x) * scaleX,
-            y: newBox.y + (p.y - init.y) * scaleY,
-          }));
-        }
-      }
-
-      onUpdateTrackKeyframe(transformState.trackId, newBox);
+    // ドラッグ変形・位置移動中（Refの更新により60fpsで即座にリアルタイム追従）
+    if (transformRef.current) {
+      e.preventDefault();
+      transformRef.current.currentMouse = pt;
       return;
     }
 
     // ホバー時のカーソルスタイル更新（マウス操作時）
-    if (!('touches' in e)) {
+    if (e.pointerType === 'mouse') {
       if (selectedTrackId) {
         const selectedTrack = tracks.find((t) => t.id === selectedTrackId);
         if (selectedTrack) {
@@ -519,6 +557,7 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
 
     // 新規囲みの描画中
     if (drawingState && drawingState.isDrawing) {
+      e.preventDefault();
       setDrawingState({
         ...drawingState,
         currentPoint: pt,
@@ -527,10 +566,58 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
     }
   };
 
-  // マウス/タッチ 終了イベント
-  const handlePointerUp = () => {
-    if (transformState) {
-      setTransformState(null);
+  // ポインター解放イベント（ドラッグ終了時にキーフレームを確定保存）
+  const handlePointerUp = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    try {
+      (e.target as HTMLCanvasElement).releasePointerCapture(e.pointerId);
+    } catch (_) {}
+
+    if (transformRef.current) {
+      const { type, startMouse, currentMouse, initialBox, trackId } = transformRef.current;
+      const dx = currentMouse.x - startMouse.x;
+      const dy = currentMouse.y - startMouse.y;
+      let newBox = { ...initialBox };
+
+      if (type === 'move') {
+        newBox.x = initialBox.x + dx;
+        newBox.y = initialBox.y + dy;
+        if (initialBox.points) {
+          newBox.points = initialBox.points.map((p) => ({
+            x: p.x + dx,
+            y: p.y + dy,
+          }));
+        }
+      } else {
+        if (type === 'se') {
+          newBox.width = Math.max(15, initialBox.width + dx);
+          newBox.height = Math.max(15, initialBox.height + dy);
+        } else if (type === 'sw') {
+          newBox.x = initialBox.x + dx;
+          newBox.width = Math.max(15, initialBox.width - dx);
+          newBox.height = Math.max(15, initialBox.height + dy);
+        } else if (type === 'ne') {
+          newBox.y = initialBox.y + dy;
+          newBox.width = Math.max(15, initialBox.width + dx);
+          newBox.height = Math.max(15, initialBox.height - dy);
+        } else if (type === 'nw') {
+          newBox.x = initialBox.x + dx;
+          newBox.y = initialBox.y + dy;
+          newBox.width = Math.max(15, initialBox.width - dx);
+          newBox.height = Math.max(15, initialBox.height - dy);
+        }
+
+        if (initialBox.points && initialBox.width > 0 && initialBox.height > 0) {
+          const scaleX = newBox.width / initialBox.width;
+          const scaleY = newBox.height / initialBox.height;
+          newBox.points = initialBox.points.map((p) => ({
+            x: newBox.x + (p.x - initialBox.x) * scaleX,
+            y: newBox.y + (p.y - initialBox.y) * scaleY,
+          }));
+        }
+      }
+
+      onUpdateTrackKeyframe(trackId, newBox);
+      transformRef.current = null;
       return;
     }
 
@@ -675,17 +762,24 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
   return (
     <div
       ref={containerRef}
-      className="relative flex-1 bg-slate-950 flex flex-col items-center justify-center p-2 sm:p-4 select-none min-h-[300px] sm:min-h-[420px] w-full"
+      className="relative flex-1 bg-slate-950 flex flex-col items-center justify-center p-2 sm:p-4 select-none min-h-[300px] sm:min-h-[420px] w-full relative"
     >
+      {/* 選択中の操作ガイドヒント */}
+      {selectedTrackId && (
+        <div className="absolute top-3 left-1/2 -translate-x-1/2 bg-slate-900/90 border border-cyan-500/60 shadow-xl px-3 py-1 rounded-full flex items-center gap-2 text-[11px] font-bold text-cyan-300 pointer-events-none backdrop-blur z-10 animate-fade-in">
+          <span>✥ 枠の内側をドラッグして移動</span>
+          <span className="text-slate-500">•</span>
+          <span className="text-slate-300 font-normal">四隅の白■でサイズ変更</span>
+        </div>
+      )}
+
       <canvas
         ref={canvasRef}
-        onMouseDown={handlePointerDown}
-        onMouseMove={handlePointerMove}
-        onMouseUp={handlePointerUp}
-        onTouchStart={handlePointerDown}
-        onTouchMove={handlePointerMove}
-        onTouchEnd={handlePointerUp}
-        className={`max-w-full max-h-[55vh] sm:max-h-[70vh] object-contain shadow-2xl rounded border border-slate-800 touch-none ${cursorStyle}`}
+        onPointerDown={handlePointerDown}
+        onPointerMove={handlePointerMove}
+        onPointerUp={handlePointerUp}
+        onPointerCancel={handlePointerUp}
+        className={`max-w-full max-h-[55vh] sm:max-h-[70vh] object-contain shadow-2xl rounded border border-slate-800 touch-none select-none ${cursorStyle}`}
       />
     </div>
   );

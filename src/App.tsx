@@ -251,6 +251,25 @@ export const App: React.FC = () => {
       prev.map((t) => {
         if (t.id !== trackId) return t;
 
+        // キーフレームが1個以下のトラック（手動囲み直後や静止画）は、そのキーフレームを直接更新
+        if (t.keyframes.length <= 1) {
+          const orig = t.keyframes[0];
+          return {
+            ...t,
+            keyframes: [
+              {
+                time: orig ? orig.time : currentTime,
+                x: box.x,
+                y: box.y,
+                width: box.width,
+                height: box.height,
+                points: box.points,
+              },
+            ],
+          };
+        }
+
+        // 複数キーフレームがあるトラックは、現在位置に近いキーフレームを更新または追加
         const existingIdx = t.keyframes.findIndex(
           (k) => Math.abs(k.time - currentTime) < 0.15
         );
