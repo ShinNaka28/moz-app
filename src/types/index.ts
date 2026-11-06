@@ -1,6 +1,6 @@
 export type MosaicType = 'pixel' | 'blur' | 'black';
 
-export type ShapeType = 'rect' | 'brush' | 'polygon';
+export type ShapeType = 'rect' | 'brush' | 'polygon' | 'lasso';
 
 export interface Point {
   x: number;
@@ -60,5 +60,5 @@ export interface DetectedPerson {
   velocity: { vx: number; vy: number };
 }
 
-export type EditorMode = 'select' | 'add_rect' | 'add_brush' | 'add_polygon' | 'adjust_keyframe';
+export type EditorMode = 'select' | 'add_rect' | 'add_lasso' | 'add_brush' | 'add_polygon' | 'adjust_keyframe';
 

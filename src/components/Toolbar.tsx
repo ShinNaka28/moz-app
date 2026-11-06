@@ -3,6 +3,7 @@ import { EditorMode, MosaicType, MosaicTrack } from '../types';
 import {
   MousePointer,
   Square,
+  LassoSelect,
   Paintbrush,
   Pentagon,
   UserCheck,
@@ -91,7 +92,20 @@ export const Toolbar: React.FC<ToolbarProps> = ({
           title="ドラッグして矩形領域を指定し自動追従"
         >
           <Square size={14} />
-          <span>矩形追従</span>
+          <span>矩形</span>
+        </button>
+
+        <button
+          onClick={() => onSelectMode('add_lasso')}
+          className={`flex items-center gap-1 px-2.5 py-1.5 rounded-md font-medium transition ${
+            editorMode === 'add_lasso'
+              ? 'bg-indigo-600 text-white shadow'
+              : 'text-slate-400 hover:text-slate-200'
+          }`}
+          title="指やマウスでぐるっと自由な形で囲んで中身全体を選択"
+        >
+          <LassoSelect size={14} />
+          <span>投げ縄 (囲む)</span>
         </button>
 
         <button
@@ -104,7 +118,7 @@ export const Toolbar: React.FC<ToolbarProps> = ({
           title="指やマウスで自由になぞって指定"
         >
           <Paintbrush size={14} />
-          <span>ブラシ</span>
+          <span>ブラシ (なぞる)</span>
         </button>
 
         <button

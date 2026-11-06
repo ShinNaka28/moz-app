@@ -88,7 +88,7 @@ export function renderTrackMosaic(
       { x, y, width, height },
       sourceCanvas
     );
-  } else if (track.shape === 'polygon' && points && points.length >= 3) {
+  } else if ((track.shape === 'polygon' || track.shape === 'lasso') && points && points.length >= 3) {
     applyMosaicEffect(
       ctx,
       track.mosaicType,
@@ -125,7 +125,7 @@ export function renderTrackMosaic(
 }
 
 export interface ProtectedRegion {
-  shape: 'rect' | 'brush' | 'polygon';
+  shape: 'rect' | 'brush' | 'polygon' | 'lasso';
   x: number;
   y: number;
   width: number;
@@ -155,7 +155,7 @@ export function renderInverseMosaic(
 
   // 内枠: 保護対象領域（くり抜き）
   for (const reg of protectedRegions) {
-    if (reg.shape === 'polygon' && reg.points && reg.points.length >= 3) {
+    if ((reg.shape === 'polygon' || reg.shape === 'lasso') && reg.points && reg.points.length >= 3) {
       ctx.moveTo(reg.points[0].x, reg.points[0].y);
       for (let i = 1; i < reg.points.length; i++) {
         ctx.lineTo(reg.points[i].x, reg.points[i].y);
@@ -248,7 +248,7 @@ export function renderTrackOverlay(
     for (let i = 1; i < points.length; i++) {
       ctx.lineTo(points[i].x, points[i].y);
     }
-    if (track.shape === 'polygon') ctx.closePath();
+    if (track.shape === 'polygon' || track.shape === 'lasso') ctx.closePath();
     ctx.stroke();
   }
 

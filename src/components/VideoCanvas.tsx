@@ -232,6 +232,15 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
         const h = drawingState.currentPoint.y - drawingState.startPoint.y;
         ctx.strokeRect(drawingState.startPoint.x, drawingState.startPoint.y, w, h);
         ctx.fillRect(drawingState.startPoint.x, drawingState.startPoint.y, w, h);
+      } else if (editorMode === 'add_lasso' && drawingState.points.length > 1) {
+        ctx.beginPath();
+        ctx.moveTo(drawingState.points[0].x, drawingState.points[0].y);
+        for (let i = 1; i < drawingState.points.length; i++) {
+          ctx.lineTo(drawingState.points[i].x, drawingState.points[i].y);
+        }
+        ctx.closePath();
+        ctx.fill();
+        ctx.stroke();
       } else if (editorMode === 'add_brush' && drawingState.points.length > 1) {
         ctx.beginPath();
         ctx.lineCap = 'round';
@@ -333,7 +342,7 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
       }
 
       onSelectTrack(null);
-    } else if (editorMode === 'add_rect' || editorMode === 'add_brush') {
+    } else if (editorMode === 'add_rect' || editorMode === 'add_brush' || editorMode === 'add_lasso') {
       setDrawingState({
         isDrawing: true,
         startPoint: pt,
@@ -428,7 +437,7 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
       if (width > 8 && height > 8) {
         const newTrack: MosaicTrack = {
           id: `track-${Date.now()}`,
-          name: `追従枠 #${tracks.length + 1}`,
+          name: `矩形追従 #${tracks.length + 1}`,
           type: 'tracked',
           shape: 'rect',
           enabled: true,
@@ -443,6 +452,40 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
               y: minY,
               width,
               height,
+            },
+          ],
+        };
+        onAddTrack(newTrack);
+        onSelectTrack(newTrack.id);
+      }
+      setDrawingState(null);
+    } else if (editorMode === 'add_lasso') {
+      if (drawingState.points.length > 2) {
+        const xs = drawingState.points.map((p) => p.x);
+        const ys = drawingState.points.map((p) => p.y);
+        const minX = Math.min(...xs);
+        const maxX = Math.max(...xs);
+        const minY = Math.min(...ys);
+        const maxY = Math.max(...ys);
+
+        const newTrack: MosaicTrack = {
+          id: `track-${Date.now()}`,
+          name: `フリー囲み #${tracks.length + 1}`,
+          type: 'tracked',
+          shape: 'lasso',
+          enabled: true,
+          mosaicType: 'pixel',
+          strength: 14,
+          startTime: currentTime,
+          endTime: currentTime + 5,
+          keyframes: [
+            {
+              time: currentTime,
+              x: minX,
+              y: minY,
+              width: maxX - minX,
+              height: maxY - minY,
+              points: drawingState.points,
             },
           ],
         };
