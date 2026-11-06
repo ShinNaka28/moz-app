@@ -1,8 +1,10 @@
-import { FilesetResolver, FaceDetector } from '@mediapipe/tasks-vision';
-import { DetectedPerson } from '../types';
+import { FilesetResolver, FaceDetector, ImageSegmenter } from '@mediapipe/tasks-vision';
+import { DetectedPerson, Point } from '../types';
 
 let faceDetectorInstance: FaceDetector | null = null;
+let segmenterInstance: ImageSegmenter | null = null;
 let isInitializing = false;
+let isInitializingSegmenter = false;
 
 export interface FaceFilterOptions {
   minScore?: number;
@@ -127,8 +129,285 @@ export async function initFaceDetector(
   }
 }
 
+// 完全ローカルから MediaPipe ImageSegmenter (Selfie Segmenter) を初期化
+export async function initPersonSegmenter(forceCpu = false): Promise<ImageSegmenter> {
+  if (segmenterInstance && !forceCpu) return segmenterInstance;
+  if (forceCpu && segmenterInstance) {
+    try {
+      segmenterInstance.close();
+    } catch (_) {}
+    segmenterInstance = null;
+  }
+  if (isInitializingSegmenter) {
+    while (isInitializingSegmenter) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    if (segmenterInstance) return segmenterInstance;
+  }
+
+  isInitializingSegmenter = true;
+  try {
+    const baseUrl = import.meta.env.BASE_URL.replace(/\/$/, '');
+    const wasmPath = `${baseUrl}/wasm`;
+    const modelPath = `${baseUrl}/models/selfie_segmenter.tflite`;
+
+    const vision = await FilesetResolver.forVisionTasks(wasmPath);
+    if (!forceCpu) {
+      segmenterInstance = await ImageSegmenter.createFromOptions(vision, {
+        baseOptions: {
+          modelAssetPath: modelPath,
+          delegate: 'GPU',
+        },
+        runningMode: 'IMAGE',
+        outputConfidenceMasks: false,
+        outputCategoryMask: true,
+      });
+      return segmenterInstance;
+    }
+    throw new Error('Force CPU delegate for segmenter');
+  } catch (err) {
+    console.warn('GPU delegate failed for segmenter, fallback to CPU delegate', err);
+    const baseUrl = import.meta.env.BASE_URL.replace(/\/$/, '');
+    const wasmPath = `${baseUrl}/wasm`;
+    const modelPath = `${baseUrl}/models/selfie_segmenter.tflite`;
+
+    const vision = await FilesetResolver.forVisionTasks(wasmPath);
+    segmenterInstance = await ImageSegmenter.createFromOptions(vision, {
+      baseOptions: {
+        modelAssetPath: modelPath,
+        delegate: 'CPU',
+      },
+      runningMode: 'IMAGE',
+      outputConfidenceMasks: false,
+      outputCategoryMask: true,
+    });
+    return segmenterInstance;
+  } finally {
+    isInitializingSegmenter = false;
+  }
+}
+
 // 2D Canvas バッファ（<video> を直接 WebGL2 texImage2D に渡すとスマホ環境で未デコードや cross-origin エラーになる問題を完全回避）
 let sharedDetCanvas: HTMLCanvasElement | null = null;
+
+/**
+ * 輪郭の点列を Ramer-Douglas-Peucker (RDP) アルゴリズムで間引き・平滑化
+ */
+function perpendicularDistance(p: Point, p1: Point, p2: Point): number {
+  const dx = p2.x - p1.x;
+  const dy = p2.y - p1.y;
+  const mag = Math.hypot(dx, dy);
+  if (mag === 0) return Math.hypot(p.x - p1.x, p.y - p1.y);
+  return Math.abs(dy * p.x - dx * p.y + p2.x * p1.y - p2.y * p1.x) / mag;
+}
+
+function rdpSimplify(points: Point[], epsilon: number): Point[] {
+  if (points.length <= 2) return points;
+  let dmax = 0;
+  let index = 0;
+  for (let i = 1; i < points.length - 1; i++) {
+    const d = perpendicularDistance(points[i], points[0], points[points.length - 1]);
+    if (d > dmax) {
+      dmax = d;
+      index = i;
+    }
+  }
+  if (dmax > epsilon) {
+    const rec1 = rdpSimplify(points.slice(0, index + 1), epsilon);
+    const rec2 = rdpSimplify(points.slice(index), epsilon);
+    return rec1.slice(0, rec1.length - 1).concat(rec2);
+  }
+  return [points[0], points[points.length - 1]];
+}
+
+/**
+ * 2値マスクから境界（アウトライン）をトレースしてポリゴン輪郭を抽出する
+ */
+function extractContourFromMask(
+  mask: Uint8Array,
+  maskW: number,
+  maskH: number,
+  origW: number,
+  origH: number
+): { points: Point[]; bounds: { x: number; y: number; width: number; height: number } } | null {
+  // マスク内の有効ピクセルを走査
+  let minX = maskW;
+  let maxX = 0;
+  let minY = maskH;
+  let maxY = 0;
+  let count = 0;
+
+  for (let y = 0; y < maskH; y++) {
+    for (let x = 0; x < maskW; x++) {
+      if (mask[y * maskW + x] > 0) {
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+        count++;
+      }
+    }
+  }
+
+  // 人物のピクセル数が少なすぎる場合は無効
+  if (count < 120 || minX >= maxX || minY >= maxY) {
+    return null;
+  }
+
+  // 8方向探索による外周輪郭追跡（ムーア近傍探索）
+  const dx = [1, 1, 0, -1, -1, -1, 0, 1];
+  const dy = [0, 1, 1, 1, 0, -1, -1, -1];
+
+  let startX = -1;
+  let startY = -1;
+  for (let y = minY; y <= maxY; y++) {
+    for (let x = minX; x <= maxX; x++) {
+      if (mask[y * maskW + x] > 0) {
+        startX = x;
+        startY = y;
+        break;
+      }
+    }
+    if (startX !== -1) break;
+  }
+
+  if (startX === -1) return null;
+
+  const rawContour: Point[] = [];
+  let cx = startX;
+  let cy = startY;
+  let dir = 0;
+  const maxSteps = maskW * maskH;
+  let steps = 0;
+
+  while (steps < maxSteps) {
+    rawContour.push({ x: cx, y: cy });
+    let found = false;
+    for (let d = 0; d < 8; d++) {
+      const nd = (dir + d) % 8;
+      const nx = cx + dx[nd];
+      const ny = cy + dy[nd];
+      if (nx >= 0 && nx < maskW && ny >= 0 && ny < maskH && mask[ny * maskW + nx] > 0) {
+        cx = nx;
+        cy = ny;
+        dir = (nd + 5) % 8; // 次の開始方向
+        found = true;
+        break;
+      }
+    }
+    if (!found || (cx === startX && cy === startY && rawContour.length > 2)) {
+      break;
+    }
+    steps++;
+  }
+
+  if (rawContour.length < 4) return null;
+
+  // 座標を元解像度へスケーリング
+  const scaleX = origW / maskW;
+  const scaleY = origH / maskH;
+
+  const scaledContour: Point[] = rawContour.map((p) => ({
+    x: Math.round(p.x * scaleX),
+    y: Math.round(p.y * scaleY),
+  }));
+
+  // RDP による輪郭線の最適化（頂点数約 40〜80 点に簡略化）
+  const simplified = rdpSimplify(scaledContour, Math.max(2, origW / 240));
+
+  return {
+    points: simplified,
+    bounds: {
+      x: Math.round(minX * scaleX),
+      y: Math.round(minY * scaleY),
+      width: Math.round((maxX - minX + 1) * scaleX),
+      height: Math.round((maxY - minY + 1) * scaleY),
+    },
+  };
+}
+
+/**
+ * スマホ・PC問わず安全に人物セグメンテーション（体のライン抽出）を実行するラッパー関数
+ * 顔が隠れていても、背を向けていても、全身・上半身の体の輪郭ラインを直接抽出します
+ */
+export async function segmentPersonSafely(
+  source: HTMLVideoElement | HTMLImageElement,
+  segmenter: ImageSegmenter
+): Promise<{
+  activeSegmenter: ImageSegmenter;
+  contour: { points: Point[]; bounds: { x: number; y: number; width: number; height: number } } | null;
+}> {
+  const isVideo = source instanceof HTMLVideoElement;
+  const origWidth = isVideo ? source.videoWidth : source.naturalWidth;
+  const origHeight = isVideo ? source.videoHeight : source.naturalHeight;
+
+  if (!origWidth || !origHeight) {
+    return { activeSegmenter: segmenter, contour: null };
+  }
+
+  if (isVideo && source.readyState < 2) {
+    return { activeSegmenter: segmenter, contour: null };
+  }
+
+  if (!sharedDetCanvas) {
+    sharedDetCanvas = document.createElement('canvas');
+  }
+
+  // セグメンテーションの入力解像度を 384px 前後に最適化（高速かつ高精度な輪郭抽出）
+  const maxDim = 384;
+  const scale = Math.min(1, maxDim / Math.max(origWidth, origHeight));
+  const segW = Math.max(16, Math.round(origWidth * scale));
+  const segH = Math.max(16, Math.round(origHeight * scale));
+
+  if (sharedDetCanvas.width !== segW || sharedDetCanvas.height !== segH) {
+    sharedDetCanvas.width = segW;
+    sharedDetCanvas.height = segH;
+  }
+
+  const ctx = sharedDetCanvas.getContext('2d', { willReadFrequently: true });
+  if (!ctx) {
+    return { activeSegmenter: segmenter, contour: null };
+  }
+
+  try {
+    ctx.clearRect(0, 0, segW, segH);
+    ctx.drawImage(source, 0, 0, segW, segH);
+  } catch (drawErr) {
+    console.warn('Skipping segmentation frame: drawImage error', drawErr);
+    return { activeSegmenter: segmenter, contour: null };
+  }
+
+  let currentSegmenter = segmenter;
+  let rawResult: ReturnType<ImageSegmenter['segment']>;
+
+  try {
+    rawResult = currentSegmenter.segment(sharedDetCanvas);
+  } catch (err) {
+    console.warn('Segmenter GPU failed on canvas, switching to CPU delegate:', err);
+    currentSegmenter = await initPersonSegmenter(true);
+    rawResult = currentSegmenter.segment(sharedDetCanvas);
+  }
+
+  if (!rawResult.categoryMask) {
+    return { activeSegmenter: currentSegmenter, contour: null };
+  }
+
+  try {
+    const maskData = rawResult.categoryMask.getAsUint8Array();
+    const maskW = rawResult.categoryMask.width;
+    const maskH = rawResult.categoryMask.height;
+
+    const contour = extractContourFromMask(maskData, maskW, maskH, origWidth, origHeight);
+    return { activeSegmenter: currentSegmenter, contour };
+  } catch (maskErr) {
+    console.warn('Error reading categoryMask data', maskErr);
+    return { activeSegmenter: currentSegmenter, contour: null };
+  } finally {
+    try {
+      rawResult.categoryMask.close();
+    } catch (_) {}
+  }
+}
 
 /**
  * スマホ・PC問わず安全に顔検出を実行するラッパー関数

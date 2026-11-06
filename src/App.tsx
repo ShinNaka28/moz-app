@@ -7,7 +7,7 @@ import { PersonListPanel } from './components/PersonListPanel';
 import { ExportModal } from './components/ExportModal';
 import { EditorMode, MosaicTrack, MosaicType, Point, Keyframe } from './types';
 import { Film, ListFilter, Clock, Play, Pause, RotateCcw, Trash2, Crosshair, Sparkles } from 'lucide-react';
-import { initFaceDetector, detectFacesSafely, updatePersonTracks, expandBoxWithMargin, estimateBodyBoxFromFace, isValidFaceDetection, FaceFilterOptions } from './utils/aiDetector';
+import { initFaceDetector, initPersonSegmenter, detectFacesSafely, segmentPersonSafely, updatePersonTracks, expandBoxWithMargin, estimateBodyBoxFromFace, isValidFaceDetection, FaceFilterOptions } from './utils/aiDetector';
 import { exportMosaicVideo, ExportProgress, saveOrShareBlob } from './utils/videoExporter';
 import { generateDemoVideoBlob } from './utils/sampleGenerator';
 import { renderTrackMosaic, renderInverseMosaic, ProtectedRegion } from './utils/mosaicRenderer';
@@ -457,7 +457,7 @@ export const App: React.FC = () => {
     }
   };
 
-  // MediaPipe による高密度・AI人物自動検出＆追跡（顔・全身切替 / 背景モザイク連動対応）
+  // MediaPipe による高密度・AI人物自動検出＆追跡（セグメンテーションによる体ライン輪郭＋顔検出併用）
   const handleRunAIFaceDetection = async (overrideTarget?: 'face' | 'body', autoEnableInverse?: boolean) => {
     if (!videoRef.current && !imageRef.current) return;
     const targetMode = overrideTarget || aiTarget;
@@ -465,7 +465,125 @@ export const App: React.FC = () => {
     setAiDetectProgress(0);
     await requestScreenWakeLock();
 
-    // 感度設定に応じたフィルタパラメータ
+    try {
+      if (targetMode === 'body') {
+        // 【体のラインに沿った人物輪郭セグメンテーション (Selfie Segmenter)】
+        // 顔が映っていない、後ろ向き、横向きでも全身・上半身の境界をダイレクトに抽出
+        let segmenter = await initPersonSegmenter();
+
+        if (isImage && imageRef.current) {
+          const img = imageRef.current;
+          const res = await segmentPersonSafely(img, segmenter);
+          segmenter = res.activeSegmenter;
+
+          if (res.contour && res.contour.points.length >= 3) {
+            const newTrack: MosaicTrack = {
+              id: `ai-body-${Date.now()}`,
+              name: 'AI人物 (輪郭)',
+              type: 'ai',
+              shape: 'polygon',
+              enabled: true,
+              mosaicType: 'pixel',
+              strength: 14,
+              startTime: 0,
+              endTime: 1,
+              keyframes: [
+                {
+                  time: 0,
+                  x: res.contour.bounds.x,
+                  y: res.contour.bounds.y,
+                  width: res.contour.bounds.width,
+                  height: res.contour.bounds.height,
+                  points: res.contour.points,
+                },
+              ],
+              aiTarget: 'body',
+            };
+            setTracks((prev) => [...prev, newTrack]);
+            if (autoEnableInverse) {
+              setIsInverseMosaic(true);
+            }
+          } else {
+            // セグメンテーションで見つからなかった場合は顔検出にフォールバック
+            await runFaceDetectionFallback(targetMode, autoEnableInverse);
+          }
+          setAiDetectProgress(100);
+        } else if (videoRef.current) {
+          const video = videoRef.current;
+          const origTime = video.currentTime;
+          const totalDuration = video.duration || 5;
+          const step = 0.08;
+          const totalSteps = Math.max(1, Math.floor(totalDuration / step));
+
+          const keyframes: Keyframe[] = [];
+
+          for (let i = 0; i <= totalSteps; i++) {
+            const sampleTime = Math.min(totalDuration, i * step);
+            await seekVideoSafely(video, sampleTime);
+            setAiDetectProgress(Math.round((i / totalSteps) * 100));
+
+            const res = await segmentPersonSafely(video, segmenter);
+            segmenter = res.activeSegmenter;
+
+            if (res.contour && res.contour.points.length >= 3) {
+              keyframes.push({
+                time: sampleTime,
+                x: res.contour.bounds.x,
+                y: res.contour.bounds.y,
+                width: res.contour.bounds.width,
+                height: res.contour.bounds.height,
+                points: res.contour.points,
+              });
+            }
+          }
+
+          await seekVideoSafely(video, origTime);
+
+          if (keyframes.length >= 2) {
+            const newTrack: MosaicTrack = {
+              id: `ai-body-${Date.now()}`,
+              name: 'AI人物 (体ライン)',
+              type: 'ai',
+              shape: 'polygon',
+              enabled: true,
+              mosaicType: 'pixel',
+              strength: 14,
+              startTime: keyframes[0].time,
+              endTime: keyframes[keyframes.length - 1].time + 0.3,
+              keyframes,
+              aiTarget: 'body',
+            };
+            setTracks((prev) => [...prev, newTrack]);
+            if (autoEnableInverse) {
+              setIsInverseMosaic(true);
+            }
+          } else {
+            // セグメンテーションでフレームが不足した場合は顔検出にフォールバック
+            await runFaceDetectionFallback(targetMode, autoEnableInverse);
+          }
+        }
+      } else {
+        // 顔中心検出モード
+        await runFaceDetectionFallback('face', autoEnableInverse);
+      }
+    } catch (err) {
+      console.error('AI Detection failed', err);
+      // エラー発生時は安全に顔検出へフォールバック
+      try {
+        await runFaceDetectionFallback(targetMode, autoEnableInverse);
+      } catch (fbErr) {
+        alert('AI検出の実行に失敗しました: ' + (err as Error).message);
+      }
+    } finally {
+      await releaseScreenWakeLock();
+      setIsAIDetecting(false);
+      setAiDetectProgress(0);
+    }
+  };
+
+  // 顔検出フォールバック関数
+  const runFaceDetectionFallback = async (targetMode: 'face' | 'body', autoEnableInverse?: boolean) => {
+    if (!videoRef.current && !imageRef.current) return;
     const filterOptions: FaceFilterOptions = {
       minScore: aiSensitivity === 'strict' ? 0.58 : aiSensitivity === 'standard' ? 0.48 : 0.35,
       minAspect: aiSensitivity === 'strict' ? 0.60 : 0.50,
@@ -474,174 +592,148 @@ export const App: React.FC = () => {
     };
     const minPersistenceFrames = aiSensitivity === 'strict' ? 4 : aiSensitivity === 'standard' ? 3 : 2;
 
-    try {
-      const confidence = filterOptions.minScore! * 0.9;
-      let detector = await initFaceDetector(confidence);
+    const confidence = filterOptions.minScore! * 0.9;
+    let detector = await initFaceDetector(confidence);
 
-      if (isImage && imageRef.current) {
-        const img = imageRef.current;
-        const width = img.naturalWidth;
-        const height = img.naturalHeight;
+    if (isImage && imageRef.current) {
+      const img = imageRef.current;
+      const width = img.naturalWidth;
+      const height = img.naturalHeight;
 
-        // 静止画の場合（2D Canvas転写経由でWebGL2エラーを防止）
-        const result = await detectFacesSafely(img, detector, confidence);
+      const result = await detectFacesSafely(img, detector, confidence);
+      detector = result.activeDetector;
+      const validDetections = (result.detections || []).filter((det) =>
+        isValidFaceDetection(det, filterOptions)
+      );
+
+      const newAITracks: MosaicTrack[] = validDetections.map((det, idx) => {
+        const bb = det.boundingBox;
+        const rawBox = {
+          x: bb ? bb.originX : 0,
+          y: bb ? bb.originY : 0,
+          width: bb ? bb.width : 50,
+          height: bb ? bb.height : 50,
+        };
+        const finalBox = targetMode === 'body'
+          ? estimateBodyBoxFromFace(rawBox, width, height)
+          : expandBoxWithMargin(rawBox, 0.35, width, height);
+
+        return {
+          id: `ai-person-${Date.now()}-${idx}`,
+          name: targetMode === 'body' ? `AI人物 #${idx + 1}` : `AI顔 #${idx + 1}`,
+          type: 'ai',
+          shape: 'rect',
+          enabled: true,
+          mosaicType: 'pixel',
+          strength: 14,
+          startTime: 0,
+          endTime: 1,
+          keyframes: [{ time: 0, ...finalBox }],
+          aiTarget: targetMode,
+        };
+      });
+      setTracks((prev) => [...prev, ...newAITracks]);
+      if (autoEnableInverse && newAITracks.length > 0) {
+        setIsInverseMosaic(true);
+      }
+    } else if (videoRef.current) {
+      const video = videoRef.current;
+      const origTime = video.currentTime;
+      const totalDuration = video.duration || 5;
+      const videoWidth = video.videoWidth || 640;
+      const videoHeight = video.videoHeight || 480;
+      const step = 0.08;
+      const totalSteps = Math.max(1, Math.floor(totalDuration / step));
+
+      let currentDetectedPersons: any[] = [];
+      const personKeyframesMap = new Map<number, any[]>();
+      const personScoresMap = new Map<number, number[]>();
+
+      for (let i = 0; i <= totalSteps; i++) {
+        const sampleTime = Math.min(totalDuration, i * step);
+        await seekVideoSafely(video, sampleTime);
+        setAiDetectProgress(Math.round((i / totalSteps) * 100));
+
+        const result = await detectFacesSafely(video, detector, confidence);
         detector = result.activeDetector;
         const validDetections = (result.detections || []).filter((det) =>
           isValidFaceDetection(det, filterOptions)
         );
 
-        const newAITracks: MosaicTrack[] = validDetections.map((det, idx) => {
-          const bb = det.boundingBox;
+        const rawBoxes = validDetections.map((det) => {
+          const bb = det.boundingBox!;
           const rawBox = {
-            x: bb ? bb.originX : 0,
-            y: bb ? bb.originY : 0,
-            width: bb ? bb.width : 50,
-            height: bb ? bb.height : 50,
+            x: bb.originX,
+            y: bb.originY,
+            width: bb.width,
+            height: bb.height,
           };
-          
-          // 顔枠または人物全身枠の算出
-          const finalBox = targetMode === 'body'
-            ? estimateBodyBoxFromFace(rawBox, width, height)
-            : expandBoxWithMargin(rawBox, 0.35, width, height);
-
+          const padded = expandBoxWithMargin(rawBox, 0.35, videoWidth, videoHeight);
           return {
-            id: `ai-person-${Date.now()}-${idx}`,
-            name: targetMode === 'body' ? `AI人物 #${idx + 1}` : `AI顔 #${idx + 1}`,
-            type: 'ai',
-            shape: 'rect',
-            enabled: true,
-            mosaicType: 'pixel',
-            strength: 14,
-            startTime: 0,
-            endTime: 1,
-            keyframes: [{ time: 0, ...finalBox }],
-            aiTarget: targetMode,
+            ...padded,
+            rawFaceBox: rawBox,
+            score: det.categories?.[0]?.score || 0.9,
           };
         });
-        setAiDetectProgress(100);
-        setTracks((prev) => [...prev, ...newAITracks]);
-        if (autoEnableInverse && newAITracks.length > 0) {
-          setIsInverseMosaic(true);
-        }
-      } else if (videoRef.current) {
-        // 動画の場合: 0.08秒間隔（約12.5fps）の超高密度スキャン
-        const video = videoRef.current;
-        const origTime = video.currentTime;
-        const totalDuration = video.duration || 5;
-        const videoWidth = video.videoWidth || 640;
-        const videoHeight = video.videoHeight || 480;
-        const step = 0.08;
-        const totalSteps = Math.max(1, Math.floor(totalDuration / step));
 
-        let currentDetectedPersons: any[] = [];
-        const personKeyframesMap = new Map<number, any[]>();
-        const personScoresMap = new Map<number, number[]>();
+        currentDetectedPersons = updatePersonTracks(
+          currentDetectedPersons,
+          rawBoxes,
+          sampleTime,
+          6
+        );
 
-        for (let i = 0; i <= totalSteps; i++) {
-          const sampleTime = Math.min(totalDuration, i * step);
-          await seekVideoSafely(video, sampleTime);
+        for (const p of currentDetectedPersons) {
+          if (!personKeyframesMap.has(p.trackId)) {
+            personKeyframesMap.set(p.trackId, []);
+            personScoresMap.set(p.trackId, []);
+          }
+          const boxToStore = targetMode === 'body'
+            ? estimateBodyBoxFromFace(p.box, videoWidth, videoHeight)
+            : p.box;
 
-          setAiDetectProgress(Math.round((i / totalSteps) * 100));
-
-          // <video> を直接 WebGL2 texImage2D に渡さず、2D Canvas に転写してから安全に検出
-          const result = await detectFacesSafely(video, detector, confidence);
-          detector = result.activeDetector;
-          // 手や背景などの誤検出を幾何学・スコアで除外
-          const validDetections = (result.detections || []).filter((det) =>
-            isValidFaceDetection(det, filterOptions)
-          );
-
-          const rawBoxes = validDetections.map((det) => {
-            const bb = det.boundingBox!;
-            const rawBox = {
-              x: bb.originX,
-              y: bb.originY,
-              width: bb.width,
-              height: bb.height,
-            };
-            // 35%安全マージンを付加して素顔チラ見えを防止
-            const padded = expandBoxWithMargin(rawBox, 0.35, videoWidth, videoHeight);
-
-            return {
-              ...padded,
-              rawFaceBox: rawBox,
-              score: det.categories?.[0]?.score || 0.9,
-            };
+          personKeyframesMap.get(p.trackId)!.push({
+            time: sampleTime,
+            x: boxToStore.x,
+            y: boxToStore.y,
+            width: boxToStore.width,
+            height: boxToStore.height,
           });
-
-          // IoUトラッキングと見失い補間
-          currentDetectedPersons = updatePersonTracks(
-            currentDetectedPersons,
-            rawBoxes,
-            sampleTime,
-            6 // 6フレーム見失いバッファ
-          );
-
-          for (const p of currentDetectedPersons) {
-            if (!personKeyframesMap.has(p.trackId)) {
-              personKeyframesMap.set(p.trackId, []);
-              personScoresMap.set(p.trackId, []);
-            }
-            
-            // 全身モードの場合は顔から体を推定、顔モードの場合は顔枠
-            const boxToStore = targetMode === 'body'
-              ? estimateBodyBoxFromFace(p.box, videoWidth, videoHeight)
-              : p.box;
-
-            personKeyframesMap.get(p.trackId)!.push({
-              time: sampleTime,
-              x: boxToStore.x,
-              y: boxToStore.y,
-              width: boxToStore.width,
-              height: boxToStore.height,
-            });
-            personScoresMap.get(p.trackId)!.push(p.score);
-          }
-        }
-
-        // トラックへ変換（時間的持続性フィルタ：手が前を横切った瞬間の1〜2フレーム誤検出を完全に除外）
-        const newTracks: MosaicTrack[] = [];
-        const requiredFrames = Math.min(minPersistenceFrames, totalSteps);
-
-        personKeyframesMap.forEach((kfs, personId) => {
-          // 最低持続フレーム数以上のトラックのみを採用（手の瞬間誤検知を遮断）
-          if (kfs.length >= requiredFrames) {
-            const scores = personScoresMap.get(personId) || [];
-            const avgScore = scores.reduce((a, b) => a + b, 0) / (scores.length || 1);
-
-            // 平均スコアが基準を満たしているか確認
-            if (avgScore >= filterOptions.minScore! * 0.95) {
-              newTracks.push({
-                id: `ai-track-${personId}-${Date.now()}`,
-                name: targetMode === 'body' ? `AI人物 #${personId}` : `AI顔 #${personId}`,
-                type: 'ai',
-                shape: 'rect',
-                enabled: true,
-                mosaicType: 'pixel',
-                strength: 14,
-                startTime: kfs[0].time,
-                endTime: kfs[kfs.length - 1].time + 0.3,
-                keyframes: kfs,
-                aiPersonId: personId,
-                aiTarget: targetMode,
-              });
-            }
-          }
-        });
-
-        await seekVideoSafely(video, origTime);
-        setTracks((prev) => [...prev, ...newTracks]);
-        if (autoEnableInverse && newTracks.length > 0) {
-          setIsInverseMosaic(true);
+          personScoresMap.get(p.trackId)!.push(p.score);
         }
       }
-    } catch (err) {
-      console.error('AI Detection failed', err);
-      alert('AI検出の実行に失敗しました: ' + (err as Error).message);
-    } finally {
-      await releaseScreenWakeLock();
-      setIsAIDetecting(false);
-      setAiDetectProgress(0);
+
+      const newTracks: MosaicTrack[] = [];
+      const requiredFrames = Math.min(minPersistenceFrames, totalSteps);
+
+      personKeyframesMap.forEach((kfs, personId) => {
+        if (kfs.length >= requiredFrames) {
+          const scores = personScoresMap.get(personId) || [];
+          const avgScore = scores.reduce((a, b) => a + b, 0) / (scores.length || 1);
+          if (avgScore >= filterOptions.minScore! * 0.95) {
+            newTracks.push({
+              id: `ai-track-${personId}-${Date.now()}`,
+              name: targetMode === 'body' ? `AI人物 #${personId}` : `AI顔 #${personId}`,
+              type: 'ai',
+              shape: 'rect',
+              enabled: true,
+              mosaicType: 'pixel',
+              strength: 14,
+              startTime: kfs[0].time,
+              endTime: kfs[kfs.length - 1].time + 0.3,
+              keyframes: kfs,
+              aiPersonId: personId,
+              aiTarget: targetMode,
+            });
+          }
+        }
+      });
+
+      await seekVideoSafely(video, origTime);
+      setTracks((prev) => [...prev, ...newTracks]);
+      if (autoEnableInverse && newTracks.length > 0) {
+        setIsInverseMosaic(true);
+      }
     }
   };
 
