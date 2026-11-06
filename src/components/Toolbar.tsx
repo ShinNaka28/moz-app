@@ -28,6 +28,8 @@ interface ToolbarProps {
   hasKeyframeAtCurrentTime: boolean;
   onRunAIFaceDetection: () => void;
   isAIDetecting: boolean;
+  aiSensitivity?: 'strict' | 'standard' | 'high';
+  onUpdateAiSensitivity?: (s: 'strict' | 'standard' | 'high') => void;
   isPreviewMode: boolean;
   onTogglePreviewMode: () => void;
 
@@ -54,6 +56,8 @@ export const Toolbar: React.FC<ToolbarProps> = ({
   hasKeyframeAtCurrentTime,
   onRunAIFaceDetection,
   isAIDetecting,
+  aiSensitivity = 'strict',
+  onUpdateAiSensitivity,
   isPreviewMode,
   onTogglePreviewMode,
   isInverseMosaic,
@@ -137,16 +141,31 @@ export const Toolbar: React.FC<ToolbarProps> = ({
         </div>
 
         <div className="flex items-center gap-1 shrink-0">
-          {/* AI顔自動検出 */}
-          <button
-            onClick={onRunAIFaceDetection}
-            disabled={isAIDetecting}
-            className="flex items-center gap-1 px-2 sm:px-2.5 py-1 bg-emerald-950/80 hover:bg-emerald-900 border border-emerald-500/40 text-emerald-300 rounded-md font-semibold transition disabled:opacity-50 shrink-0"
-            title="MediaPipeで動画内の人物・顔を高密度自動追跡（安全マージン付き）"
-          >
-            <UserCheck size={14} />
-            <span>{isAIDetecting ? 'AI解析中...' : 'AI顔検出'}</span>
-          </button>
+          {/* AI顔自動検出（誤検出抑制フィルタ・感度切替付き） */}
+          <div className="flex items-center bg-emerald-950/80 border border-emerald-500/40 rounded-md p-0.5 shrink-0 gap-1">
+            <button
+              onClick={onRunAIFaceDetection}
+              disabled={isAIDetecting}
+              className="flex items-center gap-1 px-2 py-0.5 text-emerald-300 font-semibold hover:bg-emerald-900 rounded transition disabled:opacity-50"
+              title="MediaPipeで動画内の顔を高精度自動追跡（手や物体の誤検出防止フィルタ付き）"
+            >
+              <UserCheck size={14} />
+              <span>{isAIDetecting ? 'AI解析中...' : 'AI顔検出'}</span>
+            </button>
+
+            {onUpdateAiSensitivity && (
+              <select
+                value={aiSensitivity}
+                onChange={(e) => onUpdateAiSensitivity(e.target.value as any)}
+                className="bg-slate-900 text-emerald-300 text-[10px] rounded px-1 py-0.5 border border-emerald-600/40 cursor-pointer focus:outline-none"
+                title="AI検出の感度設定: 手などの誤検出を防ぐには「高精度 (手を除外)」をご利用ください"
+              >
+                <option value="strict">高精度 (手を除外)</option>
+                <option value="standard">標準</option>
+                <option value="high">高感度 (遠くの顔)</option>
+              </select>
+            )}
+          </div>
 
           {/* 反転モザイク（選択外モザイク） */}
           <button

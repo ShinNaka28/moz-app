@@ -4,8 +4,70 @@ import { DetectedPerson } from '../types';
 let faceDetectorInstance: FaceDetector | null = null;
 let isInitializing = false;
 
+export interface FaceFilterOptions {
+  minScore?: number;
+  minAspect?: number;
+  maxAspect?: number;
+  verifyFaceKeypoints?: boolean;
+}
+
+/**
+ * 検出結果が手や物体などの誤検出ではないかを幾何学的に判定する
+ */
+export function isValidFaceDetection(
+  det: {
+    boundingBox?: { originX: number; originY: number; width: number; height: number };
+    categories?: Array<{ score: number }>;
+    keypoints?: Array<{ x: number; y: number; label?: string }>;
+  },
+  options: FaceFilterOptions = {}
+): boolean {
+  const minScore = options.minScore ?? 0.55;
+  const minAspect = options.minAspect ?? 0.55;
+  const maxAspect = options.maxAspect ?? 1.65;
+  const verifyKeypoints = options.verifyFaceKeypoints ?? true;
+
+  // 1. 信頼度スコア判定（手や背景ノイズの多くは 0.3〜0.5 前後）
+  const score = det.categories?.[0]?.score ?? 0;
+  if (score < minScore) return false;
+
+  // 2. バウンディングボックスの検証
+  const bb = det.boundingBox;
+  if (!bb || bb.width <= 6 || bb.height <= 6) return false;
+
+  // アスペクト比 (顔は通常 0.6〜1.4 程度。手や指先、腕などは極端に横長・縦長になりやすい)
+  const aspect = bb.width / bb.height;
+  if (aspect < minAspect || aspect > maxAspect) return false;
+
+  // 3. 顔キーポイント（両目、鼻、口）の幾何学的検証
+  // BlazeFace は 6点: 0:右目, 1:左目, 2:鼻先, 3:口中心, 4:右耳, 5:左耳
+  if (verifyKeypoints && det.keypoints && det.keypoints.length >= 4) {
+    const rightEye = det.keypoints[0];
+    const leftEye = det.keypoints[1];
+    const mouth = det.keypoints[3];
+
+    // 両目間の距離
+    const eyeDx = leftEye.x - rightEye.x;
+    const eyeDy = leftEye.y - rightEye.y;
+    const eyeDist = Math.sqrt(eyeDx * eyeDx + eyeDy * eyeDy);
+
+    // 手の誤検出ではキーポイントが極端に密集することが多い
+    if (eyeDist < 0.035) {
+      return false;
+    }
+
+    // 通常の顔では口が両目より上に来ることはない（手のひらや拳の誤検出防止）
+    const eyesCenterY = (rightEye.y + leftEye.y) / 2;
+    if (mouth.y < eyesCenterY - eyeDist * 0.3) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
 // 完全ローカルから MediaPipe Face Detector を初期化
-export async function initFaceDetector(): Promise<FaceDetector> {
+export async function initFaceDetector(confidence = 0.45): Promise<FaceDetector> {
   if (faceDetectorInstance) return faceDetectorInstance;
   if (isInitializing) {
     while (isInitializing) {
@@ -28,7 +90,7 @@ export async function initFaceDetector(): Promise<FaceDetector> {
         delegate: 'GPU',
       },
       runningMode: 'IMAGE',
-      minDetectionConfidence: 0.35,
+      minDetectionConfidence: confidence,
     });
     return faceDetectorInstance;
   } catch (err) {
@@ -45,7 +107,7 @@ export async function initFaceDetector(): Promise<FaceDetector> {
         delegate: 'CPU',
       },
       runningMode: 'IMAGE',
-      minDetectionConfidence: 0.3,
+      minDetectionConfidence: confidence,
     });
     return faceDetectorInstance;
   } finally {

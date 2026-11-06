@@ -7,7 +7,7 @@ import { PersonListPanel } from './components/PersonListPanel';
 import { ExportModal } from './components/ExportModal';
 import { EditorMode, MosaicTrack, MosaicType, Point, Keyframe } from './types';
 import { Film, ListFilter, Clock, Play, Pause, RotateCcw, Trash2, Crosshair, Sparkles } from 'lucide-react';
-import { initFaceDetector, updatePersonTracks, expandBoxWithMargin } from './utils/aiDetector';
+import { initFaceDetector, updatePersonTracks, expandBoxWithMargin, isValidFaceDetection, FaceFilterOptions } from './utils/aiDetector';
 import { exportMosaicVideo, ExportProgress, saveOrShareBlob } from './utils/videoExporter';
 import { generateDemoVideoBlob } from './utils/sampleGenerator';
 import { renderTrackMosaic, renderInverseMosaic, ProtectedRegion } from './utils/mosaicRenderer';
@@ -36,6 +36,7 @@ export const App: React.FC = () => {
 
   // AIおよびエクスポート進行状態
   const [isAIDetecting, setIsAIDetecting] = useState<boolean>(false);
+  const [aiSensitivity, setAiSensitivity] = useState<'strict' | 'standard' | 'high'>('strict');
   const [isTrackingProcessing, setIsTrackingProcessing] = useState<boolean>(false);
   const [exportProgress, setExportProgress] = useState<ExportProgress | null>(null);
   const [exportedBlob, setExportedBlob] = useState<Blob | null>(null);
@@ -392,18 +393,31 @@ export const App: React.FC = () => {
     }
   };
 
-  // MediaPipe による高密度・AI人物顔自動検出＆追跡（安全マージン付き）
+  // MediaPipe による高密度・AI人物顔自動検出＆追跡（手や物体の誤検出防止フィルタ付き）
   const handleRunAIFaceDetection = async () => {
     if (!videoRef.current && !imageRef.current) return;
     setIsAIDetecting(true);
 
+    // 感度設定に応じたフィルタパラメータ
+    const filterOptions: FaceFilterOptions = {
+      minScore: aiSensitivity === 'strict' ? 0.58 : aiSensitivity === 'standard' ? 0.48 : 0.35,
+      minAspect: aiSensitivity === 'strict' ? 0.60 : 0.50,
+      maxAspect: aiSensitivity === 'strict' ? 1.50 : 1.70,
+      verifyFaceKeypoints: aiSensitivity !== 'high',
+    };
+    const minPersistenceFrames = aiSensitivity === 'strict' ? 4 : aiSensitivity === 'standard' ? 3 : 2;
+
     try {
-      const detector = await initFaceDetector();
+      const detector = await initFaceDetector(filterOptions.minScore! * 0.9);
 
       if (isImage && imageRef.current) {
         // 静止画の場合
         const result = detector.detect(imageRef.current);
-        const newAITracks: MosaicTrack[] = (result.detections || []).map((det, idx) => {
+        const validDetections = (result.detections || []).filter((det) =>
+          isValidFaceDetection(det, filterOptions)
+        );
+
+        const newAITracks: MosaicTrack[] = validDetections.map((det, idx) => {
           const bb = det.boundingBox;
           const rawBox = {
             x: bb ? bb.originX : 0,
@@ -416,7 +430,7 @@ export const App: React.FC = () => {
 
           return {
             id: `ai-face-${Date.now()}-${idx}`,
-            name: `AI人物 #${idx + 1}`,
+            name: `AI顔 #${idx + 1}`,
             type: 'ai',
             shape: 'rect',
             enabled: true,
@@ -429,7 +443,7 @@ export const App: React.FC = () => {
         });
         setTracks((prev) => [...prev, ...newAITracks]);
       } else if (videoRef.current) {
-        // 動画の場合: 0.08秒間隔（約12.5fps）の超高密度スキャンで追従性を圧倒的向上
+        // 動画の場合: 0.08秒間隔（約12.5fps）の超高密度スキャン
         const video = videoRef.current;
         const origTime = video.currentTime;
         const totalDuration = video.duration || 5;
@@ -438,6 +452,7 @@ export const App: React.FC = () => {
 
         let currentDetectedPersons: any[] = [];
         const personKeyframesMap = new Map<number, any[]>();
+        const personScoresMap = new Map<number, number[]>();
 
         for (let i = 0; i <= totalSteps; i++) {
           const sampleTime = Math.min(totalDuration, i * step);
@@ -452,7 +467,12 @@ export const App: React.FC = () => {
           });
 
           const result = detector.detect(video);
-          const rawBoxes = (result.detections || []).map((det) => {
+          // 手や背景などの誤検出を幾何学・スコアで除外
+          const validDetections = (result.detections || []).filter((det) =>
+            isValidFaceDetection(det, filterOptions)
+          );
+
+          const rawBoxes = validDetections.map((det) => {
             const bb = det.boundingBox!;
             const rawBox = {
               x: bb.originX,
@@ -474,12 +494,13 @@ export const App: React.FC = () => {
             currentDetectedPersons,
             rawBoxes,
             sampleTime,
-            8 // 8フレーム見失いバッファ
+            6 // 6フレーム見失いバッファ
           );
 
           for (const p of currentDetectedPersons) {
             if (!personKeyframesMap.has(p.trackId)) {
               personKeyframesMap.set(p.trackId, []);
+              personScoresMap.set(p.trackId, []);
             }
             personKeyframesMap.get(p.trackId)!.push({
               time: sampleTime,
@@ -488,26 +509,36 @@ export const App: React.FC = () => {
               width: p.box.width,
               height: p.box.height,
             });
+            personScoresMap.get(p.trackId)!.push(p.score);
           }
         }
 
-        // トラックへ変換
+        // トラックへ変換（時間的持続性フィルタ：手が前を横切った瞬間の1〜2フレーム誤検出を完全に除外）
         const newTracks: MosaicTrack[] = [];
+        const requiredFrames = Math.min(minPersistenceFrames, totalSteps);
+
         personKeyframesMap.forEach((kfs, personId) => {
-          if (kfs.length > 0) {
-            newTracks.push({
-              id: `ai-track-${personId}-${Date.now()}`,
-              name: `AI人物 #${personId}`,
-              type: 'ai',
-              shape: 'rect',
-              enabled: true,
-              mosaicType: 'pixel',
-              strength: 14,
-              startTime: kfs[0].time,
-              endTime: kfs[kfs.length - 1].time + 0.3,
-              keyframes: kfs,
-              aiPersonId: personId,
-            });
+          // 最低持続フレーム数以上のトラックのみを採用（手の瞬間誤検知を遮断）
+          if (kfs.length >= requiredFrames) {
+            const scores = personScoresMap.get(personId) || [];
+            const avgScore = scores.reduce((a, b) => a + b, 0) / (scores.length || 1);
+
+            // 平均スコアが基準を満たしているか確認
+            if (avgScore >= filterOptions.minScore! * 0.95) {
+              newTracks.push({
+                id: `ai-track-${personId}-${Date.now()}`,
+                name: `AI顔 #${personId}`,
+                type: 'ai',
+                shape: 'rect',
+                enabled: true,
+                mosaicType: 'pixel',
+                strength: 14,
+                startTime: kfs[0].time,
+                endTime: kfs[kfs.length - 1].time + 0.3,
+                keyframes: kfs,
+                aiPersonId: personId,
+              });
+            }
           }
         });
 
@@ -660,6 +691,8 @@ export const App: React.FC = () => {
         hasKeyframeAtCurrentTime={hasKeyframeAtCurrentTime}
         onRunAIFaceDetection={handleRunAIFaceDetection}
         isAIDetecting={isAIDetecting}
+        aiSensitivity={aiSensitivity}
+        onUpdateAiSensitivity={setAiSensitivity}
         isPreviewMode={isPreviewMode}
         onTogglePreviewMode={() => setIsPreviewMode((prev) => !prev)}
         isInverseMosaic={isInverseMosaic}

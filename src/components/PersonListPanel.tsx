@@ -191,6 +191,9 @@ export const PersonListPanel: React.FC<PersonListPanelProps> = ({
                 </div>
               );
             })}
+            <div className="mt-1 text-[10px] text-slate-500 leading-tight">
+              💡 手などに誤って枠が入った場合は、右のゴミ箱ボタンか画面上の「✕」で即座に削除できます
+            </div>
           </div>
         )}
       </div>
