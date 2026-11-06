@@ -7,7 +7,7 @@ import { PersonListPanel } from './components/PersonListPanel';
 import { ExportModal } from './components/ExportModal';
 import { EditorMode, MosaicTrack, MosaicType, Point, Keyframe } from './types';
 import { Film, ListFilter, Clock, Play, Pause, RotateCcw, Trash2, Crosshair, Sparkles } from 'lucide-react';
-import { initFaceDetector, detectFacesSafely, updatePersonTracks, expandBoxWithMargin, isValidFaceDetection, FaceFilterOptions } from './utils/aiDetector';
+import { initFaceDetector, detectFacesSafely, updatePersonTracks, expandBoxWithMargin, estimateBodyBoxFromFace, isValidFaceDetection, FaceFilterOptions } from './utils/aiDetector';
 import { exportMosaicVideo, ExportProgress, saveOrShareBlob } from './utils/videoExporter';
 import { generateDemoVideoBlob } from './utils/sampleGenerator';
 import { renderTrackMosaic, renderInverseMosaic, ProtectedRegion } from './utils/mosaicRenderer';
@@ -39,6 +39,7 @@ export const App: React.FC = () => {
   const [isAIDetecting, setIsAIDetecting] = useState<boolean>(false);
   const [aiDetectProgress, setAiDetectProgress] = useState<number>(0);
   const [aiSensitivity, setAiSensitivity] = useState<'strict' | 'standard' | 'high'>('strict');
+  const [aiTarget, setAiTarget] = useState<'face' | 'body'>('face');
   const [isTrackingProcessing, setIsTrackingProcessing] = useState<boolean>(false);
   const [exportProgress, setExportProgress] = useState<ExportProgress | null>(null);
   const [exportedBlob, setExportedBlob] = useState<Blob | null>(null);
@@ -456,9 +457,10 @@ export const App: React.FC = () => {
     }
   };
 
-  // MediaPipe による高密度・AI人物顔自動検出＆追跡（手や物体の誤検出防止フィルタ＋画面オフ防止付き）
-  const handleRunAIFaceDetection = async () => {
+  // MediaPipe による高密度・AI人物自動検出＆追跡（顔・全身切替 / 背景モザイク連動対応）
+  const handleRunAIFaceDetection = async (overrideTarget?: 'face' | 'body', autoEnableInverse?: boolean) => {
     if (!videoRef.current && !imageRef.current) return;
+    const targetMode = overrideTarget || aiTarget;
     setIsAIDetecting(true);
     setAiDetectProgress(0);
     await requestScreenWakeLock();
@@ -477,8 +479,12 @@ export const App: React.FC = () => {
       let detector = await initFaceDetector(confidence);
 
       if (isImage && imageRef.current) {
+        const img = imageRef.current;
+        const width = img.naturalWidth;
+        const height = img.naturalHeight;
+
         // 静止画の場合（2D Canvas転写経由でWebGL2エラーを防止）
-        const result = await detectFacesSafely(imageRef.current, detector, confidence);
+        const result = await detectFacesSafely(img, detector, confidence);
         detector = result.activeDetector;
         const validDetections = (result.detections || []).filter((det) =>
           isValidFaceDetection(det, filterOptions)
@@ -492,12 +498,15 @@ export const App: React.FC = () => {
             width: bb ? bb.width : 50,
             height: bb ? bb.height : 50,
           };
-          // 35%の安全マージン拡張
-          const padded = expandBoxWithMargin(rawBox, 0.35);
+          
+          // 顔枠または人物全身枠の算出
+          const finalBox = targetMode === 'body'
+            ? estimateBodyBoxFromFace(rawBox, width, height)
+            : expandBoxWithMargin(rawBox, 0.35, width, height);
 
           return {
-            id: `ai-face-${Date.now()}-${idx}`,
-            name: `AI顔 #${idx + 1}`,
+            id: `ai-person-${Date.now()}-${idx}`,
+            name: targetMode === 'body' ? `AI人物 #${idx + 1}` : `AI顔 #${idx + 1}`,
             type: 'ai',
             shape: 'rect',
             enabled: true,
@@ -505,16 +514,22 @@ export const App: React.FC = () => {
             strength: 14,
             startTime: 0,
             endTime: 1,
-            keyframes: [{ time: 0, ...padded }],
+            keyframes: [{ time: 0, ...finalBox }],
+            aiTarget: targetMode,
           };
         });
         setAiDetectProgress(100);
         setTracks((prev) => [...prev, ...newAITracks]);
+        if (autoEnableInverse && newAITracks.length > 0) {
+          setIsInverseMosaic(true);
+        }
       } else if (videoRef.current) {
         // 動画の場合: 0.08秒間隔（約12.5fps）の超高密度スキャン
         const video = videoRef.current;
         const origTime = video.currentTime;
         const totalDuration = video.duration || 5;
+        const videoWidth = video.videoWidth || 640;
+        const videoHeight = video.videoHeight || 480;
         const step = 0.08;
         const totalSteps = Math.max(1, Math.floor(totalDuration / step));
 
@@ -545,10 +560,11 @@ export const App: React.FC = () => {
               height: bb.height,
             };
             // 35%安全マージンを付加して素顔チラ見えを防止
-            const padded = expandBoxWithMargin(rawBox, 0.35);
+            const padded = expandBoxWithMargin(rawBox, 0.35, videoWidth, videoHeight);
 
             return {
               ...padded,
+              rawFaceBox: rawBox,
               score: det.categories?.[0]?.score || 0.9,
             };
           });
@@ -566,12 +582,18 @@ export const App: React.FC = () => {
               personKeyframesMap.set(p.trackId, []);
               personScoresMap.set(p.trackId, []);
             }
+            
+            // 全身モードの場合は顔から体を推定、顔モードの場合は顔枠
+            const boxToStore = targetMode === 'body'
+              ? estimateBodyBoxFromFace(p.box, videoWidth, videoHeight)
+              : p.box;
+
             personKeyframesMap.get(p.trackId)!.push({
               time: sampleTime,
-              x: p.box.x,
-              y: p.box.y,
-              width: p.box.width,
-              height: p.box.height,
+              x: boxToStore.x,
+              y: boxToStore.y,
+              width: boxToStore.width,
+              height: boxToStore.height,
             });
             personScoresMap.get(p.trackId)!.push(p.score);
           }
@@ -591,7 +613,7 @@ export const App: React.FC = () => {
             if (avgScore >= filterOptions.minScore! * 0.95) {
               newTracks.push({
                 id: `ai-track-${personId}-${Date.now()}`,
-                name: `AI顔 #${personId}`,
+                name: targetMode === 'body' ? `AI人物 #${personId}` : `AI顔 #${personId}`,
                 type: 'ai',
                 shape: 'rect',
                 enabled: true,
@@ -601,6 +623,7 @@ export const App: React.FC = () => {
                 endTime: kfs[kfs.length - 1].time + 0.3,
                 keyframes: kfs,
                 aiPersonId: personId,
+                aiTarget: targetMode,
               });
             }
           }
@@ -608,6 +631,9 @@ export const App: React.FC = () => {
 
         await seekVideoSafely(video, origTime);
         setTracks((prev) => [...prev, ...newTracks]);
+        if (autoEnableInverse && newTracks.length > 0) {
+          setIsInverseMosaic(true);
+        }
       }
     } catch (err) {
       console.error('AI Detection failed', err);
@@ -617,6 +643,13 @@ export const App: React.FC = () => {
       setIsAIDetecting(false);
       setAiDetectProgress(0);
     }
+  };
+
+  // 「人物囲み+背景モザイク」ワンタップアクション
+  const handleDetectAndBlurBackground = async () => {
+    // 全身ターゲットでAI人物を検出し、自動で背景モザイク（反転モザイク）をON
+    setAiTarget('body');
+    await handleRunAIFaceDetection('body', true);
   };
 
   // エクスポート実行
@@ -755,10 +788,13 @@ export const App: React.FC = () => {
         onDeleteSelectedTrack={() => selectedTrackId && handleDeleteTrack(selectedTrackId)}
         onAddKeyframeAtCurrentTime={handleAddKeyframeAtCurrentTime}
         hasKeyframeAtCurrentTime={hasKeyframeAtCurrentTime}
-        onRunAIFaceDetection={handleRunAIFaceDetection}
+        onRunAIFaceDetection={() => handleRunAIFaceDetection(aiTarget)}
         isAIDetecting={isAIDetecting}
         aiSensitivity={aiSensitivity}
         onUpdateAiSensitivity={setAiSensitivity}
+        aiTarget={aiTarget}
+        onUpdateAiTarget={setAiTarget}
+        onDetectAndBlurBackground={handleDetectAndBlurBackground}
         isPreviewMode={isPreviewMode}
         onTogglePreviewMode={() => setIsPreviewMode((prev) => !prev)}
         isInverseMosaic={isInverseMosaic}
@@ -778,7 +814,7 @@ export const App: React.FC = () => {
             <span className="inline-block w-2 h-2 rounded-full bg-emerald-400 animate-ping" />
             <span>
               {isAIDetecting
-                ? `AI顔自動検出を実行中... (${aiDetectProgress}%)`
+                ? `AI${aiTarget === 'body' ? '人物' : '顔'}自動検出を実行中... (${aiDetectProgress}%)`
                 : '自動追従区間を解析中...'}
             </span>
           </div>

@@ -247,15 +247,52 @@ function calcIoU(
 // 顔の検出枠に安全マージン（35%拡張）を付与して素顔のはみ出し・チラ見えを防止
 export function expandBoxWithMargin(
   box: { x: number; y: number; width: number; height: number },
-  margin = 0.35
+  margin = 0.35,
+  videoWidth = 99999,
+  videoHeight = 99999
 ): { x: number; y: number; width: number; height: number } {
   const padW = box.width * margin;
   const padH = box.height * margin;
+  const nx = Math.max(0, box.x - padW / 2);
+  const ny = Math.max(0, box.y - padH / 2);
   return {
-    x: Math.max(0, box.x - padW / 2),
-    y: Math.max(0, box.y - padH / 2),
-    width: box.width + padW,
-    height: box.height + padH,
+    x: nx,
+    y: ny,
+    width: Math.min(videoWidth - nx, box.width + padW),
+    height: Math.min(videoHeight - ny, box.height + padH),
+  };
+}
+
+/**
+ * 顔の検出枠から上半身〜全身（人物全体）の推定領域を計算
+ * 顔の幅と高さを基準に、頭上から肩・胴体・足元方向へ拡張します
+ */
+export function estimateBodyBoxFromFace(
+  faceBox: { x: number; y: number; width: number; height: number },
+  videoWidth: number,
+  videoHeight: number
+): { x: number; y: number; width: number; height: number } {
+  // 顔幅の約2.6倍の横幅（左右均等に肩幅をカバー）
+  const bodyWidth = faceBox.width * 2.6;
+  // 顔高の約4.5〜5.5倍の縦幅（頭上余白 + 首・胸・胴体・腰・足元をカバー）
+  const bodyHeight = faceBox.height * 5.0;
+
+  // 顔の中心X
+  const centerX = faceBox.x + faceBox.width / 2;
+  // 頭頂部（顔の上の余白：顔の高さの30%程度上から開始）
+  const startY = Math.max(0, faceBox.y - faceBox.height * 0.35);
+
+  let startX = centerX - bodyWidth / 2;
+  startX = Math.max(0, Math.min(videoWidth - 20, startX));
+
+  const actualWidth = Math.max(20, Math.min(videoWidth - startX, bodyWidth));
+  const actualHeight = Math.max(20, Math.min(videoHeight - startY, bodyHeight));
+
+  return {
+    x: Math.round(startX),
+    y: Math.round(startY),
+    width: Math.round(actualWidth),
+    height: Math.round(actualHeight),
   };
 }
 

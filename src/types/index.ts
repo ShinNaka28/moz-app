@@ -45,6 +45,7 @@ export interface MosaicTrack {
 
   // AI人物専用
   aiPersonId?: number;
+  aiTarget?: 'face' | 'body';
   lastVelocity?: { vx: number; vy: number };
   missCount?: number; // 見失いフレーム数
 }

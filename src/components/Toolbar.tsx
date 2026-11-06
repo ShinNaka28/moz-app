@@ -30,6 +30,9 @@ interface ToolbarProps {
   isAIDetecting: boolean;
   aiSensitivity?: 'strict' | 'standard' | 'high';
   onUpdateAiSensitivity?: (s: 'strict' | 'standard' | 'high') => void;
+  aiTarget?: 'face' | 'body';
+  onUpdateAiTarget?: (t: 'face' | 'body') => void;
+  onDetectAndBlurBackground?: () => void;
   isPreviewMode: boolean;
   onTogglePreviewMode: () => void;
 
@@ -58,6 +61,9 @@ export const Toolbar: React.FC<ToolbarProps> = ({
   isAIDetecting,
   aiSensitivity = 'strict',
   onUpdateAiSensitivity,
+  aiTarget = 'face',
+  onUpdateAiTarget,
+  onDetectAndBlurBackground,
   isPreviewMode,
   onTogglePreviewMode,
   isInverseMosaic,
@@ -141,17 +147,29 @@ export const Toolbar: React.FC<ToolbarProps> = ({
         </div>
 
         <div className="flex items-center gap-1 shrink-0">
-          {/* AI顔自動検出（誤検出抑制フィルタ・感度切替付き） */}
+          {/* AI人物・顔自動検出（顔/全身切替＆感度切替付き） */}
           <div className="flex items-center bg-emerald-950/80 border border-emerald-500/40 rounded-md p-0.5 shrink-0 gap-1">
             <button
               onClick={onRunAIFaceDetection}
               disabled={isAIDetecting}
               className="flex items-center gap-1 px-2 py-0.5 text-emerald-300 font-semibold hover:bg-emerald-900 rounded transition disabled:opacity-50"
-              title="MediaPipeで動画内の顔を高精度自動追跡（手や物体の誤検出防止フィルタ付き）"
+              title="MediaPipeで動画内の人物を高精度自動追跡（手や物体の誤検出防止フィルタ付き）"
             >
               <UserCheck size={14} />
-              <span>{isAIDetecting ? 'AI解析中...' : 'AI顔検出'}</span>
+              <span>{isAIDetecting ? 'AI解析中...' : aiTarget === 'body' ? 'AI人物検出' : 'AI顔検出'}</span>
             </button>
+
+            {onUpdateAiTarget && (
+              <select
+                value={aiTarget}
+                onChange={(e) => onUpdateAiTarget(e.target.value as any)}
+                className="bg-slate-900 text-emerald-300 text-[10px] rounded px-1 py-0.5 border border-emerald-600/40 cursor-pointer focus:outline-none font-medium"
+                title="検出対象: 顔のみ、または人物全体（体・全身）"
+              >
+                <option value="face">顔</option>
+                <option value="body">全身</option>
+              </select>
+            )}
 
             {onUpdateAiSensitivity && (
               <select
@@ -166,6 +184,19 @@ export const Toolbar: React.FC<ToolbarProps> = ({
               </select>
             )}
           </div>
+
+          {/* 人物検出して背景モザイク（ワンタップ機能） */}
+          {onDetectAndBlurBackground && (
+            <button
+              onClick={onDetectAndBlurBackground}
+              disabled={isAIDetecting}
+              className="flex items-center gap-1 px-2 py-1 bg-gradient-to-r from-emerald-700 to-teal-700 hover:from-emerald-600 hover:to-teal-600 text-white rounded-md font-bold text-xs shadow transition disabled:opacity-50 shrink-0 ring-1 ring-emerald-400/40"
+              title="人物をAI検出し、人物を残して背景全体に自動でモザイクをかけます"
+            >
+              <Sparkles size={14} className="text-yellow-300" />
+              <span>人物囲み+背景モザイク</span>
+            </button>
+          )}
 
           {/* 反転モザイク（選択外モザイク） */}
           <button
