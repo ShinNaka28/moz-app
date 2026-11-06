@@ -25,7 +25,7 @@ export const PersonListPanel: React.FC<PersonListPanelProps> = ({
   const userTracks = tracks.filter((t) => t.type !== 'ai');
 
   return (
-    <div className="bg-slate-900 border-l border-slate-800 w-full md:w-64 flex flex-col p-3 text-xs overflow-y-auto max-h-48 md:max-h-full select-none">
+    <div className="bg-slate-900 border-l border-slate-800 w-full flex-1 md:w-64 flex flex-col p-3 text-xs overflow-y-auto select-none min-h-[300px] md:min-h-0">
       {/* ユーザー指定領域（フリー囲み・矩形・ブラシ）セクション */}
       <div className="mb-4">
         <div className="flex items-center justify-between mb-2">

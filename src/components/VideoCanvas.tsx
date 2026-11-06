@@ -585,7 +585,7 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
   return (
     <div
       ref={containerRef}
-      className="relative flex-1 bg-slate-950 flex items-center justify-center p-2 sm:p-4 overflow-hidden select-none"
+      className="relative flex-1 bg-slate-950 flex flex-col items-center justify-center p-2 sm:p-4 select-none min-h-[300px] sm:min-h-[420px] w-full"
     >
       <canvas
         ref={canvasRef}
@@ -595,7 +595,7 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
         onTouchStart={handlePointerDown}
         onTouchMove={handlePointerMove}
         onTouchEnd={handlePointerUp}
-        className="max-w-full max-h-[65vh] sm:max-h-[70vh] object-contain shadow-2xl rounded border border-slate-800 touch-none cursor-crosshair"
+        className="max-w-full max-h-[55vh] sm:max-h-[70vh] object-contain shadow-2xl rounded border border-slate-800 touch-none cursor-crosshair"
       />
     </div>
   );

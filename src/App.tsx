@@ -6,6 +6,7 @@ import { Timeline } from './components/Timeline';
 import { PersonListPanel } from './components/PersonListPanel';
 import { ExportModal } from './components/ExportModal';
 import { EditorMode, MosaicTrack, MosaicType, Point, Keyframe } from './types';
+import { Film, ListFilter, Clock, Play, Pause, RotateCcw, Trash2, Crosshair, Sparkles } from 'lucide-react';
 import { initFaceDetector, updatePersonTracks, expandBoxWithMargin } from './utils/aiDetector';
 import { exportMosaicVideo, ExportProgress, saveOrShareBlob } from './utils/videoExporter';
 import { generateDemoVideoBlob } from './utils/sampleGenerator';
@@ -26,6 +27,7 @@ export const App: React.FC = () => {
   const [selectedTrackId, setSelectedTrackId] = useState<string | null>(null);
   const [editorMode, setEditorMode] = useState<EditorMode>('select');
   const [isPreviewMode, setIsPreviewMode] = useState<boolean>(false);
+  const [mobileTab, setMobileTab] = useState<'canvas' | 'list' | 'timeline'>('canvas');
 
   // 反転モザイク（選択した人物やPC画面以外の『背景全体』にモザイクをかける機能）
   const [isInverseMosaic, setIsInverseMosaic] = useState<boolean>(false);
@@ -603,8 +605,16 @@ export const App: React.FC = () => {
     selectedTrack?.keyframes.some((k) => Math.abs(k.time - currentTime) < 0.1)
   );
 
+  const formatTimeStr = (sec: number) => {
+    const s = Math.max(0, sec);
+    const mins = Math.floor(s / 60);
+    const secs = Math.floor(s % 60);
+    const ms = Math.floor((s % 1) * 10);
+    return `${mins}:${secs.toString().padStart(2, '0')}.${ms}`;
+  };
+
   return (
-    <div className="flex flex-col h-screen w-screen overflow-hidden bg-slate-950 text-slate-100">
+    <div className="flex flex-col min-h-screen md:h-screen w-screen overflow-x-hidden overflow-y-auto md:overflow-hidden bg-slate-950 text-slate-100">
       {/* 隠しメディア要素 */}
       {mediaUrl && (
         <>
@@ -662,10 +672,58 @@ export const App: React.FC = () => {
         isTrackingProcessing={isTrackingProcessing}
       />
 
+      {/* スマホ専用ビュー切り替えタブ（PCでは非表示） */}
+      {mediaUrl && (
+        <div className="md:hidden flex items-center justify-around bg-slate-900/90 backdrop-blur border-b border-slate-800 p-1 text-xs font-semibold sticky top-0 z-20">
+          <button
+            onClick={() => setMobileTab('canvas')}
+            className={`flex-1 flex items-center justify-center gap-1.5 py-1.5 rounded-md transition ${
+              mobileTab === 'canvas'
+                ? 'bg-indigo-600 text-white shadow-sm'
+                : 'text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            <Film size={14} />
+            <span>映像・囲み</span>
+          </button>
+
+          <button
+            onClick={() => setMobileTab('list')}
+            className={`flex-1 flex items-center justify-center gap-1.5 py-1.5 rounded-md transition relative ${
+              mobileTab === 'list'
+                ? 'bg-indigo-600 text-white shadow-sm'
+                : 'text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            <ListFilter size={14} />
+            <span>枠・人物</span>
+            {tracks.length > 0 && (
+              <span className="bg-indigo-400 text-slate-950 text-[10px] font-black px-1.5 py-0.2 rounded-full">
+                {tracks.length}
+              </span>
+            )}
+          </button>
+
+          {!isImage && (
+            <button
+              onClick={() => setMobileTab('timeline')}
+              className={`flex-1 flex items-center justify-center gap-1.5 py-1.5 rounded-md transition ${
+                mobileTab === 'timeline'
+                  ? 'bg-indigo-600 text-white shadow-sm'
+                  : 'text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              <Clock size={14} />
+              <span>タイムライン</span>
+            </button>
+          )}
+        </div>
+      )}
+
       {/* メインプレビュー＆サイドパネルエリア */}
       <div className="flex-1 flex flex-col md:flex-row overflow-hidden relative">
         {!mediaUrl ? (
-          <div className="flex-1 flex flex-col items-center justify-center p-6 text-center text-slate-400 gap-4">
+          <div className="flex-1 flex flex-col items-center justify-center p-6 text-center text-slate-400 gap-4 min-h-[350px]">
             <div className="w-16 h-16 rounded-2xl bg-slate-900 border border-slate-800 flex items-center justify-center text-3xl shadow-inner">
               🔒
             </div>
@@ -697,58 +755,156 @@ export const App: React.FC = () => {
           </div>
         ) : (
           <>
-            <VideoCanvas
-              videoRef={videoRef}
-              imageRef={imageRef}
-              isImage={isImage}
-              tracks={tracks}
-              selectedTrackId={selectedTrackId}
-              editorMode={editorMode}
-              currentTime={currentTime}
-              isPlaying={isPlaying}
-              isPreviewMode={isPreviewMode}
-              isInverseMosaic={isInverseMosaic}
-              inverseMosaicType={inverseMosaicType}
-              inverseStrength={inverseStrength}
-              onSelectTrack={setSelectedTrackId}
-              onAddTrack={handleAddTrack}
-              onUpdateTrackKeyframe={handleUpdateTrackKeyframe}
-              onToggleTrackEnabled={handleToggleTrackEnabled}
-              onUpdateTrackFrameOut={handleUpdateTrackFrameOut}
-              onDeleteTrack={handleDeleteTrack}
-            />
+            {/* キャンバスエリア（スマホではmobileTab === 'canvas'の時またはPCで表示） */}
+            <div
+              className={`flex-1 flex flex-col ${
+                mobileTab === 'canvas' ? 'flex' : 'hidden md:flex'
+              }`}
+            >
+              <VideoCanvas
+                videoRef={videoRef}
+                imageRef={imageRef}
+                isImage={isImage}
+                tracks={tracks}
+                selectedTrackId={selectedTrackId}
+                editorMode={editorMode}
+                currentTime={currentTime}
+                isPlaying={isPlaying}
+                isPreviewMode={isPreviewMode}
+                isInverseMosaic={isInverseMosaic}
+                inverseMosaicType={inverseMosaicType}
+                inverseStrength={inverseStrength}
+                onSelectTrack={setSelectedTrackId}
+                onAddTrack={handleAddTrack}
+                onUpdateTrackKeyframe={handleUpdateTrackKeyframe}
+                onToggleTrackEnabled={handleToggleTrackEnabled}
+                onUpdateTrackFrameOut={handleUpdateTrackFrameOut}
+                onDeleteTrack={handleDeleteTrack}
+              />
 
-            {/* 人物・指定領域リスト サイドパネル */}
-            <PersonListPanel
-              tracks={tracks}
-              selectedTrackId={selectedTrackId}
-              onSelectTrack={setSelectedTrackId}
-              onToggleTrackEnabled={handleToggleTrackEnabled}
-              onToggleAllAITracks={handleToggleAllAITracks}
-              onDeleteTrack={handleDeleteTrack}
-              onDeleteAllUserTracks={handleDeleteAllUserTracks}
-            />
+              {/* スマホ専用の直感クイック操作バー（動画を見ながらワンタップで再生・シーク・確認・追従解析可能） */}
+              {!isImage && (
+                <div className="md:hidden bg-slate-900 border-t border-slate-800 p-2 flex flex-col gap-1.5 text-xs">
+                  <div className="flex items-center justify-between gap-2">
+                    <button
+                      onClick={togglePlay}
+                      className="p-1.5 bg-indigo-600 text-white rounded-lg shadow font-bold flex items-center justify-center shrink-0 w-8 h-8"
+                      title={isPlaying ? '一時停止' : '再生'}
+                    >
+                      {isPlaying ? <Pause size={16} /> : <Play size={16} className="ml-0.5" />}
+                    </button>
+
+                    <div className="flex-1 flex items-center gap-2">
+                      <input
+                        type="range"
+                        min="0"
+                        max={duration || 1}
+                        step="0.05"
+                        value={currentTime}
+                        onChange={(e) => handleSeek(Number(e.target.value))}
+                        className="w-full accent-indigo-500 h-2 bg-slate-800 rounded-lg cursor-pointer"
+                      />
+                      <span className="font-mono text-[11px] text-slate-300 shrink-0">
+                        {formatTimeStr(currentTime)} / {formatTimeStr(duration)}
+                      </span>
+                    </div>
+                  </div>
+
+                  {/* 選択枠の操作クイックボタン */}
+                  {selectedTrack && (
+                    <div className="flex items-center justify-between gap-2 pt-1 border-t border-slate-800/80">
+                      <span className="text-[11px] text-cyan-400 font-semibold truncate max-w-[140px]">
+                        {selectedTrack.name}
+                      </span>
+                      <div className="flex items-center gap-1.5">
+                        {selectedTrack.type === 'tracked' && (
+                          <button
+                            onClick={() => runTrackingForTrack(selectedTrack.id)}
+                            disabled={isTrackingProcessing}
+                            className="px-2 py-0.5 bg-indigo-900/80 hover:bg-indigo-800 border border-indigo-500 text-indigo-200 text-[10px] font-bold rounded flex items-center gap-1"
+                          >
+                            <Play size={10} className="fill-indigo-300" />
+                            <span>{isTrackingProcessing ? '解析中...' : '自動追従'}</span>
+                          </button>
+                        )}
+                        <button
+                          onClick={() => handleDeleteTrack(selectedTrack.id)}
+                          className="px-2 py-0.5 bg-rose-950/80 hover:bg-rose-900 border border-rose-600/70 text-rose-200 text-[10px] font-bold rounded flex items-center gap-0.5"
+                        >
+                          <Trash2 size={10} />
+                          <span>削除</span>
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+
+            {/* 人物・指定領域リスト サイドパネル（スマホではmobileTab === 'list'の時またはPCで表示） */}
+            <div
+              className={`w-full md:w-64 ${
+                mobileTab === 'list' ? 'flex flex-1' : 'hidden md:flex'
+              }`}
+            >
+              <PersonListPanel
+                tracks={tracks}
+                selectedTrackId={selectedTrackId}
+                onSelectTrack={setSelectedTrackId}
+                onToggleTrackEnabled={handleToggleTrackEnabled}
+                onToggleAllAITracks={handleToggleAllAITracks}
+                onDeleteTrack={handleDeleteTrack}
+                onDeleteAllUserTracks={handleDeleteAllUserTracks}
+              />
+            </div>
+
+            {/* スマホ専用のタイムライン画面（mobileTab === 'timeline'の時のみ表示） */}
+            {mediaUrl && !isImage && (
+              <div
+                className={`w-full ${
+                  mobileTab === 'timeline' ? 'block flex-1' : 'hidden'
+                }`}
+              >
+                <Timeline
+                  duration={duration}
+                  currentTime={currentTime}
+                  isPlaying={isPlaying}
+                  tracks={tracks}
+                  selectedTrackId={selectedTrackId}
+                  onSeek={handleSeek}
+                  onTogglePlay={togglePlay}
+                  onSelectTrack={setSelectedTrackId}
+                  onUpdateTrackTime={handleUpdateTrackTime}
+                  onToggleTrackEnabled={handleToggleTrackEnabled}
+                  onDeleteTrack={handleDeleteTrack}
+                  onSetInPoint={handleSetInPoint}
+                  onSetOutPoint={handleSetOutPoint}
+                />
+              </div>
+            )}
           </>
         )}
       </div>
 
-      {/* タイムライン（動画の場合のみ表示） */}
+      {/* PC専用のタイムライン（PC表示時 md:block で下部に常時表示） */}
       {mediaUrl && !isImage && (
-        <Timeline
-          duration={duration}
-          currentTime={currentTime}
-          isPlaying={isPlaying}
-          tracks={tracks}
-          selectedTrackId={selectedTrackId}
-          onSeek={handleSeek}
-          onTogglePlay={togglePlay}
-          onSelectTrack={setSelectedTrackId}
-          onUpdateTrackTime={handleUpdateTrackTime}
-          onToggleTrackEnabled={handleToggleTrackEnabled}
-          onDeleteTrack={handleDeleteTrack}
-          onSetInPoint={handleSetInPoint}
-          onSetOutPoint={handleSetOutPoint}
-        />
+        <div className="hidden md:block">
+          <Timeline
+            duration={duration}
+            currentTime={currentTime}
+            isPlaying={isPlaying}
+            tracks={tracks}
+            selectedTrackId={selectedTrackId}
+            onSeek={handleSeek}
+            onTogglePlay={togglePlay}
+            onSelectTrack={setSelectedTrackId}
+            onUpdateTrackTime={handleUpdateTrackTime}
+            onToggleTrackEnabled={handleToggleTrackEnabled}
+            onDeleteTrack={handleDeleteTrack}
+            onSetInPoint={handleSetInPoint}
+            onSetOutPoint={handleSetOutPoint}
+          />
+        </div>
       )}
 
       {/* エクスポート進行＆完成プレビューモーダル */}
