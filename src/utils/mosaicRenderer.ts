@@ -265,7 +265,7 @@ export function renderTrackOverlay(
     }
   }
 
-  // 選択時の四隅ハンドル ＆ 中央移動アイコン
+  // 選択時の四隅ハンドル ＆ ポリゴン頂点ハンドル(●) ＆ 中央移動アイコン
   if (isSelected) {
     const handleSize = Math.round(12 * scale);
     ctx.fillStyle = '#ffffff';
@@ -283,11 +283,32 @@ export function renderTrackOverlay(
       ctx.strokeRect(c.cx - handleSize / 2, c.cy - handleSize / 2, handleSize, handleSize);
     }
 
-    // 枠の中央に「✥ 枠内ドラッグで移動」を表示
+    // ポリゴン・フリー囲み選択時は輪郭上の各頂点にドラッグ編集用の丸ハンドル（●）を描画
+    if ((track.shape === 'polygon' || track.shape === 'lasso') && points && points.length >= 3) {
+      ctx.save();
+      const vRadius = Math.round(6.5 * scale);
+      const step = points.length > 32 ? Math.max(1, Math.floor(points.length / 20)) : 1;
+      for (let i = 0; i < points.length; i += step) {
+        const pt = points[i];
+        ctx.beginPath();
+        ctx.arc(pt.x, pt.y, vRadius, 0, Math.PI * 2);
+        ctx.fillStyle = '#fbbf24'; // 視認性の高いアンバーゴールド
+        ctx.fill();
+        ctx.lineWidth = 2 * scale;
+        ctx.strokeStyle = '#ffffff';
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
+
+    // 枠の中央に操作ガイドを表示
     if (width >= 40 * scale && height >= 24 * scale) {
       ctx.save();
       ctx.fillStyle = 'rgba(15, 23, 42, 0.85)';
-      const moveText = '✥ 枠内ドラッグで移動';
+      const moveText =
+        (track.shape === 'polygon' || track.shape === 'lasso') && points && points.length >= 3
+          ? '● 頂点ドラッグで体ライン調整 / ✥ 内側で移動'
+          : '✥ 枠内ドラッグで移動';
       const fontSize = Math.round(11 * scale);
       ctx.font = `bold ${fontSize}px sans-serif`;
       const moveW = ctx.measureText(moveText).width + 12 * scale;

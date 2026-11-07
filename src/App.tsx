@@ -7,7 +7,7 @@ import { PersonListPanel } from './components/PersonListPanel';
 import { ExportModal } from './components/ExportModal';
 import { EditorMode, MosaicTrack, MosaicType, Point, Keyframe } from './types';
 import { Film, ListFilter, Clock, Play, Pause, RotateCcw, Trash2, Crosshair, Sparkles } from 'lucide-react';
-import { initFaceDetector, initPersonSegmenter, detectFacesSafely, segmentPersonSafely, resetBodySegmentationState, updatePersonTracks, expandBoxWithMargin, estimateBodyBoxFromFace, createBodySilhouettePolygon, isValidFaceDetection, FaceFilterOptions } from './utils/aiDetector';
+import { initFaceDetector, initPersonSegmenter, detectFacesSafely, segmentPersonSafely, resampleClosedPolygon, BODY_CONTOUR_POINTS, updatePersonTracks, expandBoxWithMargin, estimateBodyBoxFromFace, createBodySilhouettePolygon, isValidFaceDetection, FaceFilterOptions } from './utils/aiDetector';
 import { exportMosaicVideo, ExportProgress, saveOrShareBlob } from './utils/videoExporter';
 import { generateDemoVideoBlob } from './utils/sampleGenerator';
 import { renderTrackMosaic, renderInverseMosaic, ProtectedRegion } from './utils/mosaicRenderer';
@@ -293,18 +293,56 @@ export const App: React.FC = () => {
           };
         }
 
-        // 3. ユーザーが手動でドラッグ移動・リサイズした場合：
-        // 高密度キーフレーム(0.08秒間隔)が存在するトラックでも指を離した瞬間に元の位置へ戻らないよう、
-        // 現在位置からの移動・拡縮差分を全キーフレームに滑らかに適用し、現在時刻にも正確なキーフレームを配置する
+        // 3. ユーザーが手動でドラッグ移動・リサイズ・頂点編集した場合：
+        // 高密度キーフレーム(0.08秒間隔)が存在するトラックでも指を離した瞬間に元の位置や元の形へ戻らないよう、
+        // 現在位置からの移動・拡縮差分および各頂点の個別調整量(vertexDeltas)を全キーフレームに滑らかに適用する
         const curPos = interpolateKeyframes(t.keyframes, currentTime) || t.keyframes[0];
         const dx = box.x - curPos.x;
         const dy = box.y - curPos.y;
         const scaleX = curPos.width > 0 ? box.width / curPos.width : 1;
         const scaleY = curPos.height > 0 ? box.height / curPos.height : 1;
 
+        const hasMatchingPoints =
+          box.points &&
+          curPos.points &&
+          box.points.length > 0 &&
+          box.points.length === curPos.points.length;
+
+        const pointDeltas = hasMatchingPoints
+          ? box.points!.map((bp, idx) => ({
+              dx: bp.x - curPos.points![idx].x,
+              dy: bp.y - curPos.points![idx].y,
+            }))
+          : null;
+
         const shiftedKeyframes = t.keyframes
           .filter((k) => Math.abs(k.time - currentTime) >= 0.12)
           .map((k) => {
+            if (pointDeltas && k.points && k.points.length === pointDeltas.length) {
+              const updatedPts = k.points.map((p, idx) => ({
+                x: p.x + pointDeltas[idx].dx,
+                y: p.y + pointDeltas[idx].dy,
+              }));
+              let minX = updatedPts[0].x;
+              let maxX = updatedPts[0].x;
+              let minY = updatedPts[0].y;
+              let maxY = updatedPts[0].y;
+              for (const up of updatedPts) {
+                if (up.x < minX) minX = up.x;
+                if (up.x > maxX) maxX = up.x;
+                if (up.y < minY) minY = up.y;
+                if (up.y > maxY) maxY = up.y;
+              }
+              return {
+                ...k,
+                x: minX,
+                y: minY,
+                width: Math.max(15, maxX - minX),
+                height: Math.max(15, maxY - minY),
+                points: updatedPts,
+              };
+            }
+
             const newW = Math.max(15, k.width * scaleX);
             const newH = Math.max(15, k.height * scaleY);
             const newX = k.x + dx;
@@ -340,6 +378,42 @@ export const App: React.FC = () => {
             ? { ...t.trackingData, isOutOfFrame: false, featurePoints: undefined }
             : undefined,
           keyframes: shiftedKeyframes,
+        };
+      })
+    );
+  };
+
+  // 矩形枠(rect)を20頂点のポリゴン枠に変換して、身体のラインに沿うよう手動で頂点編集できるようにする
+  const handleConvertTrackToPolygon = (trackId: string) => {
+    setTracks((prev) =>
+      prev.map((t) => {
+        if (t.id !== trackId) return t;
+        const convertedKeyframes = t.keyframes.map((k) => {
+          if (k.points && k.points.length >= 3) {
+            return {
+              ...k,
+              points: resampleClosedPolygon(k.points, BODY_CONTOUR_POINTS),
+            };
+          }
+          const rectPerimeter: Point[] = [
+            { x: k.x + k.width * 0.5, y: k.y },
+            { x: k.x + k.width, y: k.y },
+            { x: k.x + k.width, y: k.y + k.height * 0.5 },
+            { x: k.x + k.width, y: k.y + k.height },
+            { x: k.x + k.width * 0.5, y: k.y + k.height },
+            { x: k.x, y: k.y + k.height },
+            { x: k.x, y: k.y + k.height * 0.5 },
+            { x: k.x, y: k.y },
+          ];
+          return {
+            ...k,
+            points: resampleClosedPolygon(rectPerimeter, BODY_CONTOUR_POINTS),
+          };
+        });
+        return {
+          ...t,
+          shape: 'polygon',
+          keyframes: convertedKeyframes,
         };
       })
     );
@@ -467,9 +541,8 @@ export const App: React.FC = () => {
 
     try {
       if (targetMode === 'body') {
-        // 【体のラインに沿った人物輪郭セグメンテーション (Multiclass Body-Skin/Clothes + DeepLabV3 + Selfie Segmenter)】
-        // 顔が映っていない、後ろ向き、横向き、身体の一部のみでも境界をダイレクトに抽出
-        resetBodySegmentationState();
+        // 【体のラインに沿った人物輪郭セグメンテーション】
+        // 顔が映っていない、後ろ向き、横向きでも全身・上半身の境界をダイレクトに抽出
         let segmenter = await initPersonSegmenter();
 
         if (isImage && imageRef.current) {
@@ -501,6 +574,7 @@ export const App: React.FC = () => {
               aiTarget: 'body',
             };
             setTracks((prev) => [...prev, newTrack]);
+            setSelectedTrackId(newTrack.id);
             if (autoEnableInverse) {
               setIsInverseMosaic(true);
             }
@@ -555,6 +629,7 @@ export const App: React.FC = () => {
               aiTarget: 'body',
             };
             setTracks((prev) => [...prev, newTrack]);
+            setSelectedTrackId(newTrack.id);
             if (autoEnableInverse) {
               setIsInverseMosaic(true);
             }
@@ -637,6 +712,9 @@ export const App: React.FC = () => {
         };
       });
       setTracks((prev) => [...prev, ...newAITracks]);
+      if (newAITracks.length > 0) {
+        setSelectedTrackId(newAITracks[0].id);
+      }
       if (autoEnableInverse && newAITracks.length > 0) {
         setIsInverseMosaic(true);
       }
@@ -739,6 +817,9 @@ export const App: React.FC = () => {
 
       await seekVideoSafely(video, origTime);
       setTracks((prev) => [...prev, ...newTracks]);
+      if (newTracks.length > 0) {
+        setSelectedTrackId(newTracks[0].id);
+      }
       if (autoEnableInverse && newTracks.length > 0) {
         setIsInverseMosaic(true);
       }
@@ -1032,6 +1113,7 @@ export const App: React.FC = () => {
                 onToggleTrackEnabled={handleToggleTrackEnabled}
                 onUpdateTrackFrameOut={handleUpdateTrackFrameOut}
                 onDeleteTrack={handleDeleteTrack}
+                onConvertTrackToPolygon={handleConvertTrackToPolygon}
               />
 
               {/* スマホ専用の直感クイック操作バー（動画を見ながらワンタップで再生・シーク・確認・追従解析可能） */}

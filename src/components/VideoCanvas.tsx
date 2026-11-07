@@ -26,6 +26,7 @@ interface VideoCanvasProps {
   onToggleTrackEnabled: (trackId: string) => void;
   onUpdateTrackFrameOut: (trackId: string, isOutOfFrame: boolean) => void;
   onDeleteTrack?: (trackId: string) => void;
+  onConvertTrackToPolygon?: (trackId: string) => void;
 }
 
 export const VideoCanvas: React.FC<VideoCanvasProps> = ({
@@ -47,6 +48,7 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
   onToggleTrackEnabled,
   onUpdateTrackFrameOut,
   onDeleteTrack,
+  onConvertTrackToPolygon,
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -64,14 +66,67 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
     points: Point[];
   } | null>(null);
 
-  // ドラッグ変形・位置移動の高速リアルタイムRef（毎フレーム遅延なく描画に反映）
+  // ドラッグ変形・位置移動・頂点編集の高速リアルタイムRef（毎フレーム遅延なく描画に反映）
   const transformRef = useRef<{
-    type: 'move' | 'nw' | 'ne' | 'se' | 'sw';
+    type: 'move' | 'nw' | 'ne' | 'se' | 'sw' | 'vertex';
+    vertexIndex?: number;
     trackId: string;
     startMouse: Point;
     currentMouse: Point;
     initialBox: { x: number; y: number; width: number; height: number; points?: Point[] };
   } | null>(null);
+
+  // ポリゴン頂点ドラッグ時の新しい座標＆外接バウンディングボックス算出ヘルパー
+  const computeVertexMovedBox = (
+    initialBox: { x: number; y: number; width: number; height: number; points?: Point[] },
+    vertexIndex: number,
+    dx: number,
+    dy: number
+  ) => {
+    if (!initialBox.points || initialBox.points.length === 0) return initialBox;
+    const pts = initialBox.points;
+    const n = pts.length;
+    const radius = n > 32 ? Math.max(2, Math.floor(n / 18)) : 0;
+
+    const newPoints: Point[] = pts.map((p, idx) => {
+      if (idx === vertexIndex) {
+        return { x: p.x + dx, y: p.y + dy };
+      }
+      if (radius > 0) {
+        const circularDist = Math.min(
+          Math.abs(idx - vertexIndex),
+          n - Math.abs(idx - vertexIndex)
+        );
+        if (circularDist <= radius) {
+          const weight = 0.5 * (1 + Math.cos((Math.PI * circularDist) / (radius + 1)));
+          return {
+            x: p.x + dx * weight,
+            y: p.y + dy * weight,
+          };
+        }
+      }
+      return { x: p.x, y: p.y };
+    });
+
+    let minX = newPoints[0].x;
+    let maxX = newPoints[0].x;
+    let minY = newPoints[0].y;
+    let maxY = newPoints[0].y;
+    for (const np of newPoints) {
+      if (np.x < minX) minX = np.x;
+      if (np.x > maxX) maxX = np.x;
+      if (np.y < minY) minY = np.y;
+      if (np.y > maxY) maxY = np.y;
+    }
+
+    return {
+      x: minX,
+      y: minY,
+      width: Math.max(15, maxX - minX),
+      height: Math.max(15, maxY - minY),
+      points: newPoints,
+    };
+  };
 
   // マウスカーソル状態
   const [cursorStyle, setCursorStyle] = useState<string>('cursor-crosshair');
@@ -191,12 +246,14 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
       if (!pos) return null;
 
       if (transformRef.current && transformRef.current.trackId === track.id) {
-        const { type, startMouse, currentMouse, initialBox } = transformRef.current;
+        const { type, vertexIndex, startMouse, currentMouse, initialBox } = transformRef.current;
         const dx = currentMouse.x - startMouse.x;
         const dy = currentMouse.y - startMouse.y;
         let newBox = { ...initialBox };
 
-        if (type === 'move') {
+        if (type === 'vertex' && typeof vertexIndex === 'number') {
+          return computeVertexMovedBox(initialBox, vertexIndex, dx, dy);
+        } else if (type === 'move') {
           newBox.x = initialBox.x + dx;
           newBox.y = initialBox.y + dy;
           if (initialBox.points) {
@@ -379,6 +436,45 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
       if (selectedTrack && currentTime >= selectedTrack.startTime && currentTime <= selectedTrack.endTime) {
         const pos = interpolateKeyframes(selectedTrack.keyframes, currentTime);
         if (pos) {
+          // 1-A. ポリゴン・フリー囲みの「頂点ハンドル（●）」タッチ判定を最優先！
+          // 輪郭上の黄色い丸（●）をドラッグすることで、人物の身体のラインに手動でぴったり合わせられる
+          if (
+            (selectedTrack.shape === 'polygon' || selectedTrack.shape === 'lasso') &&
+            pos.points &&
+            pos.points.length >= 3
+          ) {
+            const vertexHitRadius = 20 * uiScale;
+            const step = pos.points.length > 32 ? Math.max(1, Math.floor(pos.points.length / 20)) : 1;
+            let bestIdx = -1;
+            let bestDist = vertexHitRadius;
+
+            for (let idx = 0; idx < pos.points.length; idx += step) {
+              const vPt = pos.points[idx];
+              const d = Math.hypot(pt.x - vPt.x, pt.y - vPt.y);
+              if (d <= bestDist) {
+                bestDist = d;
+                bestIdx = idx;
+              }
+            }
+
+            if (bestIdx !== -1) {
+              try {
+                (e.target as HTMLCanvasElement).setPointerCapture(e.pointerId);
+              } catch (_) {}
+              e.preventDefault();
+
+              transformRef.current = {
+                type: 'vertex',
+                vertexIndex: bestIdx,
+                trackId: selectedTrack.id,
+                startMouse: pt,
+                currentMouse: pt,
+                initialBox: { ...pos, points: pos.points.map((p) => ({ ...p })) },
+              };
+              return;
+            }
+          }
+
           // 枠の中央付近（内側の移動優先エリア）または上部ラベルバッジを触った場合は、小さい枠でも確実に「移動」を優先
           const centerX = pos.x + pos.width / 2;
           const centerY = pos.y + pos.height / 2;
@@ -536,6 +632,20 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
         if (selectedTrack) {
           const pos = interpolateKeyframes(selectedTrack.keyframes, currentTime);
           if (pos) {
+            if (
+              (selectedTrack.shape === 'polygon' || selectedTrack.shape === 'lasso') &&
+              pos.points &&
+              pos.points.length >= 3
+            ) {
+              const step = pos.points.length > 32 ? Math.max(1, Math.floor(pos.points.length / 20)) : 1;
+              for (let idx = 0; idx < pos.points.length; idx += step) {
+                if (Math.hypot(pt.x - pos.points[idx].x, pt.y - pos.points[idx].y) <= 16) {
+                  setCursorStyle('cursor-pointer');
+                  return;
+                }
+              }
+            }
+
             const handleSize = 16;
             const corners = [
               { type: 'nw', cx: pos.x, cy: pos.y },
@@ -582,7 +692,7 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
     } catch (_) {}
 
     if (transformRef.current) {
-      const { type, startMouse, currentMouse, initialBox, trackId } = transformRef.current;
+      const { type, vertexIndex, startMouse, currentMouse, initialBox, trackId } = transformRef.current;
       const dx = currentMouse.x - startMouse.x;
       const dy = currentMouse.y - startMouse.y;
 
@@ -594,7 +704,9 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
 
       let newBox = { ...initialBox };
 
-      if (type === 'move') {
+      if (type === 'vertex' && typeof vertexIndex === 'number') {
+        newBox = computeVertexMovedBox(initialBox, vertexIndex, dx, dy);
+      } else if (type === 'move') {
         newBox.x = initialBox.x + dx;
         newBox.y = initialBox.y + dy;
         if (initialBox.points) {
@@ -783,14 +895,35 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
       ref={containerRef}
       className="relative flex-1 bg-slate-950 flex flex-col items-center justify-center p-2 sm:p-4 select-none min-h-[300px] sm:min-h-[420px] w-full relative"
     >
-      {/* 選択中の操作ガイドヒント */}
-      {selectedTrackId && (
-        <div className="absolute top-3 left-1/2 -translate-x-1/2 bg-slate-900/90 border border-cyan-500/60 shadow-xl px-3 py-1 rounded-full flex items-center gap-2 text-[11px] font-bold text-cyan-300 pointer-events-none backdrop-blur z-10 animate-fade-in">
-          <span>✥ 枠の内側をドラッグして移動</span>
-          <span className="text-slate-500">•</span>
-          <span className="text-slate-300 font-normal">四隅の白■でサイズ変更</span>
-        </div>
-      )}
+      {/* 選択中の操作ガイドヒント＆頂点編集切替ボタン */}
+      {selectedTrackId && (() => {
+        const selTrack = tracks.find((t) => t.id === selectedTrackId);
+        const isPoly = selTrack && (selTrack.shape === 'polygon' || selTrack.shape === 'lasso');
+        return (
+          <div className="absolute top-3 left-1/2 -translate-x-1/2 bg-slate-900/95 border border-cyan-500/60 shadow-xl px-3 py-1 rounded-full flex flex-wrap items-center justify-center gap-2 text-[11px] font-bold text-cyan-300 backdrop-blur z-10 animate-fade-in max-w-[95%]">
+            {isPoly ? (
+              <>
+                <span className="text-amber-300">● 黄色い頂点をドラッグで身体のラインに調整</span>
+                <span className="text-slate-500">•</span>
+                <span className="text-cyan-300">✥ 内側ドラッグで全体移動</span>
+              </>
+            ) : (
+              <>
+                <span>✥ 内側ドラッグで移動 • 四隅■でサイズ変更</span>
+                {selTrack && selTrack.shape === 'rect' && onConvertTrackToPolygon && (
+                  <button
+                    type="button"
+                    onClick={() => onConvertTrackToPolygon(selTrack.id)}
+                    className="ml-1 px-2 py-0.5 rounded-full bg-amber-500 hover:bg-amber-400 text-slate-950 font-extrabold text-[10px] shadow transition cursor-pointer pointer-events-auto"
+                  >
+                    ✨ 頂点編集モードに変換
+                  </button>
+                )}
+              </>
+            )}
+          </div>
+        );
+      })()}
 
       <canvas
         ref={canvasRef}
