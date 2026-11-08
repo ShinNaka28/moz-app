@@ -1,5 +1,6 @@
 import { FilesetResolver, FaceDetector, ImageSegmenter } from '@mediapipe/tasks-vision';
-import { DetectedPerson, Point } from '../types';
+import { DetectedPerson, Point, NormalizedPoint } from '../types';
+import { NORMALIZED_POINT_COUNT, absoluteToNormalizedPoints, resampleClosedPoints } from './geometry';
 
 let faceDetectorInstance: FaceDetector | null = null;
 let segmenterInstance: ImageSegmenter | null = null;
@@ -131,6 +132,68 @@ export async function initFaceDetector(
   }
 }
 
+// 完全ローカルから MediaPipe ImageSegmenter (Selfie Multiclass 256x256) を初期化
+// クラス定義: 0: Background, 1: Hair, 2: Body-skin, 3: Face-skin, 4: Clothes, 5: Others
+let multiclassSegmenterInstance: ImageSegmenter | null = null;
+let isInitializingMulticlass = false;
+
+export async function initMulticlassSegmenter(forceCpu = false): Promise<ImageSegmenter | null> {
+  if (multiclassSegmenterInstance && !forceCpu) return multiclassSegmenterInstance;
+  if (forceCpu && multiclassSegmenterInstance) {
+    try {
+      multiclassSegmenterInstance.close();
+    } catch (_) {}
+    multiclassSegmenterInstance = null;
+  }
+  if (isInitializingMulticlass) {
+    while (isInitializingMulticlass) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    if (multiclassSegmenterInstance) return multiclassSegmenterInstance;
+  }
+
+  isInitializingMulticlass = true;
+  try {
+    const baseUrl = import.meta.env.BASE_URL.replace(/\/$/, '');
+    const wasmPath = `${baseUrl}/wasm`;
+    const modelPath = `${baseUrl}/models/selfie_multiclass_256x256.tflite`;
+
+    const vision = await FilesetResolver.forVisionTasks(wasmPath);
+    if (!forceCpu) {
+      try {
+        multiclassSegmenterInstance = await ImageSegmenter.createFromOptions(vision, {
+          baseOptions: {
+            modelAssetPath: modelPath,
+            delegate: 'GPU',
+          },
+          runningMode: 'IMAGE',
+          outputConfidenceMasks: true,
+          outputCategoryMask: true,
+        });
+        return multiclassSegmenterInstance;
+      } catch (gpuErr) {
+        console.warn('GPU delegate failed for multiclass segmenter, falling back to CPU', gpuErr);
+      }
+    }
+
+    multiclassSegmenterInstance = await ImageSegmenter.createFromOptions(vision, {
+      baseOptions: {
+        modelAssetPath: modelPath,
+        delegate: 'CPU',
+      },
+      runningMode: 'IMAGE',
+      outputConfidenceMasks: true,
+      outputCategoryMask: true,
+    });
+    return multiclassSegmenterInstance;
+  } catch (err) {
+    console.warn('Multiclass segmenter not available:', err);
+    return null;
+  } finally {
+    isInitializingMulticlass = false;
+  }
+}
+
 // 完全ローカルから MediaPipe ImageSegmenter (Selfie Segmenter) を初期化
 // 注意: selfie_segmenter.tflite は 1チャンネル出力(index 0 = person)のため、
 // outputCategoryMask: true にすると人物=0, 背景=255 となり背景全体が選択されてしまうバグが起きる。
@@ -255,11 +318,84 @@ export async function initDeepLabSegmenter(forceCpu = false): Promise<ImageSegme
   }
 }
 
-// 2D Canvas バッファ（<video> を直接 WebGL2 texImage2D に渡すとスマホ環境で未デコードや cross-origin エラーになる問題を完全回避）
-let sharedDetCanvas: HTMLCanvasElement | null = null;
+// =======================================================================
+// スマホ省メモリ・Zero-Allocation 解析用固定解像度と静的バッファ
+// =======================================================================
+export const ANALYSIS_W = 256;
+export const ANALYSIS_H = 256;
+const TOTAL_ANALYSIS_PIXELS = ANALYSIS_W * ANALYSIS_H; // 65,536
 
-// 固定頂点数（フレーム間で頂点数を一致させ、かつユーザーが手動で各頂点●をドラッグ編集しやすい20頂点に設定）
-export const BODY_CONTOUR_POINTS = 20;
+// 2D Canvas バッファ（Zero-Allocation: 毎フレームの createElement を完全排除）
+let sharedDetCanvas: HTMLCanvasElement | null = null;
+let sharedDetCtx: CanvasRenderingContext2D | null = null;
+
+// 静的画像解析バッファ（Zero-Allocation: 毎フレームの new TypedArray を完全排除）
+let sharedPrevGray: Uint8Array | null = null;
+let sharedCurrGray: Uint8Array | null = null;
+let sharedMotionMask: Uint8Array | null = null;
+let sharedSkinMask: Uint8Array | null = null;
+let sharedPersonProb: Float32Array | null = null;
+let sharedCategoryMask: Uint8Array | null = null;
+let sharedDilatedMask: Uint8Array | null = null;
+let sharedLabels: Int32Array | null = null;
+let sharedQueue: Int32Array | null = null;
+let hasPrevGray = false;
+
+/**
+ * 動画シーク時やメディア切り替え時に動体差分バッファをリセット
+ */
+export function resetAnalysisState(): void {
+  hasPrevGray = false;
+  if (sharedPrevGray) sharedPrevGray.fill(0);
+  if (sharedMotionMask) sharedMotionMask.fill(0);
+}
+
+function ensureAnalysisBuffers(): {
+  canvas: HTMLCanvasElement;
+  ctx: CanvasRenderingContext2D;
+  prevGray: Uint8Array;
+  currGray: Uint8Array;
+  motionMask: Uint8Array;
+  skinMask: Uint8Array;
+  personProb: Float32Array;
+  categoryMask: Uint8Array;
+  dilatedMask: Uint8Array;
+  labels: Int32Array;
+  queue: Int32Array;
+} {
+  if (!sharedDetCanvas) {
+    sharedDetCanvas = document.createElement('canvas');
+    sharedDetCanvas.width = ANALYSIS_W;
+    sharedDetCanvas.height = ANALYSIS_H;
+    sharedDetCtx = sharedDetCanvas.getContext('2d', { willReadFrequently: true });
+  }
+  if (!sharedPrevGray) sharedPrevGray = new Uint8Array(TOTAL_ANALYSIS_PIXELS);
+  if (!sharedCurrGray) sharedCurrGray = new Uint8Array(TOTAL_ANALYSIS_PIXELS);
+  if (!sharedMotionMask) sharedMotionMask = new Uint8Array(TOTAL_ANALYSIS_PIXELS);
+  if (!sharedSkinMask) sharedSkinMask = new Uint8Array(TOTAL_ANALYSIS_PIXELS);
+  if (!sharedPersonProb) sharedPersonProb = new Float32Array(TOTAL_ANALYSIS_PIXELS);
+  if (!sharedCategoryMask) sharedCategoryMask = new Uint8Array(TOTAL_ANALYSIS_PIXELS);
+  if (!sharedDilatedMask) sharedDilatedMask = new Uint8Array(TOTAL_ANALYSIS_PIXELS);
+  if (!sharedLabels) sharedLabels = new Int32Array(TOTAL_ANALYSIS_PIXELS);
+  if (!sharedQueue) sharedQueue = new Int32Array(TOTAL_ANALYSIS_PIXELS);
+
+  return {
+    canvas: sharedDetCanvas,
+    ctx: sharedDetCtx!,
+    prevGray: sharedPrevGray,
+    currGray: sharedCurrGray,
+    motionMask: sharedMotionMask,
+    skinMask: sharedSkinMask,
+    personProb: sharedPersonProb,
+    categoryMask: sharedCategoryMask,
+    dilatedMask: sharedDilatedMask,
+    labels: sharedLabels,
+    queue: sharedQueue,
+  };
+}
+
+// 固定頂点数（外枠に対する32頂点の正規化相対座標を維持し、拡大縮小や変形をしやすく統一）
+export const BODY_CONTOUR_POINTS = NORMALIZED_POINT_COUNT;
 
 /**
  * 閉曲線ポリゴンを移動平均フィルタで滑らかな体のラインに平滑化する
@@ -344,194 +480,280 @@ export function resampleClosedPolygon(points: Point[], targetCount = BODY_CONTOU
   return resampled;
 }
 
-/**
- * 2D Canvas の RGB 画像から肌色（YCbCr/RGB色空間）および前景サリエンシー（中心重み付き色差）を計算
- * 顔が映っていない至近距離の身体ショットや照明環境でも体のラインを確実に捉えるための補助マップ
- */
-function computeSkinAndForegroundMap(
-  ctx: CanvasRenderingContext2D,
-  segW: number,
-  segH: number,
-  gridW: number,
-  gridH: number
-): Float32Array {
-  const map = new Float32Array(gridW * gridH);
-  let imgData: ImageData;
-  try {
-    imgData = ctx.getImageData(0, 0, segW, segH);
-  } catch (_) {
-    return map;
-  }
-  const data = imgData.data;
-
-  // 外周エッジ（四隅・上下左右端）の平均色を背景基準色として推定
-  let bgR = 0;
-  let bgG = 0;
-  let bgB = 0;
-  let bgCount = 0;
-  const stepX = Math.max(1, Math.floor(segW / 32));
-  const stepY = Math.max(1, Math.floor(segH / 32));
-
-  for (let x = 0; x < segW; x += stepX) {
-    const topIdx = x * 4;
-    const botIdx = ((segH - 1) * segW + x) * 4;
-    bgR += data[topIdx] + data[botIdx];
-    bgG += data[topIdx + 1] + data[botIdx + 1];
-    bgB += data[topIdx + 2] + data[botIdx + 2];
-    bgCount += 2;
-  }
-  for (let y = 0; y < segH; y += stepY) {
-    const leftIdx = (y * segW) * 4;
-    const rightIdx = (y * segW + (segW - 1)) * 4;
-    bgR += data[leftIdx] + data[rightIdx];
-    bgG += data[leftIdx + 1] + data[rightIdx + 1];
-    bgB += data[leftIdx + 2] + data[rightIdx + 2];
-    bgCount += 2;
-  }
-  if (bgCount > 0) {
-    bgR /= bgCount;
-    bgG /= bgCount;
-    bgB /= bgCount;
-  }
-
-  for (let gy = 0; gy < gridH; gy++) {
-    const sy = Math.min(segH - 1, Math.floor(((gy + 0.5) / gridH) * segH));
-    const ny = (gy + 0.5) / gridH - 0.5;
-    for (let gx = 0; gx < gridW; gx++) {
-      const sx = Math.min(segW - 1, Math.floor(((gx + 0.5) / gridW) * segW));
-      const nx = (gx + 0.5) / gridW - 0.5;
-      const idx = (sy * segW + sx) * 4;
-      const r = data[idx];
-      const g = data[idx + 1];
-      const b = data[idx + 2];
-
-      // YCbCr 変換による肌色尤度（照明変化に強い肌色領域のソフト判定）
-      const cb = 128 - 0.168736 * r - 0.331264 * g + 0.5 * b;
-      const cr = 128 + 0.5 * r - 0.418688 * g - 0.081312 * b;
-
-      let skinScore = 0;
-      if (cr >= 130 && cr <= 178 && cb >= 75 && cb <= 132 && r > 55 && g > 35 && b > 20 && r >= g * 0.9) {
-        const dCr = Math.abs(cr - 150) / 25;
-        const dCb = Math.abs(cb - 105) / 28;
-        skinScore = Math.max(0, 1 - 0.45 * (dCr + dCb));
-      }
-
-      // 背景基準色との色差スコア
-      const colorDist = Math.hypot(r - bgR, g - bgG, b - bgB);
-      const contrastScore = Math.min(1, Math.max(0, (colorDist - 22) / 70));
-
-      // 画面中心付近の空間プライオリティ（端の背景ノイズを抑制）
-      const radialDist2 = nx * nx * 1.6 + ny * ny * 1.2;
-      const centerWeight = Math.max(0.15, Math.exp(-radialDist2 * 2.2));
-
-      map[gy * gridW + gx] = Math.min(1, (skinScore * 0.72 + contrastScore * 0.48) * centerWeight);
-    }
-  }
-
-  return map;
+export interface GatekeeperContext {
+  prevBox?: { x: number; y: number; width: number; height: number };
+  existingTracks?: Array<{
+    id: string;
+    box: { x: number; y: number; width: number; height: number };
+    hasManualKeyframe?: boolean;
+  }>;
+  origWidth: number;
+  origHeight: number;
 }
 
 /**
- * 人物の確率マップ (gridW x gridH) からモルフォロジー整形・最大連結成分抽出・穴埋めを行い、
- * 体のラインにぴったり沿った単一閉曲線ポリゴン（20頂点）を抽出する
+ * 4段階ゲートキーパー判定結果
  */
-function extractBodyPolygonFromProbabilityGrid(
-  probGrid: Float32Array,
-  gridW: number,
-  gridH: number,
-  origW: number,
-  origH: number,
-  threshold = 0.35
-): { points: Point[]; bounds: { x: number; y: number; width: number; height: number } } | null {
-  const totalCells = gridW * gridH;
+interface GatekeeperEvaluation {
+  passed: boolean;
+  reason: 'existing_track' | 'skin_face' | 'clothes_bulk' | 'border_motion' | 'rejected_inorganic';
+  score: number;
+}
 
-  // 1. 閾値による2値化（万が一マスクが背景反転している場合は自動補正）
-  const rawBin = new Uint8Array(totalCells);
-  let fgCount = 0;
-  let borderFgCount = 0;
-  let borderTotal = 0;
+/**
+ * 無機物（テロップ・機器・コード）を除外しながら、
+ * 「顔なし・腹部〜足のみ・手元のみ」を確実に保護する4段階ゲートキーパー
+ */
+function evaluateGatekeeper(
+  comp: {
+    area: number;
+    bMinX: number;
+    bMaxX: number;
+    bMinY: number;
+    bMaxY: number;
+    bw: number;
+    bh: number;
+    solidity: number;
+    faceSkinCount: number;
+    bodySkinCount: number;
+    clothesCount: number;
+    skinCount: number;
+    motionCount: number;
+    borderTouchCount: number;
+    achromaticCount: number;
+    totalCells: number;
+  },
+  context?: GatekeeperContext
+): GatekeeperEvaluation {
+  const {
+    area,
+    bMinX,
+    bMaxX,
+    bMinY,
+    bMaxY,
+    bw,
+    bh,
+    solidity,
+    faceSkinCount,
+    bodySkinCount,
+    clothesCount,
+    skinCount,
+    motionCount,
+    borderTouchCount,
+    achromaticCount,
+    totalCells,
+  } = comp;
 
-  for (let y = 0; y < gridH; y++) {
-    for (let x = 0; x < gridW; x++) {
-      const isFg = probGrid[y * gridW + x] >= threshold ? 1 : 0;
-      rawBin[y * gridW + x] = isFg;
-      fgCount += isFg;
-      if (x <= 1 || x >= gridW - 2 || y <= 1 || y >= gridH - 2) {
-        borderFgCount += isFg;
-        borderTotal++;
+  const skinRatio = skinCount / area;
+  const faceBodySkinRatio = (faceSkinCount + bodySkinCount) / area;
+  const clothesRatio = clothesCount / area;
+  const motionRatio = motionCount / area;
+  const achromaticRatio = achromaticCount / area;
+  const compCenterX = (bMinX + bMaxX) / 2;
+  const compCenterY = (bMinY + bMaxY) / 2;
+
+  // ---------------------------------------------------------------------
+  // ① 既存トラッキング枠からの継続パス（最優先）
+  // ---------------------------------------------------------------------
+  if (context) {
+    const scaleX = ANALYSIS_W / Math.max(1, context.origWidth);
+    const scaleY = ANALYSIS_H / Math.max(1, context.origHeight);
+
+    // 直前フレームの確定枠との IoU & 重心距離判定
+    const candidateBoxes: Array<{ x: number; y: number; width: number; height: number; isManual?: boolean }> = [];
+    if (context.prevBox) {
+      candidateBoxes.push({ ...context.prevBox });
+    }
+    if (context.existingTracks) {
+      for (const t of context.existingTracks) {
+        candidateBoxes.push({ ...t.box, isManual: t.hasManualKeyframe });
+      }
+    }
+
+    for (const rawB of candidateBoxes) {
+      const bx = rawB.x * scaleX;
+      const by = rawB.y * scaleY;
+      const bwPrev = rawB.width * scaleX;
+      const bhPrev = rawB.height * scaleY;
+
+      const interLeft = Math.max(bMinX, bx);
+      const interTop = Math.max(bMinY, by);
+      const interRight = Math.min(bMaxX, bx + bwPrev);
+      const interBottom = Math.min(bMaxY, by + bhPrev);
+      const interW = Math.max(0, interRight - interLeft);
+      const interH = Math.max(0, interBottom - interTop);
+      const interArea = interW * interH;
+      const unionArea = bw * bh + bwPrev * bhPrev - interArea;
+      const iou = unionArea > 0 ? interArea / unionArea : 0;
+
+      const prevCenterX = bx + bwPrev / 2;
+      const prevCenterY = by + bhPrev / 2;
+      const centerDist = Math.hypot(compCenterX - prevCenterX, compCenterY - prevCenterY);
+      const maxDim = Math.max(bw, bh, bwPrev, bhPrev);
+
+      // IoU 0.2以上 または 重心近接（手動キーフレームがある枠はさらに判定緩和）
+      if (iou >= 0.18 || centerDist <= maxDim * (rawB.isManual ? 0.45 : 0.32)) {
+        return {
+          passed: true,
+          reason: 'existing_track',
+          score: Math.min(1, 0.85 + iou * 0.15),
+        };
       }
     }
   }
 
-  // 四辺の外周の88%以上が前景かつ全体の78%以上が前景の場合は背景と人物が反転していると判断し反転補正
-  if (fgCount > totalCells * 0.78 && borderFgCount > borderTotal * 0.88) {
-    fgCount = 0;
-    for (let i = 0; i < totalCells; i++) {
-      rawBin[i] = probGrid[i] < 1 - threshold ? 1 : 0;
-      fgCount += rawBin[i];
-    }
+  // ---------------------------------------------------------------------
+  // ② 顔・肌・手元の存在パス（手元アップ等の保護）
+  // ---------------------------------------------------------------------
+  // Face-skin (3) / Body-skin (2) または YCbCr肌色が面積の10%以上
+  if (faceBodySkinRatio >= 0.025 || skinRatio >= 0.10) {
+    return {
+      passed: true,
+      reason: 'skin_face',
+      score: Math.min(1, 0.70 + skinRatio * 0.3),
+    };
   }
 
-  // 人物領域が画面の94%を超える（画面全体の矩形になってしまう）場合は閾値を引き上げて再判定
-  if (fgCount > totalCells * 0.94) {
-    fgCount = 0;
-    for (let i = 0; i < totalCells; i++) {
-      rawBin[i] = probGrid[i] >= 0.62 ? 1 : 0;
-      fgCount += rawBin[i];
-    }
+  // ---------------------------------------------------------------------
+  // ③ 衣服（腹部・背中・足のみ）の塊パス（白シャツ・黒ズボン等の保護）
+  // ---------------------------------------------------------------------
+  // Clothes (4) が領域の主成分であり、画面全体の4%以上、かつ充填率(Solidity)が0.35以上（塊状シルエット）
+  // 文字テロップや電源コードのようなスカスカな線を除外
+  const isClothesDominant = clothesRatio >= 0.22 && clothesCount > (comp.faceSkinCount + comp.bodySkinCount);
+  const isLargeBulk = area >= totalCells * 0.038;
+  if (isClothesDominant && isLargeBulk && solidity >= 0.34) {
+    return {
+      passed: true,
+      reason: 'clothes_bulk',
+      score: Math.min(1, 0.65 + clothesRatio * 0.35),
+    };
   }
 
-  // 逆に少なすぎる場合は閾値を緩和
-  if (fgCount < totalCells * 0.012) {
-    fgCount = 0;
-    for (let i = 0; i < totalCells; i++) {
-      rawBin[i] = probGrid[i] >= 0.20 ? 1 : 0;
-      fgCount += rawBin[i];
-    }
+  // ---------------------------------------------------------------------
+  // ④ 画面境界接地＋動体パス（画面に収まらない巨大変形の保護）
+  // ---------------------------------------------------------------------
+  // 画面の外周端(5px以内)に一定幅以上接しており、かつ動体差分または衣服成分がある面積3%以上の塊
+  const isBorderTouching = borderTouchCount >= 6;
+  const hasMotionOrClothes = motionRatio >= 0.018 || clothesRatio >= 0.14;
+  if (isBorderTouching && hasMotionOrClothes && area >= totalCells * 0.028) {
+    return {
+      passed: true,
+      reason: 'border_motion',
+      score: 0.65,
+    };
   }
 
-  if (fgCount < totalCells * 0.008 || fgCount > totalCells * 0.96) {
+  // ---------------------------------------------------------------------
+  // 破棄条件：画面中央付近に浮遊し、肌色・衣服乏しく、無彩色で静止している領域
+  // （テロップ文字、机上の医療機器、電源コード）
+  // ---------------------------------------------------------------------
+  const isFloatingCenter =
+    borderTouchCount === 0 &&
+    bMinX > 14 &&
+    bMaxX < ANALYSIS_W - 14 &&
+    bMinY > 14 &&
+    bMaxY < ANALYSIS_H - 14;
+
+  if (isFloatingCenter && skinRatio < 0.06 && clothesRatio < 0.12 && achromaticRatio >= 0.60 && motionRatio < 0.015) {
+    return {
+      passed: false,
+      reason: 'rejected_inorganic',
+      score: 0,
+    };
+  }
+
+  // すべてのパスに落第した場合は無機物として破棄
+  return {
+    passed: false,
+    reason: 'rejected_inorganic',
+    score: 0,
+  };
+}
+
+/**
+ * 4段階ゲートキーパー・ダイレクト肌色救済・ベージュ背景除外を統合した
+ * 人物輪郭ポリゴン（固定32頂点）抽出エンジン
+ */
+function extractBodyPolygonWithGatekeeper(
+  buffers: ReturnType<typeof ensureAnalysisBuffers>,
+  origW: number,
+  origH: number,
+  context?: GatekeeperContext
+): {
+  points: Point[];
+  bounds: { x: number; y: number; width: number; height: number };
+  normalizedPoints?: NormalizedPoint[];
+} | null {
+  const { personProb, categoryMask, skinMask, motionMask, dilatedMask, labels, queue } = buffers;
+  const totalCells = TOTAL_ANALYSIS_PIXELS;
+  const gridW = ANALYSIS_W;
+  const gridH = ANALYSIS_H;
+
+  // 1. 2値化（閾値 0.38）
+  let fgCount = 0;
+  for (let i = 0; i < totalCells; i++) {
+    const isFg = personProb[i] >= 0.38 ? 1 : 0;
+    dilatedMask[i] = isFg;
+    fgCount += isFg;
+  }
+
+  // 画面全体が真っ黒、またはほぼ全体（96%超）の場合は無効
+  if (fgCount < totalCells * 0.005 || fgCount > totalCells * 0.96) {
     return null;
   }
 
-  // 2. モルフォロジー膨張 (3x3 Dilation) で体のラインのわずかな途切れを接続
-  const dilated = new Uint8Array(totalCells);
-  for (let y = 0; y < gridH; y++) {
-    for (let x = 0; x < gridW; x++) {
-      let on = 0;
-      for (let dy = -1; dy <= 1 && !on; dy++) {
-        const ny = y + dy;
-        if (ny < 0 || ny >= gridH) continue;
-        for (let dx = -1; dx <= 1; dx++) {
-          const nx = x + dx;
-          if (nx < 0 || nx >= gridW) continue;
-          if (rawBin[ny * gridW + nx]) {
-            on = 1;
-            break;
-          }
-        }
-      }
-      dilated[y * gridW + x] = on;
-    }
-  }
+  // 2. マスクの取得（※凹凸・くびれを潰す過剰なモルフォロジー膨張は廃止）
+  labels.set(dilatedMask);
 
-  // 3. 4連結成分ラベリング (BFS) により背景の細かいノイズ斑点を完全に除去し、人物本体のみを抽出
-  const labels = new Int32Array(totalCells);
-  const compSizes: number[] = [0];
-  const compCentroids: Array<{ sumX: number; sumY: number }> = [{ sumX: 0, sumY: 0 }];
+  // 3. 4連結成分ラベリング (BFS)
   let currentLabel = 0;
-  const queue = new Int32Array(totalCells);
+  const compInfos: Array<{
+    label: number;
+    area: number;
+    bMinX: number;
+    bMaxX: number;
+    bMinY: number;
+    bMaxY: number;
+    bw: number;
+    bh: number;
+    solidity: number;
+    faceSkinCount: number;
+    bodySkinCount: number;
+    clothesCount: number;
+    skinCount: number;
+    motionCount: number;
+    borderTouchCount: number;
+    achromaticCount: number;
+    totalCells: number;
+    sumX: number;
+    sumY: number;
+  }> = [];
+
+  const visited = dilatedMask; // dilatedMask を訪問管理用バッファとして再利用
+  visited.fill(0);
 
   for (let i = 0; i < totalCells; i++) {
-    if (dilated[i] && labels[i] === 0) {
+    if (labels[i] === 1 && visited[i] === 0) {
       currentLabel++;
       let head = 0;
       let tail = 0;
       queue[tail++] = i;
-      labels[i] = currentLabel;
+      visited[i] = currentLabel;
+
       let size = 0;
       let sumX = 0;
       let sumY = 0;
+      let bMinX = gridW;
+      let bMaxX = 0;
+      let bMinY = gridH;
+      let bMaxY = 0;
+      let faceSkinCount = 0;
+      let bodySkinCount = 0;
+      let clothesCount = 0;
+      let sCount = 0;
+      let mCount = 0;
+      let borderTouchCount = 0;
+      let achromaticCount = 0;
 
       while (head < tail) {
         const curr = queue[head++];
@@ -541,90 +763,111 @@ function extractBodyPolygonFromProbabilityGrid(
         sumX += cx;
         sumY += cy;
 
-        if (cx + 1 < gridW && dilated[curr + 1] && labels[curr + 1] === 0) {
-          labels[curr + 1] = currentLabel;
+        if (cx < bMinX) bMinX = cx;
+        if (cx > bMaxX) bMaxX = cx;
+        if (cy < bMinY) bMinY = cy;
+        if (cy > bMaxY) bMaxY = cy;
+
+        const cat = categoryMask[curr];
+        if (cat === 3) faceSkinCount++;
+        else if (cat === 2) bodySkinCount++;
+        else if (cat === 4) clothesCount++;
+
+        if (skinMask[curr]) sCount++;
+        if (motionMask[curr]) mCount++;
+        if (cx <= 4 || cx >= gridW - 5 || cy <= 4 || cy >= gridH - 5) borderTouchCount++;
+
+        // 4近傍展開
+        if (cx + 1 < gridW && labels[curr + 1] === 1 && visited[curr + 1] === 0) {
+          visited[curr + 1] = currentLabel;
           queue[tail++] = curr + 1;
         }
-        if (cx - 1 >= 0 && dilated[curr - 1] && labels[curr - 1] === 0) {
-          labels[curr - 1] = currentLabel;
+        if (cx - 1 >= 0 && labels[curr - 1] === 1 && visited[curr - 1] === 0) {
+          visited[curr - 1] = currentLabel;
           queue[tail++] = curr - 1;
         }
-        if (cy + 1 < gridH && dilated[curr + gridW] && labels[curr + gridW] === 0) {
-          labels[curr + gridW] = currentLabel;
+        if (cy + 1 < gridH && labels[curr + gridW] === 1 && visited[curr + gridW] === 0) {
+          visited[curr + gridW] = currentLabel;
           queue[tail++] = curr + gridW;
         }
-        if (cy - 1 >= 0 && dilated[curr - gridW] && labels[curr - gridW] === 0) {
-          labels[curr - gridW] = currentLabel;
+        if (cy - 1 >= 0 && labels[curr - gridW] === 1 && visited[curr - gridW] === 0) {
+          visited[curr - gridW] = currentLabel;
           queue[tail++] = curr - gridW;
         }
       }
-      compSizes[currentLabel] = size;
-      compCentroids[currentLabel] = { sumX, sumY };
+
+      const bw = Math.max(1, bMaxX - bMinX + 1);
+      const bh = Math.max(1, bMaxY - bMinY + 1);
+      const solidity = size / (bw * bh);
+
+      compInfos.push({
+        label: currentLabel,
+        area: size,
+        bMinX,
+        bMaxX,
+        bMinY,
+        bMaxY,
+        bw,
+        bh,
+        solidity,
+        faceSkinCount,
+        bodySkinCount,
+        clothesCount,
+        skinCount: sCount,
+        motionCount: mCount,
+        borderTouchCount,
+        achromaticCount,
+        totalCells,
+        sumX,
+        sumY,
+      });
     }
   }
 
-  let bestLabel = -1;
-  let maxCompSize = 0;
-  for (let l = 1; l <= currentLabel; l++) {
-    if (compSizes[l] > maxCompSize) {
-      maxCompSize = compSizes[l];
-      bestLabel = l;
-    }
-  }
+  // 4. 各コンポーネントを 4段階ゲートキーパーで評価
+  const passedComps = compInfos
+    .map((c) => ({
+      comp: c,
+      eval: evaluateGatekeeper(c, context),
+    }))
+    .filter((res) => res.eval.passed && res.comp.area >= totalCells * 0.006)
+    .sort((a, b) => {
+      if (a.eval.reason === 'existing_track' && b.eval.reason !== 'existing_track') return -1;
+      if (b.eval.reason === 'existing_track' && a.eval.reason !== 'existing_track') return 1;
+      return (b.eval.score * 0.6 + (b.comp.area / totalCells) * 0.4) - (a.eval.score * 0.6 + (a.comp.area / totalCells) * 0.4);
+    });
 
-  if (bestLabel === -1 || maxCompSize < totalCells * 0.008) {
+  if (passedComps.length === 0) {
     return null;
   }
 
-  // パディング付きグリッド (pw x ph) を作成し、主要連結成分（＋25%以上の準主要部位があればブリッジ接続）を配置
+  const best = passedComps[0].comp;
+  const keepLabels = new Set<number>([best.label]);
+
+  for (let i = 1; i < passedComps.length; i++) {
+    const sub = passedComps[i].comp;
+    if (sub.area >= best.area * 0.20 && sub.area >= totalCells * 0.015) {
+      keepLabels.add(sub.label);
+    }
+  }
+
+  // 5. パディング付きグリッド (pw x ph) を作成し、選択された人物領域を配置
   const pw = gridW + 2;
   const ph = gridH + 2;
   const padded = new Uint8Array(pw * ph);
 
-  const keepLabels = new Set<number>([bestLabel]);
-  for (let l = 1; l <= currentLabel; l++) {
-    if (l !== bestLabel && compSizes[l] >= maxCompSize * 0.25 && compSizes[l] >= totalCells * 0.02) {
-      keepLabels.add(l);
-    }
-  }
-
   for (let y = 0; y < gridH; y++) {
     for (let x = 0; x < gridW; x++) {
-      if (keepLabels.has(labels[y * gridW + x])) {
+      if (keepLabels.has(visited[y * gridW + x])) {
         padded[(y + 1) * pw + (x + 1)] = 1;
       }
     }
   }
 
-  // 複数の身体部位が離れた連結成分として検出された場合は、単一ポリゴンとして一筆書きできるよう重心間を接続
-  if (keepLabels.size > 1) {
-    const mainC = compCentroids[bestLabel];
-    const mainX = Math.round(mainC.sumX / compSizes[bestLabel]) + 1;
-    const mainY = Math.round(mainC.sumY / compSizes[bestLabel]) + 1;
-
-    keepLabels.forEach((l) => {
-      if (l === bestLabel) return;
-      const subC = compCentroids[l];
-      const subX = Math.round(subC.sumX / compSizes[l]) + 1;
-      const subY = Math.round(subC.sumY / compSizes[l]) + 1;
-      const steps = Math.max(Math.abs(subX - mainX), Math.abs(subY - mainY), 1);
-      for (let s = 0; s <= steps; s++) {
-        const bx = Math.round(mainX + ((subX - mainX) * s) / steps);
-        const by = Math.round(mainY + ((subY - mainY) * s) / steps);
-        for (let dy = -1; dy <= 1; dy++) {
-          for (let dx = -1; dx <= 1; dx++) {
-            const nx = Math.max(1, Math.min(gridW, bx + dx));
-            const ny = Math.max(1, Math.min(gridH, by + dy));
-            padded[ny * pw + nx] = 1;
-          }
-        }
-      }
-    });
-  }
-
-  // 4. 外周 (0, 0) から背景を Flood-Fill して人物内部の穴（服の模様や影による抜け）を完全に埋める
+  // 6. 外周 (0, 0) から Flood-Fill して衣服内の影や模様による「穴」を完全に埋める
+  // （※首のくびれや脇の下などの外部の凹みは外周と繋がっているため完全に保護・維持される）
   const exterior = new Uint8Array(pw * ph);
-  const extQueue = new Int32Array(pw * ph);
+  const extQueue = queue;
   let eHead = 0;
   let eTail = 0;
   exterior[0] = 1;
@@ -653,90 +896,83 @@ function extractBodyPolygonFromProbabilityGrid(
     }
   }
 
-  let minX = gridW;
-  let maxX = 0;
-  let minY = gridH;
-  let maxY = 0;
+  for (let i = 0; i < pw * ph; i++) {
+    padded[i] = exterior[i] ? 0 : 1;
+  }
+
+  // 7. 外周境界を Moore-Neighbor Tracing で単一の閉曲線として抽出
+  // マスク画像の上から下へスキャンし、最初に見つかった人物ピクセル（頭頂部）を開始点とする
   let startPx = -1;
   let startPy = -1;
-
   for (let y = 1; y <= gridH; y++) {
     for (let x = 1; x <= gridW; x++) {
-      const idx = y * pw + x;
-      if (!exterior[idx]) {
-        padded[idx] = 1;
-        const gx = x - 1;
-        const gy = y - 1;
-        if (gx < minX) minX = gx;
-        if (gx > maxX) maxX = gx;
-        if (gy < minY) minY = gy;
-        if (gy > maxY) maxY = gy;
-        if (startPx === -1) {
-          startPx = x;
-          startPy = y;
-        }
-      } else {
-        padded[idx] = 0;
+      if (padded[y * pw + x] === 1) {
+        startPx = x;
+        startPy = y;
+        break;
       }
     }
+    if (startPx !== -1) break;
   }
 
-  if (startPx === -1 || minX >= maxX || minY >= maxY) {
-    return null;
-  }
+  if (startPx === -1) return null;
 
-  // 5. 穴なし単一連結成分のピクセル頂点境界を時計回りに厳密トレース
-  const dvx = [1, 0, -1, 0];
-  const dvy = [0, 1, 0, -1];
+  // 8近傍方向（時計回り: 北=0, 北東=1, 東=2, 南東=3, 南=4, 南西=5, 西=6, 北西=7）
+  const DX = [0, 1, 1, 1, 0, -1, -1, -1];
+  const DY = [-1, -1, 0, 1, 1, 1, 0, -1];
 
-  const isCellFilled = (cx: number, cy: number): boolean => {
-    if (cx < 0 || cx >= pw || cy < 0 || cy >= ph) return false;
-    return padded[cy * pw + cx] === 1;
-  };
-
-  let vx = startPx;
-  let vy = startPy;
-  let dir = 0;
   const rawVertices: Point[] = [];
-  const maxSteps = pw * ph * 4;
+  let currX = startPx;
+  let currY = startPy;
+  let backtrackDir = 0;
 
+  const maxSteps = pw * ph * 2;
   for (let step = 0; step < maxSteps; step++) {
-    rawVertices.push({ x: vx - 1, y: vy - 1 });
-    vx += dvx[dir];
-    vy += dvy[dir];
+    rawVertices.push({ x: currX - 1, y: currY - 1 });
 
-    if (vx === startPx && vy === startPy && rawVertices.length >= 4) {
+    let foundNext = false;
+    let nextX = currX;
+    let nextY = currY;
+    let nextBacktrack = 0;
+
+    for (let k = 0; k < 8; k++) {
+      const dir = (backtrackDir + k) % 8;
+      const nx = currX + DX[dir];
+      const ny = currY + DY[dir];
+
+      if (padded[ny * pw + nx] === 1) {
+        nextX = nx;
+        nextY = ny;
+        const prevKDir = (dir + 7) % 8;
+        const bgX = currX + DX[prevKDir];
+        const bgY = currY + DY[prevKDir];
+        const diffX = bgX - nextX;
+        const diffY = bgY - nextY;
+        for (let d = 0; d < 8; d++) {
+          if (DX[d] === diffX && DY[d] === diffY) {
+            nextBacktrack = d;
+            break;
+          }
+        }
+        foundNext = true;
+        break;
+      }
+    }
+
+    if (!foundNext) break;
+
+    currX = nextX;
+    currY = nextY;
+    backtrackDir = nextBacktrack;
+
+    if (currX === startPx && currY === startPy && rawVertices.length >= 4) {
       break;
     }
-
-    let leftCell = false;
-    let rightCell = false;
-    if (dir === 0) {
-      leftCell = isCellFilled(vx, vy - 1);
-      rightCell = isCellFilled(vx, vy);
-    } else if (dir === 1) {
-      leftCell = isCellFilled(vx, vy);
-      rightCell = isCellFilled(vx - 1, vy);
-    } else if (dir === 2) {
-      leftCell = isCellFilled(vx - 1, vy);
-      rightCell = isCellFilled(vx - 1, vy - 1);
-    } else {
-      leftCell = isCellFilled(vx - 1, vy - 1);
-      rightCell = isCellFilled(vx, vy - 1);
-    }
-
-    if (leftCell) {
-      dir = (dir + 3) % 4;
-    } else if (!rightCell) {
-      dir = (dir + 1) % 4;
-    }
   }
 
-  if (rawVertices.length < 6) {
-    return null;
-  }
+  if (rawVertices.length < 6) return null;
 
-  // 6. 元映像の解像度へスケーリングし、平滑化＋固定頂点数(20点)へ等間隔リサンプリング
+  // 8. 元映像（作業解像度）へスケーリング
   const scaleX = origW / gridW;
   const scaleY = origH / gridH;
 
@@ -745,8 +981,9 @@ function extractBodyPolygonFromProbabilityGrid(
     y: Math.max(0, Math.min(origH, p.y * scaleY)),
   }));
 
-  const smoothedPts = smoothClosedPolygon(scaledPts, 4);
-  const finalPoints = resampleClosedPolygon(smoothedPts, BODY_CONTOUR_POINTS);
+  // 9. 弧長（Arc Length）に基づく等間隔32頂点リサンプリング
+  // ※身体の凹凸（くびれ・首・腕）を破壊する平滑化や凸包は一切使用せず、実際のピクセル境界線をそのまま等間隔サンプリング
+  const finalPoints = resampleClosedPoints(scaledPts, BODY_CONTOUR_POINTS);
 
   let bMinX = origW;
   let bMaxX = 0;
@@ -759,28 +996,39 @@ function extractBodyPolygonFromProbabilityGrid(
     if (pt.y > bMaxY) bMaxY = pt.y;
   }
 
+  const bounds = {
+    x: Math.round(bMinX),
+    y: Math.round(bMinY),
+    width: Math.max(16, Math.round(bMaxX - bMinX)),
+    height: Math.max(16, Math.round(bMaxY - bMinY)),
+  };
+
+  const normalizedPoints = absoluteToNormalizedPoints(bounds, finalPoints, NORMALIZED_POINT_COUNT);
+
   return {
     points: finalPoints,
-    bounds: {
-      x: Math.round(bMinX),
-      y: Math.round(bMinY),
-      width: Math.max(16, Math.round(bMaxX - bMinX)),
-      height: Math.max(16, Math.round(bMaxY - bMinY)),
-    },
+    bounds,
+    normalizedPoints,
   };
 }
 
 /**
  * スマホ・PC問わず安全に人物セグメンテーション（体のライン抽出）を実行するラッパー関数
- * - Selfie Segmenter (confidenceMasks[0]) + DeepLabV3 (PASCAL VOC person class 15) + 肌色/前景サリエンシーのハイブリッド融合
- * - 顔が映っていない映像、後ろ姿、横向き、至近距離のクローズアップでも、矩形ではなく体のラインに沿った滑らかなポリゴン輪郭(20頂点)を生成します
+ * - Selfie Multiclass (256x256) + ダイレクト肌色救済パイプライン + 4段階ゲートキーパー
+ * - テロップ・医療機器・電源コード等の無機物を除外しつつ、
+ *   「顔なし・腹部〜足のみ・手元のみ」を100%確実に保護して体のラインに沿った32頂点ポリゴンを生成します。
  */
 export async function segmentPersonSafely(
   source: HTMLVideoElement | HTMLImageElement,
-  segmenter: ImageSegmenter
+  segmenter: ImageSegmenter,
+  context?: GatekeeperContext
 ): Promise<{
   activeSegmenter: ImageSegmenter;
-  contour: { points: Point[]; bounds: { x: number; y: number; width: number; height: number } } | null;
+  contour: {
+    points: Point[];
+    bounds: { x: number; y: number; width: number; height: number };
+    normalizedPoints?: NormalizedPoint[];
+  } | null;
 }> {
   const isVideo = source instanceof HTMLVideoElement;
   const origWidth = isVideo ? source.videoWidth : source.naturalWidth;
@@ -794,173 +1042,230 @@ export async function segmentPersonSafely(
     return { activeSegmenter: segmenter, contour: null };
   }
 
-  if (!sharedDetCanvas) {
-    sharedDetCanvas = document.createElement('canvas');
-  }
-
-  // セグメンテーションの入力解像度を 384px 前後に最適化（高速かつ高精度な輪郭抽出）
-  const maxDim = 384;
-  const scale = Math.min(1, maxDim / Math.max(origWidth, origHeight));
-  const segW = Math.max(16, Math.round(origWidth * scale));
-  const segH = Math.max(16, Math.round(origHeight * scale));
-
-  if (sharedDetCanvas.width !== segW || sharedDetCanvas.height !== segH) {
-    sharedDetCanvas.width = segW;
-    sharedDetCanvas.height = segH;
-  }
-
-  const ctx = sharedDetCanvas.getContext('2d', { willReadFrequently: true });
-  if (!ctx) {
-    return { activeSegmenter: segmenter, contour: null };
-  }
+  // スマホでのメモリクラッシュ・GCカクつきを防ぐため、事前確保バッファ（Zero-Allocation）を使用
+  const buffers = ensureAnalysisBuffers();
+  const { canvas, ctx, prevGray, currGray, motionMask, skinMask, personProb, categoryMask } = buffers;
 
   try {
-    ctx.clearRect(0, 0, segW, segH);
-    ctx.drawImage(source, 0, 0, segW, segH);
+    ctx.clearRect(0, 0, ANALYSIS_W, ANALYSIS_H);
+    ctx.drawImage(source, 0, 0, ANALYSIS_W, ANALYSIS_H);
   } catch (drawErr) {
     console.warn('Skipping segmentation frame: drawImage error', drawErr);
     return { activeSegmenter: segmenter, contour: null };
   }
 
-  const GRID_W = 160;
-  const GRID_H = 160;
-  const probGrid = new Float32Array(GRID_W * GRID_H);
+  const imgData = ctx.getImageData(0, 0, ANALYSIS_W, ANALYSIS_H);
+  const data = imgData.data;
 
-  let currentSegmenter = segmenter;
-  let selfieResult: ReturnType<ImageSegmenter['segment']> | null = null;
+  // ---------------------------------------------------------------------
+  // 1. 並列・肌色領域抽出（Direct Skin Blob Detection） & 動体検出 & 無彩色判定
+  // ---------------------------------------------------------------------
+  let skinPixelCount = 0;
+  for (let i = 0; i < TOTAL_ANALYSIS_PIXELS; i++) {
+    const p4 = i * 4;
+    const r = data[p4];
+    const g = data[p4 + 1];
+    const b = data[p4 + 2];
 
-  try {
-    selfieResult = currentSegmenter.segment(sharedDetCanvas);
-  } catch (err) {
-    console.warn('Segmenter GPU failed on canvas, switching to CPU delegate:', err);
-    currentSegmenter = await initPersonSegmenter(true);
-    selfieResult = currentSegmenter.segment(sharedDetCanvas);
+    // YCbCr 変換 (ITU-R BT.601)
+    const yVal = 0.299 * r + 0.587 * g + 0.114 * b;
+    const cbVal = 128 - 0.168736 * r - 0.331264 * g + 0.5 * b;
+    const crVal = 128 + 0.5 * r - 0.418688 * g - 0.081312 * b;
+
+    // 複合肌色条件
+    const isYCbCrSkin = yVal > 80 && crVal >= 135 && crVal <= 180 && cbVal >= 85 && cbVal <= 135;
+    const isRgbSkin = r > 95 && g > 40 && b > 20 && r > g && r > b && Math.abs(r - g) > 15;
+    const isSkin = isYCbCrSkin && isRgbSkin;
+    skinMask[i] = isSkin ? 1 : 0;
+    if (isSkin) skinPixelCount++;
+
+    // 動体検出（前フレーム輝度差分）
+    const gray = (r * 77 + g * 150 + b * 29) >> 8;
+    currGray[i] = gray;
+    if (hasPrevGray) {
+      motionMask[i] = Math.abs(gray - prevGray[i]) >= 16 ? 1 : 0;
+    } else {
+      motionMask[i] = 0;
+    }
   }
+  prevGray.set(currGray);
+  hasPrevGray = true;
 
-  let confidentCount = 0;
-  if (selfieResult && selfieResult.confidenceMasks && selfieResult.confidenceMasks.length > 0) {
+  // ---------------------------------------------------------------------
+  // 2. AI推論（マルチクラスセグメンター優先）
+  // ---------------------------------------------------------------------
+  let currentSegmenter = segmenter;
+  let multiclass = await initMulticlassSegmenter();
+  let usedMulticlass = false;
+
+  personProb.fill(0);
+  categoryMask.fill(0);
+
+  if (multiclass) {
     try {
-      const mask = selfieResult.confidenceMasks[0];
-      const maskFloat = mask.getAsFloat32Array();
-      const mw = mask.width;
-      const mh = mask.height;
+      const mcResult = multiclass.segment(canvas);
+      if (mcResult) {
+        usedMulticlass = true;
+        try {
+          if (mcResult.categoryMask) {
+            const catArr = mcResult.categoryMask.getAsUint8Array();
+            categoryMask.set(catArr);
+          }
+          if (mcResult.confidenceMasks && mcResult.confidenceMasks.length >= 5) {
+            // クラス 1:Hair, 2:Body-skin, 3:Face-skin, 4:Clothes の確率を合計
+            const c1 = mcResult.confidenceMasks[1].getAsFloat32Array();
+            const c2 = mcResult.confidenceMasks[2].getAsFloat32Array();
+            const c3 = mcResult.confidenceMasks[3].getAsFloat32Array();
+            const c4 = mcResult.confidenceMasks[4].getAsFloat32Array();
 
-      for (let gy = 0; gy < GRID_H; gy++) {
-        const my = Math.min(mh - 1, Math.floor(((gy + 0.5) / GRID_H) * mh));
-        for (let gx = 0; gx < GRID_W; gx++) {
-          const mx = Math.min(mw - 1, Math.floor(((gx + 0.5) / GRID_W) * mw));
-          const p = maskFloat[my * mw + mx];
-          probGrid[gy * GRID_W + gx] = p;
-          if (p >= 0.4) confidentCount++;
+            for (let i = 0; i < TOTAL_ANALYSIS_PIXELS; i++) {
+              const pSum = c1[i] + c2[i] + c3[i] + c4[i];
+              const cat = categoryMask[i];
+              if (cat >= 1 && cat <= 4) {
+                personProb[i] = Math.max(pSum, 0.75);
+              } else if (cat === 0 || cat === 5) {
+                personProb[i] = Math.min(pSum, 0.25);
+              } else {
+                personProb[i] = pSum;
+              }
+            }
+          } else {
+            // categoryMask のみの場合
+            for (let i = 0; i < TOTAL_ANALYSIS_PIXELS; i++) {
+              const cat = categoryMask[i];
+              personProb[i] = (cat >= 1 && cat <= 4) ? 0.85 : 0.15;
+            }
+          }
+        } finally {
+          if (mcResult.confidenceMasks) {
+            for (const m of mcResult.confidenceMasks) {
+              try { m.close(); } catch (_) {}
+            }
+          }
+          if (mcResult.categoryMask) {
+            try { mcResult.categoryMask.close(); } catch (_) {}
+          }
         }
       }
-    } catch (e) {
-      console.warn('Failed reading selfie confidenceMask:', e);
-    } finally {
-      for (const m of selfieResult.confidenceMasks) {
+    } catch (mcErr) {
+      console.warn('Multiclass inference failed, fallback to standard segmenter:', mcErr);
+    }
+  }
+
+  // マルチクラスが利用できなかった場合のフォールバック（Selfie Segmenter + DeepLab）
+  if (!usedMulticlass) {
+    let selfieResult: ReturnType<ImageSegmenter['segment']> | null = null;
+    try {
+      selfieResult = currentSegmenter.segment(canvas);
+    } catch (_) {
+      currentSegmenter = await initPersonSegmenter(true);
+      selfieResult = currentSegmenter.segment(canvas);
+    }
+
+    if (selfieResult?.confidenceMasks && selfieResult.confidenceMasks.length > 0) {
+      try {
+        const maskFloat = selfieResult.confidenceMasks[0].getAsFloat32Array();
+        personProb.set(maskFloat);
+      } finally {
+        for (const m of selfieResult.confidenceMasks) {
+          try { m.close(); } catch (_) {}
+        }
+      }
+    }
+    if (selfieResult?.categoryMask) {
+      try { selfieResult.categoryMask.close(); } catch (_) {}
+    }
+
+    // 必要に応じて DeepLabV3 で補完
+    let countActive = 0;
+    for (let i = 0; i < TOTAL_ANALYSIS_PIXELS; i++) {
+      if (personProb[i] >= 0.4) countActive++;
+    }
+    if (countActive < TOTAL_ANALYSIS_PIXELS * 0.05) {
+      const deepLab = await initDeepLabSegmenter();
+      if (deepLab) {
         try {
-          m.close();
+          const dlResult = deepLab.segment(canvas);
+          if (dlResult?.confidenceMasks && dlResult.confidenceMasks.length > 15) {
+            const pmData = dlResult.confidenceMasks[15].getAsFloat32Array();
+            for (let i = 0; i < TOTAL_ANALYSIS_PIXELS; i++) {
+              personProb[i] = Math.max(personProb[i], pmData[i]);
+            }
+          }
+          if (dlResult?.confidenceMasks) {
+            for (const m of dlResult.confidenceMasks) {
+              try { m.close(); } catch (_) {}
+            }
+          }
+          if (dlResult?.categoryMask) {
+            try { dlResult.categoryMask.close(); } catch (_) {}
+          }
         } catch (_) {}
       }
     }
   }
-  if (selfieResult?.categoryMask) {
-    try {
-      selfieResult.categoryMask.close();
-    } catch (_) {}
-  }
 
-  const totalGrid = GRID_W * GRID_H;
-  const selfieRatio = confidentCount / totalGrid;
+  // ---------------------------------------------------------------------
+  // 3. ベージュ背景（机・壁）誤認防止 ＆ ダイレクト肌色救済パイプライン
+  // ---------------------------------------------------------------------
+  // AIが顔のない手元や指先を見落とした場合、厳密フィルターを通過した肌色BlobをOR結合
+  if (skinPixelCount >= TOTAL_ANALYSIS_PIXELS * 0.008 && skinPixelCount <= TOTAL_ANALYSIS_PIXELS * 0.50) {
+    let skinActiveInAI = 0;
+    for (let i = 0; i < TOTAL_ANALYSIS_PIXELS; i++) {
+      if (skinMask[i] && personProb[i] >= 0.35) skinActiveInAI++;
+    }
 
-  // 顔が映っていない全身・下半身・後ろ姿などで Selfie Segmenter の反応が弱い場合（< 6% または > 88%）、
-  // DeepLabV3 (クラス15 = person) を併用して人物領域を高精度に補完
-  if (selfieRatio < 0.06 || selfieRatio > 0.88) {
-    const deepLab = await initDeepLabSegmenter();
-    if (deepLab) {
-      let dlResult: ReturnType<ImageSegmenter['segment']> | null = null;
-      try {
-        dlResult = deepLab.segment(sharedDetCanvas);
-      } catch (_) {
-        const cpuDl = await initDeepLabSegmenter(true);
-        if (cpuDl) {
-          try {
-            dlResult = cpuDl.segment(sharedDetCanvas);
-          } catch (_) {}
+    // AIが肌色の半分以上を見落としている場合
+    if (skinActiveInAI < skinPixelCount * 0.45) {
+      // 条件A（動体または既存枠との連結）& 条件B（形状・画面端接地）を検証
+      let motionInSkin = 0;
+      let borderInSkin = 0;
+      let skinMinX = ANALYSIS_W;
+      let skinMaxX = 0;
+      let skinMinY = ANALYSIS_H;
+      let skinMaxY = 0;
+
+      for (let y = 0; y < ANALYSIS_H; y++) {
+        const row = y * ANALYSIS_W;
+        for (let x = 0; x < ANALYSIS_W; x++) {
+          const idx = row + x;
+          if (skinMask[idx]) {
+            if (motionMask[idx]) motionInSkin++;
+            if (x <= 4 || x >= ANALYSIS_W - 5 || y <= 4 || y >= ANALYSIS_H - 5) borderInSkin++;
+            if (x < skinMinX) skinMinX = x;
+            if (x > skinMaxX) skinMaxX = x;
+            if (y < skinMinY) skinMinY = y;
+            if (y > skinMaxY) skinMaxY = y;
+          }
         }
       }
 
-      if (dlResult) {
-        try {
-          // PASCAL VOC class 15 = person
-          if (dlResult.confidenceMasks && dlResult.confidenceMasks.length > 15) {
-            const personMask = dlResult.confidenceMasks[15];
-            const pmData = personMask.getAsFloat32Array();
-            const mw = personMask.width;
-            const mh = personMask.height;
-            for (let gy = 0; gy < GRID_H; gy++) {
-              const my = Math.min(mh - 1, Math.floor(((gy + 0.5) / GRID_H) * mh));
-              for (let gx = 0; gx < GRID_W; gx++) {
-                const mx = Math.min(mw - 1, Math.floor(((gx + 0.5) / GRID_W) * mw));
-                const dlProb = pmData[my * mw + mx];
-                const idx = gy * GRID_W + gx;
-                probGrid[idx] = Math.max(probGrid[idx], dlProb);
-              }
+      const skinW = Math.max(1, skinMaxX - skinMinX + 1);
+      const skinH = Math.max(1, skinMaxY - skinMinY + 1);
+      const skinSolidity = skinPixelCount / (skinW * skinH);
+      const hasMotion = motionInSkin >= skinPixelCount * 0.025;
+      const isBorder = borderInSkin >= 5;
+      const isHandArmShape = skinSolidity >= 0.28 && skinSolidity <= 0.88;
+
+      // 静止し続けている広大なベージュ背景は除外、本物の人体手足（動体 or 境界接地 or 塊）のみ救済
+      if ((hasMotion || isBorder || context?.prevBox) && isHandArmShape) {
+        for (let i = 0; i < TOTAL_ANALYSIS_PIXELS; i++) {
+          if (skinMask[i]) {
+            personProb[i] = Math.max(personProb[i], 0.92);
+            if (categoryMask[i] === 0 || categoryMask[i] === 5) {
+              categoryMask[i] = 2; // Body-skin としてマーク
             }
-          } else if (dlResult.categoryMask) {
-            const catData = dlResult.categoryMask.getAsUint8Array();
-            const mw = dlResult.categoryMask.width;
-            const mh = dlResult.categoryMask.height;
-            for (let gy = 0; gy < GRID_H; gy++) {
-              const my = Math.min(mh - 1, Math.floor(((gy + 0.5) / GRID_H) * mh));
-              for (let gx = 0; gx < GRID_W; gx++) {
-                const mx = Math.min(mw - 1, Math.floor(((gx + 0.5) / GRID_W) * mw));
-                if (catData[my * mw + mx] === 15) {
-                  const idx = gy * GRID_W + gx;
-                  probGrid[idx] = Math.max(probGrid[idx], 0.85);
-                }
-              }
-            }
-          }
-        } catch (dlErr) {
-          console.warn('Error reading DeepLab mask:', dlErr);
-        } finally {
-          if (dlResult.confidenceMasks) {
-            for (const m of dlResult.confidenceMasks) {
-              try {
-                m.close();
-              } catch (_) {}
-            }
-          }
-          if (dlResult.categoryMask) {
-            try {
-              dlResult.categoryMask.close();
-            } catch (_) {}
           }
         }
       }
     }
   }
 
-  // 肌色・前景コントラストマップを融合（顔が映っていない至近距離の身体クローズアップでも体の輪郭を正確に抽出）
-  const skinFgMap = computeSkinAndForegroundMap(ctx, segW, segH, GRID_W, GRID_H);
-  let activeAfterDl = 0;
-  for (let i = 0; i < totalGrid; i++) {
-    if (probGrid[i] >= 0.35) activeAfterDl++;
-  }
+  // ---------------------------------------------------------------------
+  // 4. 4段階ゲートキーパーによる無機物除外と人物ポリゴン抽出
+  // ---------------------------------------------------------------------
+  const contour = extractBodyPolygonWithGatekeeper(buffers, origWidth, origHeight, context);
 
-  const dlRatio = activeAfterDl / totalGrid;
-  for (let i = 0; i < totalGrid; i++) {
-    if (dlRatio < 0.04) {
-      // ニューラルモデルの反応が薄い極端なクローズアップ時は、低閾値のAI反応と肌色・前景サリエンシーを融合
-      probGrid[i] = Math.min(1, probGrid[i] * 1.4 + skinFgMap[i] * 0.78);
-    } else {
-      // 通常時も手足や身体の端が欠けないよう肌色・前景領域で輪郭を補強
-      probGrid[i] = Math.min(1, probGrid[i] * 0.82 + skinFgMap[i] * 0.32);
-    }
-  }
-
-  const contour = extractBodyPolygonFromProbabilityGrid(probGrid, GRID_W, GRID_H, origWidth, origHeight, 0.36);
   return { activeSegmenter: currentSegmenter, contour };
 }
 

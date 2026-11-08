@@ -1,4 +1,12 @@
-import { Keyframe, Point } from '../types';
+import { Keyframe, Point, NormalizedPoint } from '../types';
+import {
+  NORMALIZED_POINT_COUNT,
+  createDefaultNormalizedPoints,
+  normalizedToAbsolutePoints,
+  absoluteToNormalizedPoints,
+  resampleClosedPoints,
+  isBoxTouchingBorder,
+} from './geometry';
 
 /**
  * 高精度ハイブリッドトラッカー
@@ -290,26 +298,75 @@ export function trackBox(
   };
 }
 
-// キーフレーム間の線形補間
+// キーフレーム間の線形補間（外枠 Bounding Box + 32正規化頂点 Lerp、退場即時破棄・見失いタイムアウト対応）
 export function interpolateKeyframes(
   keyframes: Keyframe[],
-  time: number
-): { x: number; y: number; width: number; height: number; points?: Point[] } | null {
+  time: number,
+  options?: {
+    screenWidth?: number;
+    screenHeight?: number;
+    hasFutureManualKeyframe?: boolean;
+  }
+): { x: number; y: number; width: number; height: number; points?: Point[]; normalizedPoints?: NormalizedPoint[] } | null {
   if (keyframes.length === 0) return null;
+
+  const toNormalized = (k: Keyframe): NormalizedPoint[] | undefined => {
+    if (k.normalizedPoints && k.normalizedPoints.length > 0) {
+      return k.normalizedPoints;
+    }
+    if (k.points && k.points.length >= 3) {
+      return absoluteToNormalizedPoints({ x: k.x, y: k.y, width: k.width, height: k.height }, k.points, NORMALIZED_POINT_COUNT);
+    }
+    return undefined;
+  };
+
+  const buildResult = (k: Keyframe) => {
+    const norm = toNormalized(k);
+    const box = { x: k.x, y: k.y, width: k.width, height: k.height };
+    const points = norm ? normalizedToAbsolutePoints(box, norm) : k.points;
+    return { ...box, points, normalizedPoints: norm };
+  };
+
+  const sw = options?.screenWidth || 1280;
+  const sh = options?.screenHeight || 720;
+
   if (keyframes.length === 1) {
-    const k = keyframes[0];
-    return { x: k.x, y: k.y, width: k.width, height: k.height, points: k.points };
+    const kf = keyframes[0];
+    if (time > kf.time && !options?.hasFutureManualKeyframe) {
+      const isBorder = isBoxTouchingBorder(kf, sw, sh, 20);
+      const maxHold = isBorder ? 0.05 : 1.0;
+      if (time > kf.time + maxHold) {
+        return null;
+      }
+    }
+    return buildResult(kf);
   }
 
   const sorted = [...keyframes].sort((a, b) => a.time - b.time);
 
+  // 最初のキーフレーム以前: 0.08秒より前はまだ出現していないため非表示（入場前のゴースト枠防止）
   if (time <= sorted[0].time) {
-    const k = sorted[0];
-    return { x: k.x, y: k.y, width: k.width, height: k.height, points: k.points };
+    if (time < sorted[0].time - 0.08 && !options?.hasFutureManualKeyframe) {
+      return null;
+    }
+    return buildResult(sorted[0]);
   }
-  if (time >= sorted[sorted.length - 1].time) {
-    const k = sorted[sorted.length - 1];
-    return { x: k.x, y: k.y, width: k.width, height: k.height, points: k.points };
+
+  // 最後のキーフレーム以降:
+  // 1. 未来に手動キーフレームがある場合は絶対に枠を破棄せず維持（手動キーフレームの絶対保護）
+  // 2. 画面境界（端から20px以内）に接していた場合は「画面外への退場」と確定し即時破棄（ホールド即解除）
+  // 3. 画面中央付近で見失った場合は連続約1秒（1.0秒）経過後にホールド解除・枠消去
+  const lastKf = sorted[sorted.length - 1];
+  if (time >= lastKf.time) {
+    if (options?.hasFutureManualKeyframe) {
+      return buildResult(lastKf);
+    }
+    const isBorder = isBoxTouchingBorder(lastKf, sw, sh, 20);
+    const maxHold = isBorder ? 0.05 : 1.0;
+    if (time > lastKf.time + maxHold) {
+      return null;
+    }
+    return buildResult(lastKf);
   }
 
   let prev = sorted[0];
@@ -327,42 +384,59 @@ export function interpolateKeyframes(
 
   const x = prev.x + (next.x - prev.x) * alpha;
   const y = prev.y + (next.y - prev.y) * alpha;
-  const width = prev.width + (next.width - prev.width) * alpha;
-  const height = prev.height + (next.height - prev.height) * alpha;
+  const width = Math.max(4, prev.width + (next.width - prev.width) * alpha);
+  const height = Math.max(4, prev.height + (next.height - prev.height) * alpha);
+  const box = { x, y, width, height };
 
+  const prevNorm = toNormalized(prev);
+  const nextNorm = toNormalized(next);
+
+  let normalizedPoints: NormalizedPoint[] | undefined = undefined;
   let points: Point[] | undefined = undefined;
-  if (prev.points && prev.points.length > 0 && next.points && next.points.length > 0) {
-    if (prev.points.length === next.points.length) {
-      points = prev.points.map((p, idx) => ({
-        x: p.x + (next.points![idx].x - p.x) * alpha,
-        y: p.y + (next.points![idx].y - p.y) * alpha,
-      }));
-    } else {
-      // 頂点数が異なるフレーム間でも輪郭ポリゴンが決して消えて矩形(rect)に退化しないよう、比率インデックスで線形補間
-      const count = prev.points.length;
-      const nextLen = next.points.length;
-      points = prev.points.map((p, idx) => {
-        const nextF = (idx / count) * nextLen;
-        const nIdx0 = Math.floor(nextF) % nextLen;
-        const nIdx1 = (nIdx0 + 1) % nextLen;
-        const frac = nextF - Math.floor(nextF);
-        const npX = next.points![nIdx0].x + (next.points![nIdx1].x - next.points![nIdx0].x) * frac;
-        const npY = next.points![nIdx0].y + (next.points![nIdx1].y - next.points![nIdx0].y) * frac;
-        return {
-          x: p.x + (npX - p.x) * alpha,
-          y: p.y + (npY - p.y) * alpha,
-        };
-      });
-    }
-  } else if (prev.points && prev.points.length > 0) {
-    const dx = x - prev.x;
-    const dy = y - prev.y;
-    points = prev.points.map((p) => ({ x: p.x + dx, y: p.y + dy }));
-  } else if (next.points && next.points.length > 0) {
-    const dx = x - next.x;
-    const dy = y - next.y;
-    points = next.points.map((p) => ({ x: p.x + dx, y: p.y + dy }));
+
+  if (prevNorm && nextNorm) {
+    // 32頂点の Lerp 補間
+    const count = NORMALIZED_POINT_COUNT;
+    const pNorm: NormalizedPoint[] =
+      prevNorm.length === count
+        ? prevNorm
+        : resampleClosedPoints(
+            prevNorm.map((p: NormalizedPoint) => ({ x: p.u, y: p.v })),
+            count
+          ).map((p: Point) => ({ u: p.x, v: p.y }));
+
+    const nNorm: NormalizedPoint[] =
+      nextNorm.length === count
+        ? nextNorm
+        : resampleClosedPoints(
+            nextNorm.map((p: NormalizedPoint) => ({ x: p.u, y: p.v })),
+            count
+          ).map((p: Point) => ({ u: p.x, v: p.y }));
+
+    const lerpedNorm: NormalizedPoint[] = pNorm.map((p: NormalizedPoint, idx: number) => ({
+      u: p.u + (nNorm[idx].u - p.u) * alpha,
+      v: p.v + (nNorm[idx].v - p.v) * alpha,
+    }));
+    normalizedPoints = lerpedNorm;
+    points = normalizedToAbsolutePoints(box, lerpedNorm);
+  } else if (prevNorm) {
+    normalizedPoints = prevNorm;
+    points = normalizedToAbsolutePoints(box, prevNorm);
+  } else if (nextNorm) {
+    normalizedPoints = nextNorm;
+    points = normalizedToAbsolutePoints(box, nextNorm);
+  } else if (prev.points && next.points) {
+    // レガシーポイント補間フォールバック
+    const count = Math.max(prev.points.length, next.points.length, NORMALIZED_POINT_COUNT);
+    const pRes = resampleClosedPoints(prev.points, count);
+    const nRes = resampleClosedPoints(next.points, count);
+    const lerpedPts: Point[] = pRes.map((p: Point, idx: number) => ({
+      x: p.x + (nRes[idx].x - p.x) * alpha,
+      y: p.y + (nRes[idx].y - p.y) * alpha,
+    }));
+    points = lerpedPts;
+    normalizedPoints = absoluteToNormalizedPoints(box, lerpedPts, NORMALIZED_POINT_COUNT);
   }
 
-  return { x, y, width, height, points };
+  return { x, y, width, height, points, normalizedPoints };
 }

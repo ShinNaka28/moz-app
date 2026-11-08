@@ -1,7 +1,8 @@
 import React, { useRef, useEffect, useState, useCallback } from 'react';
-import { EditorMode, MosaicTrack, MosaicType, Point } from '../types';
+import { EditorMode, MosaicTrack, MosaicType, Point, NormalizedPoint } from '../types';
 import { renderTrackMosaic, renderInverseMosaic, renderTrackOverlay, ProtectedRegion } from '../utils/mosaicRenderer';
 import { interpolateKeyframes, extractFeaturePoints, toGrayscale, trackBox } from '../utils/tracking';
+import { getClampedDimensions, absoluteToNormalizedPoints, resampleClosedPoints, NORMALIZED_POINT_COUNT } from '../utils/geometry';
 
 interface VideoCanvasProps {
   videoRef: React.RefObject<HTMLVideoElement | null>;
@@ -20,7 +21,7 @@ interface VideoCanvasProps {
   onAddTrack: (newTrack: MosaicTrack) => void;
   onUpdateTrackKeyframe: (
     trackId: string,
-    box: { x: number; y: number; width: number; height: number; points?: Point[] },
+    box: { x: number; y: number; width: number; height: number; points?: Point[]; normalizedPoints?: NormalizedPoint[] },
     isPlaybackTracking?: boolean
   ) => void;
   onToggleTrackEnabled: (trackId: string) => void;
@@ -77,6 +78,8 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
   } | null>(null);
 
   // ポリゴン頂点ドラッグ時の新しい座標＆外接バウンディングボックス算出ヘルパー
+  // 32頂点などのポリゴンの場合、1頂点のみ動かすと角張ったトゲになってしまうため、
+  // ガウス重み exp(-(dist / sigma)^2) による「ソフト選択（Soft Selection）」で隣接頂点も滑らかに連動
   const computeVertexMovedBox = (
     initialBox: { x: number; y: number; width: number; height: number; points?: Point[] },
     vertexIndex: number,
@@ -86,7 +89,9 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
     if (!initialBox.points || initialBox.points.length === 0) return initialBox;
     const pts = initialBox.points;
     const n = pts.length;
-    const radius = n > 32 ? Math.max(2, Math.floor(n / 18)) : 0;
+    // 32頂点では前後3頂点（半径3）にガウス重みを適用
+    const radius = n >= 16 ? Math.min(4, Math.max(2, Math.round(n * 0.1))) : (n > 8 ? 1 : 0);
+    const sigma = Math.max(1.2, radius * 0.55);
 
     const newPoints: Point[] = pts.map((p, idx) => {
       if (idx === vertexIndex) {
@@ -98,7 +103,7 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
           n - Math.abs(idx - vertexIndex)
         );
         if (circularDist <= radius) {
-          const weight = 0.5 * (1 + Math.cos((Math.PI * circularDist) / (radius + 1)));
+          const weight = Math.exp(-Math.pow(circularDist / sigma, 2));
           return {
             x: p.x + dx * weight,
             y: p.y + dy * weight,
@@ -166,10 +171,13 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
     const media = isImage ? imageRef.current : videoRef.current;
     if (!media) return;
 
-    const mediaWidth = isImage ? (media as HTMLImageElement).naturalWidth : (media as HTMLVideoElement).videoWidth;
-    const mediaHeight = isImage ? (media as HTMLImageElement).naturalHeight : (media as HTMLVideoElement).videoHeight;
+    const rawWidth = isImage ? (media as HTMLImageElement).naturalWidth : (media as HTMLVideoElement).videoWidth;
+    const rawHeight = isImage ? (media as HTMLImageElement).naturalHeight : (media as HTMLVideoElement).videoHeight;
 
-    if (!mediaWidth || !mediaHeight) return;
+    if (!rawWidth || !rawHeight) return;
+
+    // スマホでの 4K/1080p メモリクラッシュ（OOM）を防ぐため、内部作業解像度を長辺 1280px 以下にクランプ
+    const { width: mediaWidth, height: mediaHeight } = getClampedDimensions(rawWidth, rawHeight, 1280);
 
     if (canvas.width !== mediaWidth || canvas.height !== mediaHeight) {
       canvas.width = mediaWidth;
@@ -181,7 +189,7 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
     const srcCtx = sourceCanvasRef.current.getContext('2d');
     if (!srcCtx) return;
 
-    // 元メディアを一時キャンバスと表示キャンバスに描画
+    // 元メディアを作業解像度にダウンスケール転写
     srcCtx.drawImage(media, 0, 0, mediaWidth, mediaHeight);
     ctx.drawImage(sourceCanvasRef.current, 0, 0, mediaWidth, mediaHeight);
 
@@ -196,7 +204,11 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
           if (currentTime < track.startTime || currentTime > track.endTime) continue;
 
           // 直前のキーフレームまたは現在位置
-          const curPos = interpolateKeyframes(track.keyframes, currentTime);
+          const curPos = interpolateKeyframes(track.keyframes, currentTime, {
+            screenWidth: mediaWidth,
+            screenHeight: mediaHeight,
+            hasFutureManualKeyframe: track.keyframes.some((k) => k.time > currentTime),
+          });
           if (!curPos) continue;
 
           const featPoints = track.trackingData?.featurePoints || extractFeaturePoints(prevGrayRef.current, mediaWidth, mediaHeight, curPos);
@@ -242,7 +254,11 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
 
     // 現在の表示位置を計算（ドラッグ変形・移動中はリアルタイムに反映）
     const getEffectivePos = (track: MosaicTrack) => {
-      const pos = interpolateKeyframes(track.keyframes, currentTime);
+      const pos = interpolateKeyframes(track.keyframes, currentTime, {
+        screenWidth: canvas.width,
+        screenHeight: canvas.height,
+        hasFutureManualKeyframe: track.keyframes.some((k) => k.time > currentTime),
+      });
       if (!pos) return null;
 
       if (transformRef.current && transformRef.current.trackId === track.id) {
@@ -434,7 +450,11 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
     if (selectedTrackId) {
       const selectedTrack = tracks.find((t) => t.id === selectedTrackId);
       if (selectedTrack && currentTime >= selectedTrack.startTime && currentTime <= selectedTrack.endTime) {
-        const pos = interpolateKeyframes(selectedTrack.keyframes, currentTime);
+        const pos = interpolateKeyframes(selectedTrack.keyframes, currentTime, {
+          screenWidth: canvas?.width,
+          screenHeight: canvas?.height,
+          hasFutureManualKeyframe: selectedTrack.keyframes.some((k) => k.time > currentTime),
+        });
         if (pos) {
           // 1-A. ポリゴン・フリー囲みの「頂点ハンドル（●）」タッチ判定を最優先！
           // 輪郭上の黄色い丸（●）をドラッグすることで、人物の身体のラインに手動でぴったり合わせられる
@@ -443,12 +463,11 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
             pos.points &&
             pos.points.length >= 3
           ) {
-            const vertexHitRadius = 20 * uiScale;
-            const step = pos.points.length > 32 ? Math.max(1, Math.floor(pos.points.length / 20)) : 1;
+            const vertexHitRadius = 22 * uiScale;
             let bestIdx = -1;
             let bestDist = vertexHitRadius;
 
-            for (let idx = 0; idx < pos.points.length; idx += step) {
+            for (let idx = 0; idx < pos.points.length; idx++) {
               const vPt = pos.points[idx];
               const d = Math.hypot(pt.x - vPt.x, pt.y - vPt.y);
               if (d <= bestDist) {
@@ -547,7 +566,11 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
     for (let i = tracks.length - 1; i >= 0; i--) {
       const track = tracks[i];
       if (currentTime < track.startTime || currentTime > track.endTime) continue;
-      const pos = interpolateKeyframes(track.keyframes, currentTime);
+      const pos = interpolateKeyframes(track.keyframes, currentTime, {
+        screenWidth: canvas?.width,
+        screenHeight: canvas?.height,
+        hasFutureManualKeyframe: track.keyframes.some((k) => k.time > currentTime),
+      });
       if (!pos) continue;
 
       if (
@@ -630,16 +653,19 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
       if (selectedTrackId) {
         const selectedTrack = tracks.find((t) => t.id === selectedTrackId);
         if (selectedTrack) {
-          const pos = interpolateKeyframes(selectedTrack.keyframes, currentTime);
+          const pos = interpolateKeyframes(selectedTrack.keyframes, currentTime, {
+            screenWidth: canvasRef.current?.width,
+            screenHeight: canvasRef.current?.height,
+            hasFutureManualKeyframe: selectedTrack.keyframes.some((k) => k.time > currentTime),
+          });
           if (pos) {
             if (
               (selectedTrack.shape === 'polygon' || selectedTrack.shape === 'lasso') &&
               pos.points &&
               pos.points.length >= 3
             ) {
-              const step = pos.points.length > 32 ? Math.max(1, Math.floor(pos.points.length / 20)) : 1;
-              for (let idx = 0; idx < pos.points.length; idx += step) {
-                if (Math.hypot(pt.x - pos.points[idx].x, pt.y - pos.points[idx].y) <= 16) {
+              for (let idx = 0; idx < pos.points.length; idx++) {
+                if (Math.hypot(pt.x - pos.points[idx].x, pt.y - pos.points[idx].y) <= 18) {
                   setCursorStyle('cursor-pointer');
                   return;
                 }
@@ -744,7 +770,11 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
         }
       }
 
-      onUpdateTrackKeyframe(trackId, newBox);
+      const normalizedPoints = newBox.points && newBox.points.length >= 3
+        ? absoluteToNormalizedPoints(newBox, newBox.points, NORMALIZED_POINT_COUNT)
+        : undefined;
+
+      onUpdateTrackKeyframe(trackId, { ...newBox, normalizedPoints });
       transformRef.current = null;
       return;
     }
@@ -793,6 +823,15 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
         const width = Math.max(24, maxX - minX);
         const height = Math.max(24, maxY - minY);
 
+        const box = {
+          x: minX,
+          y: minY,
+          width,
+          height,
+        };
+        const resampledPoints = resampleClosedPoints(drawingState.points, NORMALIZED_POINT_COUNT);
+        const normalizedPoints = absoluteToNormalizedPoints(box, resampledPoints, NORMALIZED_POINT_COUNT);
+
         const newTrack: MosaicTrack = {
           id: `track-${Date.now()}`,
           name: `フリー囲み #${tracks.length + 1}`,
@@ -806,11 +845,9 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
           keyframes: [
             {
               time: currentTime,
-              x: minX,
-              y: minY,
-              width,
-              height,
-              points: drawingState.points,
+              ...box,
+              points: resampledPoints,
+              normalizedPoints,
             },
           ],
         };
@@ -828,6 +865,14 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
         const minY = Math.max(0, Math.min(...ys) - pad);
         const maxY = Math.max(...ys) + pad;
 
+        const box = {
+          x: minX,
+          y: minY,
+          width: Math.max(28, maxX - minX),
+          height: Math.max(28, maxY - minY),
+        };
+        const normalizedPoints = absoluteToNormalizedPoints(box, drawingState.points, NORMALIZED_POINT_COUNT);
+
         const newTrack: MosaicTrack = {
           id: `track-${Date.now()}`,
           name: `ブラシ #${tracks.length + 1}`,
@@ -841,11 +886,9 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
           keyframes: [
             {
               time: currentTime,
-              x: minX,
-              y: minY,
-              width: Math.max(28, maxX - minX),
-              height: Math.max(28, maxY - minY),
+              ...box,
               points: drawingState.points,
+              normalizedPoints,
             },
           ],
         };
@@ -864,6 +907,15 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
     const minY = Math.min(...ys);
     const maxY = Math.max(...ys);
 
+    const box = {
+      x: minX,
+      y: minY,
+      width: Math.max(24, maxX - minX),
+      height: Math.max(24, maxY - minY),
+    };
+    const resampledPoints = resampleClosedPoints(points, NORMALIZED_POINT_COUNT);
+    const normalizedPoints = absoluteToNormalizedPoints(box, resampledPoints, NORMALIZED_POINT_COUNT);
+
     const newTrack: MosaicTrack = {
       id: `track-${Date.now()}`,
       name: `ポリゴン #${tracks.length + 1}`,
@@ -877,11 +929,9 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
       keyframes: [
         {
           time: currentTime,
-          x: minX,
-          y: minY,
-          width: Math.max(24, maxX - minX),
-          height: Math.max(24, maxY - minY),
-          points,
+          ...box,
+          points: resampledPoints,
+          normalizedPoints,
         },
       ],
     };

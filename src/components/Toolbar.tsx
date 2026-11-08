@@ -61,7 +61,7 @@ export const Toolbar: React.FC<ToolbarProps> = ({
   isAIDetecting,
   aiSensitivity = 'strict',
   onUpdateAiSensitivity,
-  aiTarget = 'face',
+  aiTarget = 'body',
   onUpdateAiTarget,
   onDetectAndBlurBackground,
   isPreviewMode,

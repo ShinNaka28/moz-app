@@ -5,14 +5,15 @@ import { VideoCanvas } from './components/VideoCanvas';
 import { Timeline } from './components/Timeline';
 import { PersonListPanel } from './components/PersonListPanel';
 import { ExportModal } from './components/ExportModal';
-import { EditorMode, MosaicTrack, MosaicType, Point, Keyframe } from './types';
-import { Film, ListFilter, Clock, Play, Pause, RotateCcw, Trash2, Crosshair, Sparkles } from 'lucide-react';
-import { initFaceDetector, initPersonSegmenter, detectFacesSafely, segmentPersonSafely, resampleClosedPolygon, BODY_CONTOUR_POINTS, updatePersonTracks, expandBoxWithMargin, estimateBodyBoxFromFace, createBodySilhouettePolygon, isValidFaceDetection, FaceFilterOptions } from './utils/aiDetector';
+import { EditorMode, MosaicTrack, MosaicType, Point, Keyframe, NormalizedPoint } from './types';
+import { Film, ListFilter, Clock, Play, Pause, RotateCcw, Trash2, Crosshair, Sparkles, AlertTriangle, X } from 'lucide-react';
+import { initFaceDetector, initPersonSegmenter, detectFacesSafely, segmentPersonSafely, resampleClosedPolygon, BODY_CONTOUR_POINTS, updatePersonTracks, expandBoxWithMargin, estimateBodyBoxFromFace, createBodySilhouettePolygon, isValidFaceDetection, FaceFilterOptions, GatekeeperContext, resetAnalysisState } from './utils/aiDetector';
 import { exportMosaicVideo, ExportProgress, saveOrShareBlob } from './utils/videoExporter';
 import { generateDemoVideoBlob } from './utils/sampleGenerator';
 import { renderTrackMosaic, renderInverseMosaic, ProtectedRegion } from './utils/mosaicRenderer';
 import { extractFeaturePoints, toGrayscale, trackBox, interpolateKeyframes } from './utils/tracking';
 import { requestScreenWakeLock, releaseScreenWakeLock, seekVideoSafely } from './utils/wakeLock';
+import { getClampedDimensions, absoluteToNormalizedPoints, NORMALIZED_POINT_COUNT, createDefaultNormalizedPoints, normalizedToAbsolutePoints, isBoxTouchingBorder } from './utils/geometry';
 
 export const App: React.FC = () => {
   // メディア状態
@@ -20,6 +21,7 @@ export const App: React.FC = () => {
   const [mediaUrl, setMediaUrl] = useState<string | null>(null);
   const [isImage, setIsImage] = useState<boolean>(false);
   const [duration, setDuration] = useState<number>(0);
+  const [durationWarning, setDurationWarning] = useState<boolean>(false);
   const [currentTime, setCurrentTime] = useState<number>(0);
   const [isPlaying, setIsPlaying] = useState<boolean>(false);
 
@@ -39,7 +41,7 @@ export const App: React.FC = () => {
   const [isAIDetecting, setIsAIDetecting] = useState<boolean>(false);
   const [aiDetectProgress, setAiDetectProgress] = useState<number>(0);
   const [aiSensitivity, setAiSensitivity] = useState<'strict' | 'standard' | 'high'>('strict');
-  const [aiTarget, setAiTarget] = useState<'face' | 'body'>('face');
+  const [aiTarget, setAiTarget] = useState<'face' | 'body'>('body');
   const [isTrackingProcessing, setIsTrackingProcessing] = useState<boolean>(false);
   const [exportProgress, setExportProgress] = useState<ExportProgress | null>(null);
   const [exportedBlob, setExportedBlob] = useState<Blob | null>(null);
@@ -66,6 +68,7 @@ export const App: React.FC = () => {
     setSelectedTrackId(null);
     setCurrentTime(0);
     setIsPlaying(false);
+    setDurationWarning(false);
 
     if (isImg) {
       setDuration(1);
@@ -86,6 +89,7 @@ export const App: React.FC = () => {
       setSelectedTrackId(null);
       setCurrentTime(0);
       setIsPlaying(false);
+      setDurationWarning(false);
     } catch (e) {
       console.error('Demo video generation failed:', e);
       alert('デモ動画の生成に失敗しました');
@@ -114,7 +118,19 @@ export const App: React.FC = () => {
   // ビデオのメタデータ読み込み
   const handleLoadedMetadata = () => {
     if (videoRef.current) {
-      setDuration(videoRef.current.duration || 1);
+      const videoDur = videoRef.current.duration || 1;
+      setDuration(videoDur);
+
+      // 5分（300秒）を超える長尺動画に対する安全装置（OOMクラッシュ防止警告）
+      if (videoDur > 300) {
+        setDurationWarning(true);
+        alert(
+          'ブラウザのメモリ制限のため、5分以上の動画は処理中に強制終了する可能性があります。短い動画にカットしてご利用ください'
+        );
+      } else {
+        setDurationWarning(false);
+      }
+
       // スマホブラウザで初期フレームが未デコード(readyState < 2)のままになるのを防ぐため微小シークで先頭フレームをデコード
       if (videoRef.current.readyState < 2 && videoRef.current.currentTime === 0) {
         try {
@@ -250,12 +266,15 @@ export const App: React.FC = () => {
 
   const handleUpdateTrackKeyframe = (
     trackId: string,
-    box: { x: number; y: number; width: number; height: number; points?: Point[] },
+    box: { x: number; y: number; width: number; height: number; points?: Point[]; normalizedPoints?: NormalizedPoint[] },
     isPlaybackTracking: boolean = false
   ) => {
     setTracks((prev) =>
       prev.map((t) => {
         if (t.id !== trackId) return t;
+
+        const norm = box.normalizedPoints || (box.points && box.points.length >= 3 ? absoluteToNormalizedPoints(box, box.points, NORMALIZED_POINT_COUNT) : undefined);
+        const points = norm ? normalizedToAbsolutePoints(box, norm) : box.points;
 
         // 1. キーフレームが1個以下のトラック（手動囲み直後や静止画）は、そのキーフレームを直接更新
         if (t.keyframes.length <= 1) {
@@ -272,142 +291,86 @@ export const App: React.FC = () => {
                 y: box.y,
                 width: box.width,
                 height: box.height,
-                points: box.points,
+                points,
+                normalizedPoints: norm,
               },
             ],
           };
         }
 
-        // 2. 再生中の自動追従による更新の場合（現在時刻のキーフレームのみ追加/更新）
+        // 2. 再生中の自動追従による更新の場合（現在時刻の近傍キーフレームを更新）
         if (isPlaybackTracking) {
-          const filtered = t.keyframes.filter((k) => Math.abs(k.time - currentTime) >= 0.04);
+          const filtered = t.keyframes.filter((k) => Math.abs(k.time - currentTime) >= 0.05);
           return {
             ...t,
             keyframes: [
               ...filtered,
               {
                 time: currentTime,
-                ...box,
+                x: box.x,
+                y: box.y,
+                width: box.width,
+                height: box.height,
+                points,
+                normalizedPoints: norm,
               },
             ].sort((a, b) => a.time - b.time),
           };
         }
 
-        // 3. ユーザーが手動でドラッグ移動・リサイズ・頂点編集した場合：
-        // 高密度キーフレーム(0.08秒間隔)が存在するトラックでも指を離した瞬間に元の位置や元の形へ戻らないよう、
-        // 現在位置からの移動・拡縮差分および各頂点の個別調整量(vertexDeltas)を全キーフレームに滑らかに適用する
-        const curPos = interpolateKeyframes(t.keyframes, currentTime) || t.keyframes[0];
-        const dx = box.x - curPos.x;
-        const dy = box.y - curPos.y;
-        const scaleX = curPos.width > 0 ? box.width / curPos.width : 1;
-        const scaleY = curPos.height > 0 ? box.height / curPos.height : 1;
-
-        const hasMatchingPoints =
-          box.points &&
-          curPos.points &&
-          box.points.length > 0 &&
-          box.points.length === curPos.points.length;
-
-        const pointDeltas = hasMatchingPoints
-          ? box.points!.map((bp, idx) => ({
-              dx: bp.x - curPos.points![idx].x,
-              dy: bp.y - curPos.points![idx].y,
-            }))
-          : null;
-
-        const shiftedKeyframes = t.keyframes
-          .filter((k) => Math.abs(k.time - currentTime) >= 0.12)
-          .map((k) => {
-            if (pointDeltas && k.points && k.points.length === pointDeltas.length) {
-              const updatedPts = k.points.map((p, idx) => ({
-                x: p.x + pointDeltas[idx].dx,
-                y: p.y + pointDeltas[idx].dy,
-              }));
-              let minX = updatedPts[0].x;
-              let maxX = updatedPts[0].x;
-              let minY = updatedPts[0].y;
-              let maxY = updatedPts[0].y;
-              for (const up of updatedPts) {
-                if (up.x < minX) minX = up.x;
-                if (up.x > maxX) maxX = up.x;
-                if (up.y < minY) minY = up.y;
-                if (up.y > maxY) maxY = up.y;
-              }
-              return {
-                ...k,
-                x: minX,
-                y: minY,
-                width: Math.max(15, maxX - minX),
-                height: Math.max(15, maxY - minY),
-                points: updatedPts,
-              };
-            }
-
-            const newW = Math.max(15, k.width * scaleX);
-            const newH = Math.max(15, k.height * scaleY);
-            const newX = k.x + dx;
-            const newY = k.y + dy;
-            return {
-              ...k,
-              x: newX,
-              y: newY,
-              width: newW,
-              height: newH,
-              points: k.points
-                ? k.points.map((p) => ({
-                    x: newX + (p.x - k.x) * scaleX,
-                    y: newY + (p.y - k.y) * scaleY,
-                  }))
-                : undefined,
-            };
-          });
-
-        shiftedKeyframes.push({
-          time: currentTime,
-          x: box.x,
-          y: box.y,
-          width: box.width,
-          height: box.height,
-          points: box.points,
-        });
-        shiftedKeyframes.sort((a, b) => a.time - b.time);
+        // 3. ユーザーが手動で外枠操作・32頂点ドラッグ変形した場合：
+        // 現在時刻 currentTime に「キーフレーム」として記録する。
+        // 近傍（0.08秒以内）の既存キーフレームがあれば更新し、なければ新規追加。
+        // 2つのキーフレーム間（例: 10F目と40F目）は interpolateKeyframes の Lerp で自動変形し、
+        // 後続にキーフレームがない場合は直前のキーフレームの状態を維持（ホールド）します。
+        const filtered = t.keyframes.filter((k) => Math.abs(k.time - currentTime) >= 0.08);
+        const newKeyframes = [
+          ...filtered,
+          {
+            time: currentTime,
+            x: box.x,
+            y: box.y,
+            width: box.width,
+            height: box.height,
+            points,
+            normalizedPoints: norm,
+          },
+        ].sort((a, b) => a.time - b.time);
 
         return {
           ...t,
           trackingData: t.trackingData
             ? { ...t.trackingData, isOutOfFrame: false, featurePoints: undefined }
             : undefined,
-          keyframes: shiftedKeyframes,
+          keyframes: newKeyframes,
         };
       })
     );
   };
 
-  // 矩形枠(rect)を20頂点のポリゴン枠に変換して、身体のラインに沿うよう手動で頂点編集できるようにする
+  // 矩形枠(rect)を固定32頂点の正規化ポリゴン枠に変換し、身体のラインに沿うよう手動で頂点編集できるようにする
   const handleConvertTrackToPolygon = (trackId: string) => {
     setTracks((prev) =>
       prev.map((t) => {
         if (t.id !== trackId) return t;
         const convertedKeyframes = t.keyframes.map((k) => {
-          if (k.points && k.points.length >= 3) {
-            return {
-              ...k,
-              points: resampleClosedPolygon(k.points, BODY_CONTOUR_POINTS),
-            };
+          const box = { x: k.x, y: k.y, width: k.width, height: k.height };
+          let normPoints = k.normalizedPoints;
+          let points = k.points;
+
+          if (!normPoints || normPoints.length !== NORMALIZED_POINT_COUNT) {
+            if (points && points.length >= 3) {
+              normPoints = absoluteToNormalizedPoints(box, points, NORMALIZED_POINT_COUNT);
+            } else {
+              normPoints = createDefaultNormalizedPoints(NORMALIZED_POINT_COUNT);
+            }
           }
-          const rectPerimeter: Point[] = [
-            { x: k.x + k.width * 0.5, y: k.y },
-            { x: k.x + k.width, y: k.y },
-            { x: k.x + k.width, y: k.y + k.height * 0.5 },
-            { x: k.x + k.width, y: k.y + k.height },
-            { x: k.x + k.width * 0.5, y: k.y + k.height },
-            { x: k.x, y: k.y + k.height },
-            { x: k.x, y: k.y + k.height * 0.5 },
-            { x: k.x, y: k.y },
-          ];
+          points = normalizedToAbsolutePoints(box, normPoints);
+
           return {
             ...k,
-            points: resampleClosedPolygon(rectPerimeter, BODY_CONTOUR_POINTS),
+            points,
+            normalizedPoints: normPoints,
           };
         });
         return {
@@ -447,8 +410,9 @@ export const App: React.FC = () => {
 
     const video = videoRef.current;
     const origTime = video.currentTime;
-    const width = video.videoWidth;
-    const height = video.videoHeight;
+    const rawW = video.videoWidth || 640;
+    const rawH = video.videoHeight || 480;
+    const { width, height } = getClampedDimensions(rawW, rawH, 1280);
 
     const offCanvas = document.createElement('canvas');
     offCanvas.width = width;
@@ -470,6 +434,8 @@ export const App: React.FC = () => {
       let curBox = { x: initialPos.x, y: initialPos.y, width: initialPos.width, height: initialPos.height };
       let featPoints = extractFeaturePoints(prevGray, width, height, curBox, 36);
 
+      const initialNorm = initialPos.normalizedPoints || (initialPos.points ? absoluteToNormalizedPoints(curBox, initialPos.points, NORMALIZED_POINT_COUNT) : undefined);
+
       const generatedKeyframes: Keyframe[] = [
         {
           time: startT,
@@ -478,6 +444,7 @@ export const App: React.FC = () => {
           width: curBox.width,
           height: curBox.height,
           points: initialPos.points,
+          normalizedPoints: initialNorm,
         },
       ];
 
@@ -508,6 +475,7 @@ export const App: React.FC = () => {
             x: p.x + (curBox.x - initialPos.x),
             y: p.y + (curBox.y - initialPos.y),
           })),
+          normalizedPoints: initialNorm,
         });
       }
 
@@ -547,10 +515,38 @@ export const App: React.FC = () => {
 
         if (isImage && imageRef.current) {
           const img = imageRef.current;
-          const res = await segmentPersonSafely(img, segmenter);
+          const rawW = img.naturalWidth || 640;
+          const rawH = img.naturalHeight || 480;
+          const { width: workW, height: workH } = getClampedDimensions(rawW, rawH, 1280);
+          const scaleX = workW / rawW;
+          const scaleY = workH / rawH;
+
+          const gateContext: GatekeeperContext = {
+            existingTracks: tracks.map((t) => ({
+              id: t.id,
+              box: t.keyframes[0] || { x: 0, y: 0, width: 0, height: 0 },
+              hasManualKeyframe: t.keyframes.length > 1,
+            })),
+            origWidth: workW,
+            origHeight: workH,
+          };
+
+          const res = await segmentPersonSafely(img, segmenter, gateContext);
           segmenter = res.activeSegmenter;
 
           if (res.contour && res.contour.points.length >= 3) {
+            const scaledBox = {
+              x: Math.round(res.contour.bounds.x * scaleX),
+              y: Math.round(res.contour.bounds.y * scaleY),
+              width: Math.round(res.contour.bounds.width * scaleX),
+              height: Math.round(res.contour.bounds.height * scaleY),
+            };
+            const scaledPoints = res.contour.points.map((p) => ({
+              x: p.x * scaleX,
+              y: p.y * scaleY,
+            }));
+            const normPoints = res.contour.normalizedPoints || absoluteToNormalizedPoints(scaledBox, scaledPoints, NORMALIZED_POINT_COUNT);
+
             const newTrack: MosaicTrack = {
               id: `ai-body-${Date.now()}`,
               name: 'AI人物 (輪郭)',
@@ -564,11 +560,9 @@ export const App: React.FC = () => {
               keyframes: [
                 {
                   time: 0,
-                  x: res.contour.bounds.x,
-                  y: res.contour.bounds.y,
-                  width: res.contour.bounds.width,
-                  height: res.contour.bounds.height,
-                  points: res.contour.points,
+                  ...scaledBox,
+                  points: scaledPoints,
+                  normalizedPoints: normPoints,
                 },
               ],
               aiTarget: 'body',
@@ -587,49 +581,234 @@ export const App: React.FC = () => {
           const video = videoRef.current;
           const origTime = video.currentTime;
           const totalDuration = video.duration || 5;
-          const step = 0.08;
+          const rawW = video.videoWidth || 640;
+          const rawH = video.videoHeight || 480;
+          const { width: workW, height: workH } = getClampedDimensions(rawW, rawH, 1280);
+          const scaleX = workW / rawW;
+          const scaleY = workH / rawH;
+
+          // キーフレーム補間(Lerp)が滑らかに繋ぐため、スマホでも超高速かつ低負荷な 0.35秒サンプリング
+          const step = 0.35;
           const totalSteps = Math.max(1, Math.floor(totalDuration / step));
 
-          const keyframes: Keyframe[] = [];
+          resetAnalysisState();
+          const createdTracks: MosaicTrack[] = [];
+          let currentKeyframes: Keyframe[] = [];
+          let lastValidBox: { x: number; y: number; width: number; height: number } | undefined = undefined;
+          let prevBox: { x: number; y: number; width: number; height: number } | undefined = undefined;
+          let pendingKeyframes: Keyframe[] = [];
+          let consecutiveHits = 0;
+          let missedDuration = 0; // 見失った継続時間（秒）
 
           for (let i = 0; i <= totalSteps; i++) {
             const sampleTime = Math.min(totalDuration, i * step);
             await seekVideoSafely(video, sampleTime);
             setAiDetectProgress(Math.round((i / totalSteps) * 100));
 
-            const res = await segmentPersonSafely(video, segmenter);
+            const gateContext: GatekeeperContext = {
+              prevBox,
+              existingTracks: tracks.map((t) => ({
+                id: t.id,
+                box: t.keyframes[0] || { x: 0, y: 0, width: 0, height: 0 },
+                hasManualKeyframe: t.keyframes.length > 1,
+              })),
+              origWidth: workW,
+              origHeight: workH,
+            };
+
+            const res = await segmentPersonSafely(video, segmenter, gateContext);
             segmenter = res.activeSegmenter;
 
             if (res.contour && res.contour.points.length >= 3) {
-              keyframes.push({
+              const scaledBox = {
+                x: Math.round(res.contour.bounds.x * scaleX),
+                y: Math.round(res.contour.bounds.y * scaleY),
+                width: Math.round(res.contour.bounds.width * scaleX),
+                height: Math.round(res.contour.bounds.height * scaleY),
+              };
+              const scaledPoints = res.contour.points.map((p) => ({
+                x: p.x * scaleX,
+                y: p.y * scaleY,
+              }));
+              const normPoints = res.contour.normalizedPoints || absoluteToNormalizedPoints(scaledBox, scaledPoints, NORMALIZED_POINT_COUNT);
+
+              // 座標のスムージング（EMA補間 + 円周位相アライメント）
+              // 頂点インデックスの位相ズレによるシルエットの潰れ・楕円化を完全に防ぎつつ、ジッターのみを自然に抑制
+              const prevKf = currentKeyframes.length > 0
+                ? currentKeyframes[currentKeyframes.length - 1]
+                : pendingKeyframes.length > 0
+                ? pendingKeyframes[pendingKeyframes.length - 1]
+                : null;
+
+              let finalBox = scaledBox;
+              let finalPoints = scaledPoints;
+              let finalNormPoints = normPoints;
+
+              if (prevKf) {
+                // 外枠の適度なスムージング (ジッター防止)
+                const bPrevW = 0.35;
+                const bCurrW = 0.65;
+                finalBox = {
+                  x: Math.round(prevKf.x * bPrevW + scaledBox.x * bCurrW),
+                  y: Math.round(prevKf.y * bPrevW + scaledBox.y * bCurrW),
+                  width: Math.round(prevKf.width * bPrevW + scaledBox.width * bCurrW),
+                  height: Math.round(prevKf.height * bPrevW + scaledBox.height * bCurrW),
+                };
+
+                // 頂点の最適な円周位相（位相ズレ最小化）
+                if (prevKf.normalizedPoints && prevKf.normalizedPoints.length === normPoints.length) {
+                  const N = normPoints.length;
+                  let bestShift = 0;
+                  let bestDist = Infinity;
+
+                  for (let shift = -3; shift <= 3; shift++) {
+                    let dSum = 0;
+                    for (let j = 0; j < N; j++) {
+                      const curNp = normPoints[(j + shift + N) % N];
+                      const prevNp = prevKf.normalizedPoints[j];
+                      const du = curNp.u - prevNp.u;
+                      const dv = curNp.v - prevNp.v;
+                      dSum += du * du + dv * dv;
+                    }
+                    if (dSum < bestDist) {
+                      bestDist = dSum;
+                      bestShift = shift;
+                    }
+                  }
+
+                  // 最適位相に回転
+                  const alignedNorm = normPoints.map((_, idx) => normPoints[(idx + bestShift + N) % N]);
+
+                  // 身体の凹凸（くびれ・首・腕）を100%保ちつつジッターのみ抑制 (prev 0.3, curr 0.7)
+                  const pPrevW = 0.30;
+                  const pCurrW = 0.70;
+                  finalNormPoints = alignedNorm.map((np, idx) => ({
+                    u: Number((prevKf.normalizedPoints![idx].u * pPrevW + np.u * pCurrW).toFixed(4)),
+                    v: Number((prevKf.normalizedPoints![idx].v * pPrevW + np.v * pCurrW).toFixed(4)),
+                  }));
+
+                  finalPoints = normalizedToAbsolutePoints(finalBox, finalNormPoints);
+                }
+              }
+
+              const kf: Keyframe = {
                 time: sampleTime,
-                x: res.contour.bounds.x,
-                y: res.contour.bounds.y,
-                width: res.contour.bounds.width,
-                height: res.contour.bounds.height,
-                points: res.contour.points,
-              });
+                ...finalBox,
+                points: finalPoints,
+                normalizedPoints: finalNormPoints,
+              };
+
+              consecutiveHits++;
+              prevBox = finalBox;
+              lastValidBox = finalBox;
+              missedDuration = 0;
+
+              if (currentKeyframes.length > 0) {
+                // すでに確定済みのトラックがある場合は即座に追加（継続パス）
+                currentKeyframes.push(kf);
+              } else {
+                // 新規検出時は単発ノイズを防ぐため一時バッファに保持
+                pendingKeyframes.push(kf);
+                if (consecutiveHits >= 3) {
+                  // 3フレーム連続でゲートキーパーを通過した時点で正式採用！
+                  currentKeyframes.push(...pendingKeyframes);
+                  pendingKeyframes = [];
+                }
+              }
+            } else {
+              consecutiveHits = 0;
+              pendingKeyframes = []; // 3フレーム未満で途切れた単発ノイズは破棄
+
+              if (currentKeyframes.length > 0) {
+                missedDuration += step;
+
+                // 3. 手動キーフレームの「絶対保護」（タイムアウト・退場の例外）
+                // 現在時刻より未来に手動キーフレームが存在する場合は、何フレーム見失おうが絶対に破棄せず補間を継続
+                const hasFutureManualKeyframe = tracks.some((t) =>
+                  t.keyframes.some((k) => k.time > sampleTime)
+                );
+
+                if (!hasFutureManualKeyframe) {
+                  // 1. 画面境界からの「退場」判定（即時破棄）
+                  // 直前フレームの枠が画面端（20px以内）に接していた場合は「画面外への退場」と確定
+                  const isBorder = lastValidBox
+                    ? isBoxTouchingBorder(lastValidBox, workW, workH, 20)
+                    : false;
+
+                  if (isBorder) {
+                    // ホールド処理を即座に打ち切り、トラックを確定終了してゴースト枠を完全排除
+                    const lastKf = currentKeyframes[currentKeyframes.length - 1];
+                    createdTracks.push({
+                      id: `ai-body-${Date.now()}-${createdTracks.length}`,
+                      name: `AI人物 (体ライン) #${createdTracks.length + 1}`,
+                      type: 'ai',
+                      shape: 'polygon',
+                      enabled: true,
+                      mosaicType: 'pixel',
+                      strength: 14,
+                      startTime: currentKeyframes[0].time,
+                      endTime: lastKf.time + 0.05,
+                      keyframes: [...currentKeyframes],
+                      aiTarget: 'body',
+                    });
+
+                    // 状態をリセットし、次の人物登場時に新規枠として作成
+                    currentKeyframes = [];
+                    lastValidBox = undefined;
+                    prevBox = undefined;
+                    missedDuration = 0;
+                  } else if (missedDuration >= 1.0) {
+                    // 2. 画面中央での「完全見失い」タイムアウト（連続約1秒 / 30フレームで遅延破棄）
+                    const lastKf = currentKeyframes[currentKeyframes.length - 1];
+                    createdTracks.push({
+                      id: `ai-body-${Date.now()}-${createdTracks.length}`,
+                      name: `AI人物 (体ライン) #${createdTracks.length + 1}`,
+                      type: 'ai',
+                      shape: 'polygon',
+                      enabled: true,
+                      mosaicType: 'pixel',
+                      strength: 14,
+                      startTime: currentKeyframes[0].time,
+                      endTime: Math.min(totalDuration, lastKf.time + 1.0),
+                      keyframes: [...currentKeyframes],
+                      aiTarget: 'body',
+                    });
+
+                    currentKeyframes = [];
+                    lastValidBox = undefined;
+                    prevBox = undefined;
+                    missedDuration = 0;
+                  }
+                }
+              }
             }
           }
 
           await seekVideoSafely(video, origTime);
 
-          if (keyframes.length >= 1) {
-            const newTrack: MosaicTrack = {
-              id: `ai-body-${Date.now()}`,
-              name: 'AI人物 (体ライン)',
+          // ループ終了時にアクティブなトラックが残っていれば確定
+          if (currentKeyframes.length >= 1) {
+            const lastKf = currentKeyframes[currentKeyframes.length - 1];
+            const isBorder = lastValidBox ? isBoxTouchingBorder(lastValidBox, workW, workH, 20) : false;
+            const trackEndTime = isBorder ? lastKf.time + 0.05 : Math.min(totalDuration, lastKf.time + 1.0);
+            createdTracks.push({
+              id: `ai-body-${Date.now()}-${createdTracks.length}`,
+              name: `AI人物 (体ライン) #${createdTracks.length + 1}`,
               type: 'ai',
               shape: 'polygon',
               enabled: true,
               mosaicType: 'pixel',
               strength: 14,
-              startTime: 0,
-              endTime: Math.max(totalDuration, keyframes[keyframes.length - 1].time + 0.3),
-              keyframes,
+              startTime: currentKeyframes[0].time,
+              endTime: trackEndTime,
+              keyframes: [...currentKeyframes],
               aiTarget: 'body',
-            };
-            setTracks((prev) => [...prev, newTrack]);
-            setSelectedTrackId(newTrack.id);
+            });
+          }
+
+          if (createdTracks.length >= 1) {
+            setTracks((prev) => [...prev, ...createdTracks]);
+            setSelectedTrackId(createdTracks[0].id);
             if (autoEnableInverse) {
               setIsInverseMosaic(true);
             }
@@ -673,8 +852,11 @@ export const App: React.FC = () => {
 
     if (isImage && imageRef.current) {
       const img = imageRef.current;
-      const width = img.naturalWidth;
-      const height = img.naturalHeight;
+      const rawW = img.naturalWidth || 640;
+      const rawH = img.naturalHeight || 480;
+      const { width: workW, height: workH } = getClampedDimensions(rawW, rawH, 1280);
+      const scaleX = workW / rawW;
+      const scaleY = workH / rawH;
 
       const result = await detectFacesSafely(img, detector, confidence);
       detector = result.activeDetector;
@@ -691,11 +873,20 @@ export const App: React.FC = () => {
           height: bb ? bb.height : 50,
         };
         const finalBox = targetMode === 'body'
-          ? estimateBodyBoxFromFace(rawBox, width, height)
-          : expandBoxWithMargin(rawBox, 0.35, width, height);
+          ? estimateBodyBoxFromFace(rawBox, rawW, rawH)
+          : expandBoxWithMargin(rawBox, 0.35, rawW, rawH);
         const bodyPoints = targetMode === 'body'
-          ? createBodySilhouettePolygon(finalBox, width, height)
+          ? createBodySilhouettePolygon(finalBox, rawW, rawH)
           : undefined;
+
+        const scaledBox = {
+          x: Math.round(finalBox.x * scaleX),
+          y: Math.round(finalBox.y * scaleY),
+          width: Math.round(finalBox.width * scaleX),
+          height: Math.round(finalBox.height * scaleY),
+        };
+        const scaledPoints = bodyPoints ? bodyPoints.map((p) => ({ x: p.x * scaleX, y: p.y * scaleY })) : undefined;
+        const normPoints = scaledPoints ? absoluteToNormalizedPoints(scaledBox, scaledPoints, NORMALIZED_POINT_COUNT) : undefined;
 
         return {
           id: `ai-person-${Date.now()}-${idx}`,
@@ -707,7 +898,7 @@ export const App: React.FC = () => {
           strength: 14,
           startTime: 0,
           endTime: 1,
-          keyframes: [{ time: 0, ...finalBox, points: bodyPoints }],
+          keyframes: [{ time: 0, ...scaledBox, points: scaledPoints, normalizedPoints: normPoints }],
           aiTarget: targetMode,
         };
       });
@@ -722,9 +913,12 @@ export const App: React.FC = () => {
       const video = videoRef.current;
       const origTime = video.currentTime;
       const totalDuration = video.duration || 5;
-      const videoWidth = video.videoWidth || 640;
-      const videoHeight = video.videoHeight || 480;
-      const step = 0.08;
+      const rawW = video.videoWidth || 640;
+      const rawH = video.videoHeight || 480;
+      const { width: workW, height: workH } = getClampedDimensions(rawW, rawH, 1280);
+      const scaleX = workW / rawW;
+      const scaleY = workH / rawH;
+      const step = 0.35;
       const totalSteps = Math.max(1, Math.floor(totalDuration / step));
 
       let currentDetectedPersons: any[] = [];
@@ -750,7 +944,7 @@ export const App: React.FC = () => {
             width: bb.width,
             height: bb.height,
           };
-          const padded = expandBoxWithMargin(rawBox, 0.35, videoWidth, videoHeight);
+          const padded = expandBoxWithMargin(rawBox, 0.35, rawW, rawH);
           return {
             ...padded,
             rawFaceBox: rawBox,
@@ -771,19 +965,26 @@ export const App: React.FC = () => {
             personScoresMap.set(p.trackId, []);
           }
           const boxToStore = targetMode === 'body'
-            ? estimateBodyBoxFromFace(p.box, videoWidth, videoHeight)
+            ? estimateBodyBoxFromFace(p.box, rawW, rawH)
             : p.box;
           const bodyPoints = targetMode === 'body'
-            ? createBodySilhouettePolygon(boxToStore, videoWidth, videoHeight)
+            ? createBodySilhouettePolygon(boxToStore, rawW, rawH)
             : undefined;
+
+          const scaledBox = {
+            x: Math.round(boxToStore.x * scaleX),
+            y: Math.round(boxToStore.y * scaleY),
+            width: Math.round(boxToStore.width * scaleX),
+            height: Math.round(boxToStore.height * scaleY),
+          };
+          const scaledPoints = bodyPoints ? bodyPoints.map((pt) => ({ x: pt.x * scaleX, y: pt.y * scaleY })) : undefined;
+          const normPoints = scaledPoints ? absoluteToNormalizedPoints(scaledBox, scaledPoints, NORMALIZED_POINT_COUNT) : undefined;
 
           personKeyframesMap.get(p.trackId)!.push({
             time: sampleTime,
-            x: boxToStore.x,
-            y: boxToStore.y,
-            width: boxToStore.width,
-            height: boxToStore.height,
-            points: bodyPoints,
+            ...scaledBox,
+            points: scaledPoints,
+            normalizedPoints: normPoints,
           });
           personScoresMap.get(p.trackId)!.push(p.score);
         }
@@ -836,6 +1037,13 @@ export const App: React.FC = () => {
   // エクスポート実行
   const handleExport = async () => {
     if (!mediaFile) return;
+
+    if (!isImage && videoRef.current && videoRef.current.duration > 300) {
+      const proceed = window.confirm(
+        'ブラウザのメモリ制限のため、5分以上の動画は処理中に強制終了する可能性があります。短い動画にカットしてご利用ください。\n\nこのままエクスポートを続行しますか？'
+      );
+      if (!proceed) return;
+    }
 
     setIsExportModalOpen(true);
     setExportedBlob(null);
@@ -987,6 +1195,25 @@ export const App: React.FC = () => {
         onRunTrackingForSelectedTrack={() => selectedTrackId && runTrackingForTrack(selectedTrackId)}
         isTrackingProcessing={isTrackingProcessing}
       />
+
+      {/* 長時間動画（5分以上）のメモリ警告バナー */}
+      {durationWarning && (
+        <div className="bg-amber-950/90 border-b border-amber-500/60 px-3 py-2 flex items-center justify-between gap-3 text-xs text-amber-200 z-30 shadow-md">
+          <div className="flex items-center gap-2">
+            <AlertTriangle size={18} className="text-amber-400 shrink-0" />
+            <span>
+              <strong className="text-amber-300">メモリ制限警告:</strong> 動画が5分（{Math.floor(duration / 60)}分{Math.floor(duration % 60)}秒）を超えています。ブラウザのメモリ制限のため、5分以上の動画は処理中に強制終了する可能性があります。短い動画にカットしてご利用ください。
+            </span>
+          </div>
+          <button
+            onClick={() => setDurationWarning(false)}
+            className="text-amber-400 hover:text-white p-1 rounded shrink-0 transition"
+            title="警告を閉じる"
+          >
+            <X size={16} />
+          </button>
+        </div>
+      )}
 
       {/* AI顔検出・自動追従解析中のスリープ防止＆進捗ステータスバー */}
       {(isAIDetecting || isTrackingProcessing) && (

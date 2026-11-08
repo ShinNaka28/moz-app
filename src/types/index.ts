@@ -7,14 +7,20 @@ export interface Point {
   y: number;
 }
 
+export interface NormalizedPoint {
+  u: number; // 0.0〜1.0 (外枠の左端=0.0, 右端=1.0)
+  v: number; // 0.0〜1.0 (外枠の上端=0.0, 下端=1.0)
+}
+
 export interface Keyframe {
   time: number; // 秒
-  x: number;
-  y: number;
-  width: number;
-  height: number;
+  x: number; // 外枠 左上 X (作業解像度基準)
+  y: number; // 外枠 左上 Y (作業解像度基準)
+  width: number; // 外枠 幅
+  height: number; // 外枠 高さ
   rotation?: number;
-  points?: Point[]; // ブラシやポリゴンの場合
+  normalizedPoints?: NormalizedPoint[]; // 固定32頂点の相対座標(0.0〜1.0)
+  points?: Point[]; // 互換性＆即時描画用の絶対座標(キャッシュ)
 }
 
 export interface MosaicTrack {

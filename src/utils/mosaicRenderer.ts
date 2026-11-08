@@ -1,4 +1,5 @@
 import { MosaicType, MosaicTrack, Point } from '../types';
+import { drawSmoothClosedCurve } from './geometry';
 
 /**
  * モザイク描画ユーティリティ
@@ -94,10 +95,8 @@ export function renderTrackMosaic(
       track.mosaicType,
       track.strength,
       () => {
-        ctx.moveTo(points[0].x, points[0].y);
-        for (let i = 1; i < points.length; i++) {
-          ctx.lineTo(points[i].x, points[i].y);
-        }
+        ctx.beginPath();
+        drawSmoothClosedCurve(ctx, points);
         ctx.closePath();
       },
       { x, y, width, height },
@@ -156,10 +155,7 @@ export function renderInverseMosaic(
   // 内枠: 保護対象領域（くり抜き）
   for (const reg of protectedRegions) {
     if ((reg.shape === 'polygon' || reg.shape === 'lasso') && reg.points && reg.points.length >= 3) {
-      ctx.moveTo(reg.points[0].x, reg.points[0].y);
-      for (let i = 1; i < reg.points.length; i++) {
-        ctx.lineTo(reg.points[i].x, reg.points[i].y);
-      }
+      drawSmoothClosedCurve(ctx, reg.points);
       ctx.closePath();
     } else {
       ctx.rect(reg.x, reg.y, reg.width, reg.height);
@@ -233,11 +229,8 @@ export function renderTrackOverlay(
       ctx.fillRect(x, y, width, height);
     } else if (points && points.length > 0) {
       ctx.beginPath();
-      ctx.moveTo(points[0].x, points[0].y);
-      for (let i = 1; i < points.length; i++) {
-        ctx.lineTo(points[i].x, points[i].y);
-      }
-      if (track.shape === 'polygon' || track.shape === 'lasso') ctx.closePath();
+      drawSmoothClosedCurve(ctx, points);
+      ctx.closePath();
       ctx.fill();
     }
     ctx.restore();
@@ -247,11 +240,8 @@ export function renderTrackOverlay(
     ctx.strokeRect(x, y, width, height);
   } else if (points && points.length > 0) {
     ctx.beginPath();
-    ctx.moveTo(points[0].x, points[0].y);
-    for (let i = 1; i < points.length; i++) {
-      ctx.lineTo(points[i].x, points[i].y);
-    }
-    if (track.shape === 'polygon' || track.shape === 'lasso') ctx.closePath();
+    drawSmoothClosedCurve(ctx, points);
+    ctx.closePath();
     ctx.stroke();
 
     // 選択中のみリサイズハンドル操作の目安として外枠バウンディングボックスを補助描画（非選択時は体のラインの輪郭線のみをクリアに表示）
@@ -284,17 +274,17 @@ export function renderTrackOverlay(
     }
 
     // ポリゴン・フリー囲み選択時は輪郭上の各頂点にドラッグ編集用の丸ハンドル（●）を描画
+    // 32頂点などの高密度ポリゴンでも画面が埋もれないよう半径を最適化
     if ((track.shape === 'polygon' || track.shape === 'lasso') && points && points.length >= 3) {
       ctx.save();
-      const vRadius = Math.round(6.5 * scale);
-      const step = points.length > 32 ? Math.max(1, Math.floor(points.length / 20)) : 1;
-      for (let i = 0; i < points.length; i += step) {
+      const vRadius = points.length >= 16 ? Math.max(3, Math.round(4.5 * scale)) : Math.round(6 * scale);
+      for (let i = 0; i < points.length; i++) {
         const pt = points[i];
         ctx.beginPath();
         ctx.arc(pt.x, pt.y, vRadius, 0, Math.PI * 2);
         ctx.fillStyle = '#fbbf24'; // 視認性の高いアンバーゴールド
         ctx.fill();
-        ctx.lineWidth = 2 * scale;
+        ctx.lineWidth = Math.max(1.5, 1.8 * scale);
         ctx.strokeStyle = '#ffffff';
         ctx.stroke();
       }
@@ -307,8 +297,8 @@ export function renderTrackOverlay(
       ctx.fillStyle = 'rgba(15, 23, 42, 0.85)';
       const moveText =
         (track.shape === 'polygon' || track.shape === 'lasso') && points && points.length >= 3
-          ? '● 頂点ドラッグで体ライン調整 / ✥ 内側で移動'
-          : '✥ 枠内ドラッグで移動';
+          ? '● 頂点調整 / ■ 四隅拡縮 / ✥ 移動'
+          : '✥ 枠内ドラッグで移動 / ■ 四隅拡縮';
       const fontSize = Math.round(11 * scale);
       ctx.font = `bold ${fontSize}px sans-serif`;
       const moveW = ctx.measureText(moveText).width + 12 * scale;

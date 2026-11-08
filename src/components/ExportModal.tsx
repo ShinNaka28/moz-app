@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { ExportProgress, saveOrShareBlob } from '../utils/videoExporter';
-import { Download, Share2, CheckCircle2, Loader2, X, ArrowLeft, Play, Eye, Sun } from 'lucide-react';
+import { Download, Share2, CheckCircle2, Loader2, X, ArrowLeft, Play, Eye, Sun, AlertTriangle } from 'lucide-react';
 
 interface ExportModalProps {
   isOpen: boolean;
@@ -66,13 +66,16 @@ export const ExportModal: React.FC<ExportModalProps> = ({
   return (
     <div className="fixed inset-0 z-50 bg-black/85 backdrop-blur-md flex items-center justify-center p-3 sm:p-5 overflow-y-auto">
       <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-xl w-full p-4 sm:p-6 shadow-2xl relative my-auto">
-        <button
-          onClick={onClose}
-          className="absolute top-4 right-4 p-1.5 text-slate-400 hover:text-white rounded-lg transition"
-          title="閉じる"
-        >
-          <X size={20} />
-        </button>
+        {/* 処理完了時のみ右上の閉じるボタンを表示（処理中の誤タップ遮断） */}
+        {exportedBlob && (
+          <button
+            onClick={onClose}
+            className="absolute top-4 right-4 p-1.5 text-slate-400 hover:text-white rounded-lg transition"
+            title="閉じる"
+          >
+            <X size={20} />
+          </button>
+        )}
 
         {/* ヘッダータイトル */}
         <h3 className="text-base sm:text-lg font-bold text-slate-100 flex items-center gap-2 mb-3">
@@ -84,28 +87,45 @@ export const ExportModal: React.FC<ExportModalProps> = ({
           ) : (
             <>
               <Loader2 className="text-indigo-400 animate-spin" size={22} />
-              <span>{isImage ? '画像を処理中...' : '動画をローカルエンコード中...'}</span>
+              <span className="text-amber-300 font-bold">
+                処理中... 画面を閉じたり、別のアプリを開かないでください
+              </span>
             </>
           )}
         </h3>
 
         {/* 処理中ステータス */}
-        {!exportedBlob && progress && (
-          <div className="space-y-4 py-4">
-            <p className="text-sm text-slate-300 font-medium">{progress.status}</p>
+        {!exportedBlob && (
+          <div className="space-y-4 py-3">
+            {/* バックグラウンド移行防止警告バナー */}
+            <div className="p-3.5 bg-amber-950/80 border-2 border-amber-500/80 rounded-xl flex items-start gap-3 text-amber-200 text-xs sm:text-sm font-semibold shadow-lg">
+              <AlertTriangle size={22} className="text-amber-400 shrink-0 mt-0.5 animate-pulse" />
+              <div>
+                <p className="text-amber-200 font-bold text-sm">
+                  処理中... 画面を閉じたり、別のアプリを開かないでください
+                </p>
+                <p className="text-amber-300/80 text-[11px] font-normal mt-1 leading-relaxed">
+                  別のアプリへ切り替えたりタブをバックグラウンドに移動すると、ブラウザの省電力機能によりエンコード処理が中断・失敗する恐れがあります。この画面のまま完了をお待ちください。
+                </p>
+              </div>
+            </div>
+
+            <p className="text-sm text-slate-300 font-medium">
+              {progress?.status || (isImage ? '画像を処理中...' : '動画エンコードを準備中...')}
+            </p>
 
             {/* プログレスバー */}
             <div className="w-full bg-slate-950 rounded-full h-3 p-0.5 border border-slate-800 overflow-hidden">
               <div
-                style={{ width: `${progress.percent}%` }}
+                style={{ width: `${progress?.percent || 0}%` }}
                 className="h-full bg-gradient-to-r from-indigo-500 via-cyan-400 to-emerald-400 rounded-full transition-all duration-150"
               />
             </div>
 
             <div className="flex justify-between text-xs text-slate-400 font-mono">
-              <span>{progress.percent}%</span>
+              <span>{progress?.percent || 0}%</span>
               <span>
-                {progress.currentFrame} / {progress.totalFrames} フレーム
+                {progress?.currentFrame || 0} / {progress?.totalFrames || 0} フレーム
               </span>
             </div>
 
@@ -113,7 +133,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
             <div className="flex items-center gap-2 p-2.5 bg-indigo-950/70 border border-indigo-700/60 rounded-xl text-indigo-200 text-[11px] leading-relaxed">
               <Sun size={16} className="text-amber-400 shrink-0 animate-pulse" />
               <span>
-                <strong className="text-amber-300">画面スリープ防止が作動中:</strong> 処理完了まで画面は自動消灯しません。別のアプリへ切り替えずにそのままお待ちください。
+                <strong className="text-amber-300">画面スリープ防止が作動中:</strong> 処理完了まで画面は自動消灯しません。そのままお待ちください。
               </span>
             </div>
 
