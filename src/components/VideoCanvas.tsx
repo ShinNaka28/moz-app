@@ -136,11 +136,13 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
   // マウスカーソル状態
   const [cursorStyle, setCursorStyle] = useState<string>('cursor-crosshair');
 
-  // キャンバス座標系への変換（マウス・タッチ・ポインター完全対応）
+  // キャンバス座標系への変換（マウス・タッチ・ポインター完全対応・object-fit余白/レターボックス完全補正）
   const getCanvasCoords = (e: React.PointerEvent | React.MouseEvent | React.TouchEvent): Point | null => {
     const canvas = canvasRef.current;
-    if (!canvas) return null;
+    if (!canvas || canvas.width <= 0 || canvas.height <= 0) return null;
     const rect = canvas.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return null;
+
     let clientX = 0;
     let clientY = 0;
 
@@ -152,12 +154,30 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
       clientY = e.clientY;
     }
 
-    const scaleX = canvas.width / rect.width;
-    const scaleY = canvas.height / rect.height;
+    // CSS の object-contain により Canvas 要素の描画領域と DOM 矩形（rect）の間に生じる余白（黒帯 / レターボックス）を正確に計算
+    const canvasAspect = canvas.width / canvas.height;
+    const rectAspect = rect.width / rect.height;
+    let actualWidth = rect.width;
+    let actualHeight = rect.height;
+    let actualLeft = rect.left;
+    let actualTop = rect.top;
+
+    if (rectAspect > canvasAspect) {
+      // 左右に余白が生じている場合
+      actualWidth = rect.height * canvasAspect;
+      actualLeft = rect.left + (rect.width - actualWidth) / 2;
+    } else if (rectAspect < canvasAspect) {
+      // 上下に余白が生じている場合
+      actualHeight = rect.width / canvasAspect;
+      actualTop = rect.top + (rect.height - actualHeight) / 2;
+    }
+
+    const scaleX = canvas.width / actualWidth;
+    const scaleY = canvas.height / actualHeight;
 
     return {
-      x: (clientX - rect.left) * scaleX,
-      y: (clientY - rect.top) * scaleY,
+      x: (clientX - actualLeft) * scaleX,
+      y: (clientY - actualTop) * scaleY,
     };
   };
 
@@ -981,6 +1001,12 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
         onPointerMove={handlePointerMove}
         onPointerUp={handlePointerUp}
         onPointerCancel={handlePointerUp}
+        style={{
+          aspectRatio:
+            canvasRef.current && canvasRef.current.width > 0 && canvasRef.current.height > 0
+              ? `${canvasRef.current.width} / ${canvasRef.current.height}`
+              : undefined,
+        }}
         className={`max-w-full max-h-[55vh] sm:max-h-[70vh] object-contain shadow-2xl rounded border border-slate-800 touch-none select-none ${cursorStyle}`}
       />
     </div>

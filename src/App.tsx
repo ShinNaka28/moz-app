@@ -1049,41 +1049,110 @@ export const App: React.FC = () => {
     setExportedBlob(null);
 
     if (isImage && imageRef.current) {
-      // 画像の場合: Canvas から PNG Blob を生成
+      const img = imageRef.current;
+      const rawW = img.naturalWidth || 640;
+      const rawH = img.naturalHeight || 480;
+      const { width: workW, height: workH } = getClampedDimensions(rawW, rawH, 1280);
+
+      // 元画像の解像度を保持して高品質PNGを生成
       const canvas = document.createElement('canvas');
-      canvas.width = imageRef.current.naturalWidth;
-      canvas.height = imageRef.current.naturalHeight;
+      canvas.width = rawW;
+      canvas.height = rawH;
       const ctx = canvas.getContext('2d')!;
-      ctx.drawImage(imageRef.current, 0, 0);
 
       const sourceCanvas = document.createElement('canvas');
-      sourceCanvas.width = canvas.width;
-      sourceCanvas.height = canvas.height;
-      sourceCanvas.getContext('2d')!.drawImage(imageRef.current, 0, 0);
+      sourceCanvas.width = rawW;
+      sourceCanvas.height = rawH;
+      const srcCtx = sourceCanvas.getContext('2d')!;
+
+      // 元画像を出力Canvasへ等倍転写
+      srcCtx.drawImage(img, 0, 0, rawW, rawH);
+      ctx.drawImage(sourceCanvas, 0, 0, rawW, rawH);
+
+      // 動画エクスポート（videoExporter）の座標復元ロジックに則り、
+      // プレビュー作業解像度（workW, workH）から出力キャンバス（rawW, rawH）へのスケーリングと
+      // 余白（レターボックス / contain）のオフセットを正確に計算
+      const scale = Math.min(rawW / workW, rawH / workH);
+      const drawW = workW * scale;
+      const drawH = workH * scale;
+      const offsetX = (rawW - drawW) / 2;
+      const offsetY = (rawH - drawH) / 2;
 
       if (isInverseMosaic) {
         // 反転モザイク適用
         const protectedRegions: ProtectedRegion[] = [];
         tracks.forEach((track) => {
-          if (track.enabled && track.keyframes[0]) {
-            const k = track.keyframes[0];
+          if (!track.enabled) return;
+          const pos = interpolateKeyframes(track.keyframes, 0, {
+            screenWidth: workW,
+            screenHeight: workH,
+          });
+          if (pos && !track.trackingData?.isOutOfFrame) {
+            const targetBox = {
+              x: offsetX + pos.x * scale,
+              y: offsetY + pos.y * scale,
+              width: pos.width * scale,
+              height: pos.height * scale,
+            };
+            const targetPoints =
+              pos.normalizedPoints && pos.normalizedPoints.length >= 3
+                ? normalizedToAbsolutePoints(targetBox, pos.normalizedPoints)
+                : pos.points?.map((p) => ({
+                    x: offsetX + p.x * scale,
+                    y: offsetY + p.y * scale,
+                  }));
+
             protectedRegions.push({
               shape: track.shape,
-              x: k.x,
-              y: k.y,
-              width: k.width,
-              height: k.height,
-              points: k.points,
+              x: targetBox.x,
+              y: targetBox.y,
+              width: targetBox.width,
+              height: targetBox.height,
+              points: targetPoints,
             });
           }
         });
-        renderInverseMosaic(ctx, protectedRegions, canvas.width, canvas.height, inverseMosaicType, inverseStrength, sourceCanvas);
+        renderInverseMosaic(
+          ctx,
+          protectedRegions,
+          rawW,
+          rawH,
+          inverseMosaicType,
+          inverseStrength,
+          sourceCanvas
+        );
       } else {
         // 通常モザイク適用
         tracks.forEach((track) => {
-          if (track.enabled && track.keyframes[0]) {
-            const k = track.keyframes[0];
-            renderTrackMosaic(ctx, track, k, sourceCanvas);
+          if (!track.enabled) return;
+          const pos = interpolateKeyframes(track.keyframes, 0, {
+            screenWidth: workW,
+            screenHeight: workH,
+          });
+          if (pos && !track.trackingData?.isOutOfFrame) {
+            const targetBox = {
+              x: offsetX + pos.x * scale,
+              y: offsetY + pos.y * scale,
+              width: pos.width * scale,
+              height: pos.height * scale,
+            };
+            const targetPoints =
+              pos.normalizedPoints && pos.normalizedPoints.length >= 3
+                ? normalizedToAbsolutePoints(targetBox, pos.normalizedPoints)
+                : pos.points?.map((p) => ({
+                    x: offsetX + p.x * scale,
+                    y: offsetY + p.y * scale,
+                  }));
+
+            renderTrackMosaic(
+              ctx,
+              track,
+              {
+                ...targetBox,
+                points: targetPoints,
+              },
+              sourceCanvas
+            );
           }
         });
       }
@@ -1142,7 +1211,10 @@ export const App: React.FC = () => {
               ref={imageRef}
               src={mediaUrl}
               alt="Source"
-              className="fixed -left-[9999px] -top-[9999px] w-px h-px opacity-0 pointer-events-none"
+              onLoad={() => {
+                setDuration(1);
+              }}
+              className="fixed -left-[9999px] -top-[9999px] opacity-0 pointer-events-none"
             />
           ) : (
             <video
