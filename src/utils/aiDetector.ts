@@ -377,7 +377,7 @@ function ensureAnalysisBuffers(): {
   if (!sharedCategoryMask) sharedCategoryMask = new Uint8Array(TOTAL_ANALYSIS_PIXELS);
   if (!sharedDilatedMask) sharedDilatedMask = new Uint8Array(TOTAL_ANALYSIS_PIXELS);
   if (!sharedLabels) sharedLabels = new Int32Array(TOTAL_ANALYSIS_PIXELS);
-  if (!sharedQueue) sharedQueue = new Int32Array(TOTAL_ANALYSIS_PIXELS);
+  if (!sharedQueue) sharedQueue = new Int32Array(Math.max(TOTAL_ANALYSIS_PIXELS, (ANALYSIS_W + 2) * (ANALYSIS_H + 2)));
 
   return {
     canvas: sharedDetCanvas,
@@ -478,6 +478,19 @@ export function resampleClosedPolygon(points: Point[], targetCount = BODY_CONTOU
   }
 
   return resampled;
+}
+
+export interface BodyContourResult {
+  points: Point[];
+  bounds: { x: number; y: number; width: number; height: number };
+  normalizedPoints?: NormalizedPoint[];
+  score?: number;
+}
+
+export interface SegmentPersonResult {
+  activeSegmenter: ImageSegmenter;
+  contour: BodyContourResult | null;
+  contours: BodyContourResult[];
 }
 
 export interface GatekeeperContext {
@@ -680,10 +693,9 @@ function extractBodyPolygonWithGatekeeper(
   origH: number,
   context?: GatekeeperContext
 ): {
-  points: Point[];
-  bounds: { x: number; y: number; width: number; height: number };
-  normalizedPoints?: NormalizedPoint[];
-} | null {
+  contour: BodyContourResult | null;
+  contours: BodyContourResult[];
+} {
   const { personProb, categoryMask, skinMask, motionMask, dilatedMask, labels, queue } = buffers;
   const totalCells = TOTAL_ANALYSIS_PIXELS;
   const gridW = ANALYSIS_W;
@@ -699,7 +711,7 @@ function extractBodyPolygonWithGatekeeper(
 
   // 画面全体が真っ黒、またはほぼ全体（96%超）の場合は無効
   if (fgCount < totalCells * 0.005 || fgCount > totalCells * 0.96) {
-    return null;
+    return { contour: null, contours: [] };
   }
 
   // 2. マスクの取得（※凹凸・くびれを潰す過剰なモルフォロジー膨張は廃止）
@@ -838,61 +850,156 @@ function extractBodyPolygonWithGatekeeper(
     });
 
   if (passedComps.length === 0) {
-    return null;
+    return { contour: null, contours: [] };
   }
 
-  const best = passedComps[0].comp;
-  const keepLabels = new Set<number>([best.label]);
+  // 5. 複数人物クラスタリング (Person Clustering)
+  // 近接・同一人物のパーツ（頭+胴体+腕等）をまとめつつ、空間的に独立した複数の人物を個別クラスタに分離
+  interface PersonCluster {
+    labels: Set<number>;
+    bMinX: number;
+    bMaxX: number;
+    bMinY: number;
+    bMaxY: number;
+    totalArea: number;
+    score: number;
+  }
 
-  for (let i = 1; i < passedComps.length; i++) {
-    const sub = passedComps[i].comp;
-    if (sub.area >= best.area * 0.20 && sub.area >= totalCells * 0.015) {
-      keepLabels.add(sub.label);
+  const clusters: PersonCluster[] = [];
+
+  for (const { comp: c, eval: ev } of passedComps) {
+    let matchedCluster: PersonCluster | null = null;
+    let minDistance = Infinity;
+
+    for (const cl of clusters) {
+      // 2つのバウンディングボックス間のユークリッド距離
+      const dx = Math.max(0, Math.max(cl.bMinX, c.bMinX) - Math.min(cl.bMaxX, c.bMaxX));
+      const dy = Math.max(0, Math.max(cl.bMinY, c.bMinY) - Math.min(cl.bMaxY, c.bMaxY));
+      const dist = Math.hypot(dx, dy);
+
+      // 横方向の重複幅（身体の上下パーツ判定）
+      const overlapX = Math.max(0, Math.min(cl.bMaxX, c.bMaxX) - Math.max(cl.bMinX, c.bMinX));
+      const clWidth = cl.bMaxX - cl.bMinX + 1;
+      const cWidth = c.bMaxX - c.bMinX + 1;
+      const isVerticallyAligned = overlapX >= Math.min(clWidth, cWidth) * 0.25;
+
+      // 距離が24px以内、または上下に整列して距離が45px以内の場合は同一人物の別部位と判定
+      if (dist <= 24 || (isVerticallyAligned && dy <= 45)) {
+        if (dist < minDistance) {
+          minDistance = dist;
+          matchedCluster = cl;
+        }
+      }
     }
-  }
 
-  // 5. パディング付きグリッド (pw x ph) を作成し、選択された人物領域を配置
-  const pw = gridW + 2;
-  const ph = gridH + 2;
-  const padded = new Uint8Array(pw * ph);
-
-  for (let y = 0; y < gridH; y++) {
-    for (let x = 0; x < gridW; x++) {
-      if (keepLabels.has(visited[y * gridW + x])) {
-        padded[(y + 1) * pw + (x + 1)] = 1;
+    if (matchedCluster) {
+      matchedCluster.labels.add(c.label);
+      matchedCluster.bMinX = Math.min(matchedCluster.bMinX, c.bMinX);
+      matchedCluster.bMaxX = Math.max(matchedCluster.bMaxX, c.bMaxX);
+      matchedCluster.bMinY = Math.min(matchedCluster.bMinY, c.bMinY);
+      matchedCluster.bMaxY = Math.max(matchedCluster.bMaxY, c.bMaxY);
+      matchedCluster.totalArea += c.area;
+      matchedCluster.score = Math.max(matchedCluster.score, ev.score);
+    } else {
+      // 一定以上の面積がある部位を独立した人物クラスタとして新規登録（最大6人まで）
+      if (clusters.length < 6 && c.area >= totalCells * 0.008) {
+        clusters.push({
+          labels: new Set<number>([c.label]),
+          bMinX: c.bMinX,
+          bMaxX: c.bMaxX,
+          bMinY: c.bMinY,
+          bMaxY: c.bMaxY,
+          totalArea: c.area,
+          score: ev.score,
+        });
       }
     }
   }
 
+  // 面積の大きい順にソート
+  clusters.sort((a, b) => b.totalArea - a.totalArea);
+
+  const pw = gridW + 2;
+  const ph = gridH + 2;
+  const padded = new Uint8Array(pw * ph);
+  const contours: BodyContourResult[] = [];
+
+  for (const cl of clusters) {
+    padded.fill(0);
+    for (let y = 0; y < gridH; y++) {
+      const row = y * gridW;
+      const padRow = (y + 1) * pw;
+      for (let x = 0; x < gridW; x++) {
+        if (cl.labels.has(visited[row + x])) {
+          padded[padRow + (x + 1)] = 1;
+        }
+      }
+    }
+
+    const cnt = traceContourFromCluster(
+      padded,
+      pw,
+      ph,
+      gridW,
+      gridH,
+      origW,
+      origH,
+      queue
+    );
+
+    if (cnt) {
+      cnt.score = cl.score;
+      contours.push(cnt);
+    }
+  }
+
+  return {
+    contour: contours[0] || null,
+    contours,
+  };
+}
+
+/**
+ * 単一人物クラスタのマスクから外周境界を Moore-Neighbor Tracing で抽出
+ */
+function traceContourFromCluster(
+  padded: Uint8Array,
+  pw: number,
+  ph: number,
+  gridW: number,
+  gridH: number,
+  origW: number,
+  origH: number,
+  queue: Int32Array
+): BodyContourResult | null {
   // 6. 外周 (0, 0) から Flood-Fill して衣服内の影や模様による「穴」を完全に埋める
   // （※首のくびれや脇の下などの外部の凹みは外周と繋がっているため完全に保護・維持される）
   const exterior = new Uint8Array(pw * ph);
-  const extQueue = queue;
   let eHead = 0;
   let eTail = 0;
   exterior[0] = 1;
-  extQueue[eTail++] = 0;
+  queue[eTail++] = 0;
 
   while (eHead < eTail) {
-    const curr = extQueue[eHead++];
+    const curr = queue[eHead++];
     const cx = curr % pw;
     const cy = (curr - cx) / pw;
 
     if (cx + 1 < pw && !padded[curr + 1] && !exterior[curr + 1]) {
       exterior[curr + 1] = 1;
-      extQueue[eTail++] = curr + 1;
+      queue[eTail++] = curr + 1;
     }
     if (cx - 1 >= 0 && !padded[curr - 1] && !exterior[curr - 1]) {
       exterior[curr - 1] = 1;
-      extQueue[eTail++] = curr - 1;
+      queue[eTail++] = curr - 1;
     }
     if (cy + 1 < ph && !padded[curr + pw] && !exterior[curr + pw]) {
       exterior[curr + pw] = 1;
-      extQueue[eTail++] = curr + pw;
+      queue[eTail++] = curr + pw;
     }
     if (cy - 1 >= 0 && !padded[curr - pw] && !exterior[curr - pw]) {
       exterior[curr - pw] = 1;
-      extQueue[eTail++] = curr - pw;
+      queue[eTail++] = curr - pw;
     }
   }
 
@@ -1022,24 +1129,17 @@ export async function segmentPersonSafely(
   source: HTMLVideoElement | HTMLImageElement,
   segmenter: ImageSegmenter,
   context?: GatekeeperContext
-): Promise<{
-  activeSegmenter: ImageSegmenter;
-  contour: {
-    points: Point[];
-    bounds: { x: number; y: number; width: number; height: number };
-    normalizedPoints?: NormalizedPoint[];
-  } | null;
-}> {
+): Promise<SegmentPersonResult> {
   const isVideo = source instanceof HTMLVideoElement;
   const origWidth = isVideo ? source.videoWidth : source.naturalWidth;
   const origHeight = isVideo ? source.videoHeight : source.naturalHeight;
 
   if (!origWidth || !origHeight) {
-    return { activeSegmenter: segmenter, contour: null };
+    return { activeSegmenter: segmenter, contour: null, contours: [] };
   }
 
   if (isVideo && source.readyState < 2) {
-    return { activeSegmenter: segmenter, contour: null };
+    return { activeSegmenter: segmenter, contour: null, contours: [] };
   }
 
   // スマホでのメモリクラッシュ・GCカクつきを防ぐため、事前確保バッファ（Zero-Allocation）を使用
@@ -1051,7 +1151,7 @@ export async function segmentPersonSafely(
     ctx.drawImage(source, 0, 0, ANALYSIS_W, ANALYSIS_H);
   } catch (drawErr) {
     console.warn('Skipping segmentation frame: drawImage error', drawErr);
-    return { activeSegmenter: segmenter, contour: null };
+    return { activeSegmenter: segmenter, contour: null, contours: [] };
   }
 
   const imgData = ctx.getImageData(0, 0, ANALYSIS_W, ANALYSIS_H);
@@ -1262,11 +1362,11 @@ export async function segmentPersonSafely(
   }
 
   // ---------------------------------------------------------------------
-  // 4. 4段階ゲートキーパーによる無機物除外と人物ポリゴン抽出
+  // 4. 4段階ゲートキーパーによる無機物除外と複数人物ポリゴン抽出
   // ---------------------------------------------------------------------
-  const contour = extractBodyPolygonWithGatekeeper(buffers, origWidth, origHeight, context);
+  const { contour, contours } = extractBodyPolygonWithGatekeeper(buffers, origWidth, origHeight, context);
 
-  return { activeSegmenter: currentSegmenter, contour };
+  return { activeSegmenter: currentSegmenter, contour, contours };
 }
 
 /**
@@ -1364,7 +1464,7 @@ export async function detectFacesSafely(
 }
 
 // IoU (Intersection over Union) 計算
-function calcIoU(
+export function calcIoU(
   b1: { x: number; y: number; width: number; height: number },
   b2: { x: number; y: number; width: number; height: number }
 ): number {
