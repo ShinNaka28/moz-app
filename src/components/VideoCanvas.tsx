@@ -1,7 +1,7 @@
 import React, { useRef, useEffect, useState, useCallback } from 'react';
 import { EditorMode, MosaicTrack, MosaicType, Point, NormalizedPoint } from '../types';
 import { renderTrackMosaic, renderInverseMosaic, renderTrackOverlay, ProtectedRegion } from '../utils/mosaicRenderer';
-import { interpolateKeyframes, extractFeaturePoints, toGrayscale, trackBox } from '../utils/tracking';
+import { interpolateKeyframes } from '../utils/tracking';
 import { getClampedDimensions, absoluteToNormalizedPoints, normalizedToAbsolutePoints, resampleClosedPoints, NORMALIZED_POINT_COUNT } from '../utils/geometry';
 
 interface VideoCanvasProps {
@@ -87,9 +87,6 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const sourceCanvasRef = useRef<HTMLCanvasElement>(document.createElement('canvas'));
 
-  // トラッキング用: 前フレームのグレースケールデータ
-  const prevGrayRef = useRef<Uint8Array | null>(null);
-  const prevTimeRef = useRef<number>(0);
 
   // ドラッグ・描画インタラクションの状態
   const [drawingState, setDrawingState] = useState<{
@@ -244,65 +241,6 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
     // 元メディアを作業解像度にダウンスケール転写
     srcCtx.drawImage(media, 0, 0, mediaWidth, mediaHeight);
     ctx.drawImage(sourceCanvasRef.current, 0, 0, mediaWidth, mediaHeight);
-
-    // オプティカルフロー自動追従処理（再生中かつ時間が進んでいる場合）
-    if (isPlaying && !isImage && Math.abs(currentTime - prevTimeRef.current) > 0.01) {
-      const currImgData = srcCtx.getImageData(0, 0, mediaWidth, mediaHeight);
-      const currGray = toGrayscale(currImgData);
-
-      if (prevGrayRef.current) {
-        for (const track of tracks) {
-          if (track.type !== 'tracked' || !track.enabled) continue;
-          if (currentTime < track.startTime || currentTime > track.endTime) continue;
-
-          // 直前のキーフレームまたは現在位置
-          const curPos = interpolateKeyframes(track.keyframes, currentTime, {
-            screenWidth: mediaWidth,
-            screenHeight: mediaHeight,
-            hasFutureManualKeyframe: track.keyframes.some((k) => k.time > currentTime),
-          });
-          if (!curPos) continue;
-
-          const featPoints = track.trackingData?.featurePoints || extractFeaturePoints(prevGrayRef.current, mediaWidth, mediaHeight, curPos);
-
-          const trackRes = trackBox(
-            curPos,
-            featPoints,
-            prevGrayRef.current,
-            currGray,
-            mediaWidth,
-            mediaHeight
-          );
-
-          onUpdateTrackFrameOut(track.id, trackRes.isOutOfFrame);
-
-          if (!trackRes.isOutOfFrame) {
-            // 追従結果をキーフレームとして滑らかに更新（再生中フラグ true）
-            onUpdateTrackKeyframe(
-              track.id,
-              {
-                ...trackRes.newBox,
-                points: curPos.points?.map((p) => ({
-                  x: p.x + (trackRes.newBox.x - curPos.x),
-                  y: p.y + (trackRes.newBox.y - curPos.y),
-                })),
-              },
-              true
-            );
-            track.trackingData = {
-              ...track.trackingData,
-              templateWidth: curPos.width,
-              templateHeight: curPos.height,
-              featurePoints: trackRes.newPoints,
-              isOutOfFrame: false,
-            };
-          }
-        }
-      }
-
-      prevGrayRef.current = currGray;
-      prevTimeRef.current = currentTime;
-    }
 
     // 現在の表示位置を計算（ドラッグ変形・移動中はリアルタイムに反映）
     const getEffectivePos = (track: MosaicTrack) => {
@@ -468,8 +406,6 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
     isInverseMosaic,
     inverseMosaicType,
     inverseStrength,
-    onUpdateTrackFrameOut,
-    onUpdateTrackKeyframe,
   ]);
 
   useEffect(() => {

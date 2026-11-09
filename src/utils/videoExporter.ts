@@ -235,7 +235,7 @@ async function findSupportedAudioConfig(
 }
 
 /**
- * WebCodecs VideoEncoder で端末が対応しているH.264プロファイルを検出
+ * 解像度（幅・高さ）とFPSから必要なH.264 (AVC) レベルを算出し、端末が対応する最適なエンコード設定を自動検出
  */
 async function findSupportedVideoConfig(
   width: number,
@@ -243,36 +243,47 @@ async function findSupportedVideoConfig(
   fps: number,
   bitrate: number
 ): Promise<VideoEncoderConfig> {
-  const candidates: VideoEncoderConfig[] = [
-    {
-      codec: 'avc1.42001f', // Baseline profile level 3.1
-      width,
-      height,
-      bitrate,
-      framerate: fps,
-    },
-    {
-      codec: 'avc1.4d001f', // Main profile level 3.1
-      width,
-      height,
-      bitrate,
-      framerate: fps,
-    },
-    {
-      codec: 'avc1.64001f', // High profile level 3.1
-      width,
-      height,
-      bitrate,
-      framerate: fps,
-    },
-    {
-      codec: 'avc1.42E01E', // Baseline profile level 3.0
-      width,
-      height,
-      bitrate,
-      framerate: fps,
-    },
+  // H.264のマクロブロック（16x16）数を計算
+  const mbW = Math.ceil(width / 16);
+  const mbH = Math.ceil(height / 16);
+  const totalMacroblocks = mbW * mbH;
+
+  // 各レベルの許容マクロブロック数上限:
+  // Level 3.0: 1,620 MB (720x480)
+  // Level 3.1: 3,600 MB (1280x720) = 921,600 px
+  // Level 3.2: 5,120 MB (1280x1024) = 1,310,720 px
+  // Level 4.0: 8,192 MB (1920x1080) = 2,097,152 px
+  // Level 4.1: 8,192 MB (1920x1080 60fps) = 2,097,152 px
+  // Level 4.2: 8,704 MB (2048x1080) = 2,228,224 px
+  // Level 5.0: 22,080 MB (2560x1440) = 5,652,480 px
+  // Level 5.1: 36,864 MB (4096x2048 / 4K) = 9,437,184 px
+
+  // スマホの縦動画（例: 732x1280 -> 736*1280 = 942,080 px）は Level 3.1 (921,600) を超過するため、
+  // 最低でも Level 4.0 / 4.1 / 4.2 が必須となります。
+  const levels = totalMacroblocks > 3600
+    ? ['29', '28', '2a', '33', '32', '20', '1f'] // Level 4.1, 4.0, 4.2, 5.1, 5.0, 3.2, 3.1
+    : ['29', '28', '1f', '2a', '20', '33', '32'];
+
+  const profiles = [
+    '4d00', // Main Profile (高画質・広範なスマホ互換)
+    '4200', // Baseline Profile (全スマホ・PC対応)
+    '6400', // High Profile
+    '42E0', // Constrained Baseline
   ];
+
+  const candidates: VideoEncoderConfig[] = [];
+  for (const lvl of levels) {
+    for (const prof of profiles) {
+      candidates.push({
+        codec: `avc1.${prof}${lvl}`,
+        width,
+        height,
+        bitrate,
+        framerate: fps,
+        hardwareAcceleration: 'no-preference',
+      });
+    }
+  }
 
   for (const candidate of candidates) {
     try {
@@ -283,7 +294,14 @@ async function findSupportedVideoConfig(
     } catch (_) {}
   }
 
-  return candidates[0];
+  // フォールバック: 1080pまで万能対応する Level 4.1 Main Profile
+  return {
+    codec: 'avc1.4d0029',
+    width,
+    height,
+    bitrate,
+    framerate: fps,
+  };
 }
 
 /**
