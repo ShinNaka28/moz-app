@@ -1,4 +1,5 @@
 import { Muxer, ArrayBufferTarget, FileSystemWritableFileStreamTarget } from 'mp4-muxer';
+import { Input, ALL_FORMATS, BlobSource, EncodedPacketSink } from 'mediabunny';
 import { MosaicTrack, MosaicType } from '../types';
 import { interpolateKeyframes } from './tracking';
 import { renderTrackMosaic, renderInverseMosaic, ProtectedRegion } from './mosaicRenderer';
@@ -305,6 +306,239 @@ export function isInAppBrowser(): boolean {
   return /Line|FBAN|FBAV|Instagram|Twitter|Snapchat|MicroMessenger/i.test(ua);
 }
 
+interface PreparedAudioPipeline {
+  audioConfig?: {
+    codec: 'aac' | 'opus';
+    numberOfChannels: number;
+    sampleRate: number;
+  };
+  addAudioChunks: (muxer: Muxer<any>) => Promise<void>;
+}
+
+/**
+ * WebCodecs AudioEncoder を使用して PCM AudioBuffer を AAC チャンクへエンコードして muxer へ追加
+ */
+async function encodePcmToMuxer(
+  muxer: Muxer<any>,
+  normalizedAudio: AudioBuffer,
+  encoderConfig: AudioEncoderConfig,
+  duration: number
+): Promise<void> {
+  let audioEncodeError: Error | null = null;
+  const audioEncoder = new AudioEncoder({
+    output: (chunk, meta) => muxer.addAudioChunk(chunk, meta),
+    error: (e) => {
+      console.error('AudioEncoder error', e);
+      audioEncodeError = e;
+    },
+  });
+
+  let channelArrays: Float32Array[] = [];
+  try {
+    audioEncoder.configure({
+      ...encoderConfig,
+      numberOfChannels: normalizedAudio.numberOfChannels,
+      sampleRate: normalizedAudio.sampleRate,
+    });
+
+    const sampleRate = normalizedAudio.sampleRate;
+    const numChannels = normalizedAudio.numberOfChannels;
+    const maxAudioSamples = Math.ceil(duration * sampleRate);
+    const totalSamples = Math.min(normalizedAudio.length, maxAudioSamples);
+    const samplesPerChunk = 1024; // AAC固定ブロック長
+
+    channelArrays = [];
+    for (let ch = 0; ch < numChannels; ch++) {
+      channelArrays.push(normalizedAudio.getChannelData(ch));
+    }
+
+    for (let offset = 0; offset < totalSamples; offset += samplesPerChunk) {
+      if (audioEncodeError) break;
+      const frameCount = Math.min(samplesPerChunk, totalSamples - offset);
+
+      const planarData = new Float32Array(samplesPerChunk * numChannels);
+      for (let ch = 0; ch < numChannels; ch++) {
+        planarData.set(
+          channelArrays[ch].subarray(offset, offset + frameCount),
+          ch * samplesPerChunk
+        );
+      }
+
+      const audioData = new AudioData({
+        format: 'f32-planar',
+        sampleRate,
+        numberOfFrames: samplesPerChunk,
+        numberOfChannels: numChannels,
+        timestamp: Math.round((offset / sampleRate) * 1_000_000),
+        data: planarData,
+      });
+      audioEncoder.encode(audioData);
+      audioData.close();
+
+      while (audioEncoder.encodeQueueSize > 6) {
+        await new Promise((r) => setTimeout(r, 5));
+      }
+    }
+
+    await audioEncoder.flush();
+    audioEncoder.close();
+  } catch (aErr) {
+    try {
+      audioEncoder.close();
+    } catch (_) {}
+    throw aErr;
+  } finally {
+    channelArrays.length = 0;
+  }
+
+  if (audioEncodeError) {
+    throw audioEncodeError;
+  }
+}
+
+/**
+ * 音声トラックの抽出・エンコードパイプラインを準備
+ * 1. Mediabunny による直接ストリームコピー（iOS Safari / Android / PC で無劣化・最速・AudioEncoder不要）
+ * 2. Web Audio API + WebCodecs AudioEncoder（特殊形式向けのフォールバック）
+ * 3. 音声なし動画
+ */
+async function prepareAudioPipeline(
+  videoFile: File,
+  duration: number,
+  onProgress: (status: string) => void
+): Promise<PreparedAudioPipeline> {
+  onProgress('元動画の音声トラックを解析中...');
+
+  // 戦略1 (最優先・iOS/Android完全対応):
+  // Mediabunny によるコンテナ直接デマルチプレクス（パケットストリームコピー）
+  // AAC / Opus パケットを再エンコードなしで直接抽出するため、
+  // iOS Safari の「AudioEncoder 未実装」および「decodeAudioData の MOV/MP4 失敗」を 100% 回避！
+  try {
+    const input = new Input({
+      formats: ALL_FORMATS,
+      source: new BlobSource(videoFile),
+    });
+
+    const audioTrack = await input.getPrimaryAudioTrack();
+    if (audioTrack) {
+      const codec = await audioTrack.getCodec();
+      if (codec === 'aac' || codec === 'opus') {
+        const sampleRate = (await audioTrack.getSampleRate()) || 44100;
+        const numberOfChannels = (await audioTrack.getNumberOfChannels()) || 2;
+
+        return {
+          audioConfig: {
+            codec,
+            numberOfChannels,
+            sampleRate,
+          },
+          addAudioChunks: async (muxer: Muxer<any>) => {
+            onProgress('音声トラック（無劣化ストリーム）を結合中...');
+            try {
+              const sink = new EncodedPacketSink(audioTrack);
+              let firstTimestamp: number | null = null;
+              let lastTimestampUs = -1;
+
+              for await (const packet of sink.packets()) {
+                if (firstTimestamp === null) {
+                  firstTimestamp = packet.timestamp;
+                }
+                const relativeSec = packet.timestamp - firstTimestamp;
+                if (relativeSec > duration + 0.1) break;
+
+                let timestampUs = Math.round(Math.max(0, relativeSec) * 1e6);
+                if (timestampUs < lastTimestampUs) {
+                  timestampUs = lastTimestampUs; // 単調非減少を保証
+                }
+                lastTimestampUs = timestampUs;
+                const durationUs = Math.max(1, Math.round(packet.duration * 1e6));
+                muxer.addAudioChunkRaw(packet.data, packet.type, timestampUs, durationUs);
+              }
+            } finally {
+              // 抽出完了後にMediabunnyリソースを即座に破棄してメモリリークを完全防止
+              input.dispose();
+            }
+          },
+        };
+      }
+    }
+  } catch (directErr) {
+    console.warn('Mediabunny direct audio extraction failed, attempting Web Audio API fallback:', directErr);
+  }
+
+  // 戦略2 (フォールバック): Web Audio API decodeAudioData + AudioEncoder
+  if (typeof window.AudioEncoder !== 'undefined') {
+    try {
+      const isMobile =
+        typeof navigator !== 'undefined' &&
+        /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+      const MAX_AUDIO_SAFE_FILE_SIZE = isMobile ? 120 * 1024 * 1024 : 350 * 1024 * 1024;
+
+      if (videoFile.size <= MAX_AUDIO_SAFE_FILE_SIZE) {
+        onProgress('音声トラックを展開中 (Web Audio API)...');
+        let arrayBuffer: ArrayBuffer | null = await videoFile.arrayBuffer();
+        const AudioCtx =
+          window.AudioContext ||
+          (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+        const audioCtx = new AudioCtx();
+        let audioBuffer: AudioBuffer | null = null;
+        try {
+          audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+        } finally {
+          arrayBuffer = null;
+          await audioCtx.close().catch(() => {});
+        }
+
+        if (audioBuffer) {
+          const supportedAudioConfig = await findSupportedAudioConfig(audioBuffer);
+          if (supportedAudioConfig) {
+            let normalizedAudio: AudioBuffer | null = null;
+            try {
+              normalizedAudio = await normalizeAudioBuffer(
+                audioBuffer,
+                supportedAudioConfig.encoderConfig.sampleRate,
+                supportedAudioConfig.encoderConfig.numberOfChannels
+              );
+              if (normalizedAudio !== audioBuffer) {
+                audioBuffer = null;
+              }
+            } catch (_) {
+              normalizedAudio = audioBuffer;
+            }
+
+            if (normalizedAudio && normalizedAudio.length > 0) {
+              const currentNormAudio = normalizedAudio;
+              return {
+                audioConfig: {
+                  codec: supportedAudioConfig.muxerCodec,
+                  numberOfChannels: currentNormAudio.numberOfChannels,
+                  sampleRate: currentNormAudio.sampleRate,
+                },
+                addAudioChunks: async (muxer: Muxer<any>) => {
+                  onProgress('音声トラックをエンコード中 (WebCodecs)...');
+                  await encodePcmToMuxer(
+                    muxer,
+                    currentNormAudio,
+                    supportedAudioConfig.encoderConfig,
+                    duration
+                  );
+                },
+              };
+            }
+          }
+        }
+      }
+    } catch (fallbackErr) {
+      console.warn('Web Audio fallback failed:', fallbackErr);
+    }
+  }
+
+  // 戦略3: 音声なし
+  return {
+    addAudioChunks: async () => {},
+  };
+}
+
 /**
  * 動画の完全ローカルMP4書き出し（WebCodecs API + mp4-muxer による完全なmoovアトム構築）
  */
@@ -361,67 +595,10 @@ export async function exportMosaicVideo(
     const srcCtx = sourceCanvas.getContext('2d');
     if (!srcCtx) throw new Error('Source canvas context error');
 
-    // 1. オリジナル音声のデコードと解析（Web Audio API）
-    onProgress({ currentFrame: 0, totalFrames, percent: 0, status: '元動画の音声トラックを展開中...' });
-    let audioBuffer: AudioBuffer | null = null;
-    const isMobile =
-      typeof navigator !== 'undefined' &&
-      /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
-    // モバイル端末ではRAM制限が極めて厳しいため、120MBを超える動画ファイルは音声展開によるOOMを防止し映像優先にする
-    const MAX_AUDIO_SAFE_FILE_SIZE = isMobile ? 120 * 1024 * 1024 : 350 * 1024 * 1024;
-
-    if (videoFile.size > MAX_AUDIO_SAFE_FILE_SIZE) {
-      console.warn(
-        `動画ファイルサイズ (${Math.round(videoFile.size / 1024 / 1024)}MB) が安全上限 (${Math.round(
-          MAX_AUDIO_SAFE_FILE_SIZE / 1024 / 1024
-        )}MB) を超えているため、メモリクラッシュを防止し映像優先で高速出力します。`
-      );
-      onProgress({
-        currentFrame: 0,
-        totalFrames,
-        percent: 0,
-        status: 'メモリ保護: 大容量動画のため映像を優先して高速処理中...',
-      });
-    } else {
-      try {
-        let arrayBuffer: ArrayBuffer | null = await videoFile.arrayBuffer();
-        const AudioCtx =
-          window.AudioContext ||
-          (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-        const audioCtx = new AudioCtx();
-        try {
-          audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
-        } finally {
-          // デコード完了またはエラー発生時に即座にArrayBuffer参照を解放しGCを促す
-          arrayBuffer = null;
-          await audioCtx.close().catch(() => {});
-        }
-      } catch (err) {
-        console.warn('音声トラックの取得をスキップまたは音声なし:', err);
-      }
-    }
-
-    const supportedAudioConfig = audioBuffer
-      ? await findSupportedAudioConfig(audioBuffer)
-      : null;
-
-    let normalizedAudio: AudioBuffer | null = null;
-    if (audioBuffer && supportedAudioConfig) {
-      try {
-        normalizedAudio = await normalizeAudioBuffer(
-          audioBuffer,
-          supportedAudioConfig.encoderConfig.sampleRate,
-          supportedAudioConfig.encoderConfig.numberOfChannels
-        );
-        // リサンプリングが行われて別のAudioBufferが作成された場合、不要になった元バッファを即時破棄
-        if (normalizedAudio !== audioBuffer) {
-          audioBuffer = null;
-        }
-      } catch (e) {
-        console.warn('Audio normalization failed, using original buffer:', e);
-        normalizedAudio = audioBuffer;
-      }
-    }
+    // 1. 音声トラックの解析・準備（超高速＆スマホ完全対応のストリーム抽出を優先）
+    const audioPipeline = await prepareAudioPipeline(videoFile, duration, (status) => {
+      onProgress({ currentFrame: 0, totalFrames, percent: 0, status });
+    });
 
     // 2. mp4-muxer 出力ターゲット（OPFS または ArrayBufferTarget）の準備
     const outputTarget = await prepareMuxerTarget();
@@ -434,14 +611,7 @@ export async function exportMosaicVideo(
         height: videoHeight,
         frameRate: fps,
       },
-      audio:
-        normalizedAudio && supportedAudioConfig
-          ? {
-              codec: supportedAudioConfig.muxerCodec,
-              numberOfChannels: normalizedAudio.numberOfChannels,
-              sampleRate: normalizedAudio.sampleRate,
-            }
-          : undefined,
+      audio: audioPipeline.audioConfig,
       fastStart: outputTarget.fastStart,
       firstTimestampBehavior: 'offset',
     });
@@ -458,88 +628,9 @@ export async function exportMosaicVideo(
     });
     videoEncoder.configure(videoConfig);
 
-    // 4. 音声のエンコード（映像PTSと厳密に同期した1024サンプルAACフレーム）
-    if (normalizedAudio && supportedAudioConfig && normalizedAudio.length > 0) {
-      onProgress({ currentFrame: 0, totalFrames, percent: 0, status: '音声トラックをエンコード中...' });
-      let audioEncodeError: Error | null = null;
-      const audioEncoder = new AudioEncoder({
-        output: (chunk, meta) => muxer.addAudioChunk(chunk, meta),
-        error: (e) => {
-          console.error('AudioEncoder error', e);
-          audioEncodeError = e;
-        },
-      });
-
-      let channelArrays: Float32Array[] = [];
-      try {
-        audioEncoder.configure({
-          ...supportedAudioConfig.encoderConfig,
-          numberOfChannels: normalizedAudio.numberOfChannels,
-          sampleRate: normalizedAudio.sampleRate,
-        });
-
-        const sampleRate = normalizedAudio.sampleRate;
-        const numChannels = normalizedAudio.numberOfChannels;
-        const maxAudioSamples = Math.ceil(duration * sampleRate);
-        const totalSamples = Math.min(normalizedAudio.length, maxAudioSamples);
-        const samplesPerChunk = 1024; // AAC固定ブロック長
-
-        channelArrays = [];
-        for (let ch = 0; ch < numChannels; ch++) {
-          channelArrays.push(normalizedAudio.getChannelData(ch));
-        }
-
-        for (let offset = 0; offset < totalSamples; offset += samplesPerChunk) {
-          if (audioEncodeError) break;
-          const frameCount = Math.min(samplesPerChunk, totalSamples - offset);
-
-          // 最終フレームが1024サンプル未満の場合、ゼロパディング（無音補完）してエンコーダのエラーを防止
-          const planarData = new Float32Array(samplesPerChunk * numChannels);
-          for (let ch = 0; ch < numChannels; ch++) {
-            planarData.set(
-              channelArrays[ch].subarray(offset, offset + frameCount),
-              ch * samplesPerChunk
-            );
-          }
-
-          const audioData = new AudioData({
-            format: 'f32-planar',
-            sampleRate,
-            numberOfFrames: samplesPerChunk,
-            numberOfChannels: numChannels,
-            timestamp: Math.round((offset / sampleRate) * 1_000_000),
-            data: planarData,
-          });
-          audioEncoder.encode(audioData);
-          audioData.close();
-
-          // メモリ蓄積を防ぐバックプレッシャー制御
-          while (audioEncoder.encodeQueueSize > 6) {
-            await new Promise((r) => setTimeout(r, 5));
-          }
-        }
-
-        await audioEncoder.flush();
-        audioEncoder.close();
-      } catch (aErr) {
-        try { audioEncoder.close(); } catch (_) {}
-        try { videoEncoder.close(); } catch (_) {}
-        throw aErr;
-      } finally {
-        // 音声エンコード完了後、映像フレームの描画に入る前にすべての音声メモリを即時解放（GC回収）
-        channelArrays.length = 0;
-        normalizedAudio = null;
-        audioBuffer = null;
-      }
-
-      if (audioEncodeError) {
-        try { videoEncoder.close(); } catch (_) {}
-        throw audioEncodeError;
-      }
-    } else {
-      // 音声なしまたはスキップの場合も確実に参照を破棄
-      normalizedAudio = null;
-      audioBuffer = null;
+    // 4. 音声チャンクの書き込み（無劣化ストリームまたはWebCodecsエンコード）
+    if (audioPipeline.audioConfig) {
+      await audioPipeline.addAudioChunks(muxer);
     }
 
     // 5. 映像フレームの順次レンダリングとエンコード
