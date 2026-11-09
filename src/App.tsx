@@ -8,7 +8,7 @@ import { ExportModal } from './components/ExportModal';
 import { EditorMode, MosaicTrack, MosaicType, Point, Keyframe, NormalizedPoint } from './types';
 import { Film, ListFilter, Clock, Play, Pause, RotateCcw, Trash2, Crosshair, Sparkles, AlertTriangle, X } from 'lucide-react';
 import { initFaceDetector, initPersonSegmenter, detectFacesSafely, segmentPersonSafely, resampleClosedPolygon, BODY_CONTOUR_POINTS, updatePersonTracks, expandBoxWithMargin, estimateBodyBoxFromFace, createBodySilhouettePolygon, isValidFaceDetection, FaceFilterOptions, GatekeeperContext, resetAnalysisState } from './utils/aiDetector';
-import { exportMosaicVideo, ExportProgress, saveOrShareBlob } from './utils/videoExporter';
+import { exportMosaicVideo, ExportProgress, saveOrShareBlob, isWebCodecsSupported, isInAppBrowser } from './utils/videoExporter';
 import { generateDemoVideoBlob } from './utils/sampleGenerator';
 import { renderTrackMosaic, renderInverseMosaic, ProtectedRegion } from './utils/mosaicRenderer';
 import { extractFeaturePoints, toGrayscale, trackBox, interpolateKeyframes } from './utils/tracking';
@@ -275,6 +275,29 @@ export const App: React.FC = () => {
 
         const norm = box.normalizedPoints || (box.points && box.points.length >= 3 ? absoluteToNormalizedPoints(box, box.points, NORMALIZED_POINT_COUNT) : undefined);
         const points = norm ? normalizedToAbsolutePoints(box, norm) : box.points;
+
+        // 静止画モードの場合：常に time: 0 の単一キーフレームとして確実に保持・更新（タイムライン分裂やホールド切れを防止）
+        if (isImage) {
+          return {
+            ...t,
+            startTime: 0,
+            endTime: 1,
+            trackingData: t.trackingData
+              ? { ...t.trackingData, isOutOfFrame: false, featurePoints: undefined }
+              : undefined,
+            keyframes: [
+              {
+                time: 0,
+                x: box.x,
+                y: box.y,
+                width: box.width,
+                height: box.height,
+                points,
+                normalizedPoints: norm,
+              },
+            ],
+          };
+        }
 
         // 1. キーフレームが1個以下のトラック（手動囲み直後や静止画）は、そのキーフレームを直接更新
         if (t.keyframes.length <= 1) {
@@ -655,16 +678,17 @@ export const App: React.FC = () => {
                   height: Math.round(prevKf.height * bPrevW + scaledBox.height * bCurrW),
                 };
 
-                // 頂点の最適な円周位相（位相ズレ最小化）
+                // 頂点の最適な円周位相（全周探索により急激な傾きや素早い動きでのねじれを完全防止）
                 if (prevKf.normalizedPoints && prevKf.normalizedPoints.length === normPoints.length) {
                   const N = normPoints.length;
                   let bestShift = 0;
                   let bestDist = Infinity;
 
-                  for (let shift = -3; shift <= 3; shift++) {
+                  // 0〜N-1（全周32通り）の二乗ユークリッド距離を探索し、直前形状と最も一致するインデックスを決定
+                  for (let shift = 0; shift < N; shift++) {
                     let dSum = 0;
                     for (let j = 0; j < N; j++) {
-                      const curNp = normPoints[(j + shift + N) % N];
+                      const curNp = normPoints[(j + shift) % N];
                       const prevNp = prevKf.normalizedPoints[j];
                       const du = curNp.u - prevNp.u;
                       const dv = curNp.v - prevNp.v;
@@ -677,7 +701,7 @@ export const App: React.FC = () => {
                   }
 
                   // 最適位相に回転
-                  const alignedNorm = normPoints.map((_, idx) => normPoints[(idx + bestShift + N) % N]);
+                  const alignedNorm = normPoints.map((_, idx) => normPoints[(idx + bestShift) % N]);
 
                   // 身体の凹凸（くびれ・首・腕）を100%保ちつつジッターのみ抑制 (prev 0.3, curr 0.7)
                   const pPrevW = 0.30;
@@ -1038,11 +1062,26 @@ export const App: React.FC = () => {
   const handleExport = async () => {
     if (!mediaFile) return;
 
-    if (!isImage && videoRef.current && videoRef.current.duration > 300) {
-      const proceed = window.confirm(
-        'ブラウザのメモリ制限のため、5分以上の動画は処理中に強制終了する可能性があります。短い動画にカットしてご利用ください。\n\nこのままエクスポートを続行しますか？'
-      );
-      if (!proceed) return;
+    if (!isImage && videoRef.current) {
+      if (!isWebCodecsSupported()) {
+        if (isInAppBrowser()) {
+          alert(
+            'LINEやSNS等のアプリ内ブラウザではWebCodecs動画書き出しが制限されています。\n画面右上のメニュー（︙等）から「ブラウザで開く（SafariまたはChrome）」を選択してご利用ください。'
+          );
+        } else {
+          alert(
+            'お使いのブラウザはWebCodecs API（MP4動画エクスポート）に対応していません。\n最新バージョンのSafari、Chrome、またはEdgeをご利用ください。'
+          );
+        }
+        return;
+      }
+
+      if (videoRef.current.duration > 300) {
+        const proceed = window.confirm(
+          'ブラウザのメモリ制限のため、5分以上の動画は処理中に強制終了する可能性があります。短い動画にカットしてご利用ください。\n\nこのままエクスポートを続行しますか？'
+        );
+        if (!proceed) return;
+      }
     }
 
     setIsExportModalOpen(true);
@@ -1083,10 +1122,7 @@ export const App: React.FC = () => {
         const protectedRegions: ProtectedRegion[] = [];
         tracks.forEach((track) => {
           if (!track.enabled) return;
-          const pos = interpolateKeyframes(track.keyframes, 0, {
-            screenWidth: workW,
-            screenHeight: workH,
-          });
+          const pos = track.keyframes[0];
           if (pos && !track.trackingData?.isOutOfFrame) {
             const targetBox = {
               x: offsetX + pos.x * scale,
@@ -1125,10 +1161,7 @@ export const App: React.FC = () => {
         // 通常モザイク適用
         tracks.forEach((track) => {
           if (!track.enabled) return;
-          const pos = interpolateKeyframes(track.keyframes, 0, {
-            screenWidth: workW,
-            screenHeight: workH,
-          });
+          const pos = track.keyframes[0];
           if (pos && !track.trackingData?.isOutOfFrame) {
             const targetBox = {
               x: offsetX + pos.x * scale,

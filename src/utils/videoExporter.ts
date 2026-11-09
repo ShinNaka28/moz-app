@@ -286,6 +286,26 @@ async function findSupportedVideoConfig(
 }
 
 /**
+ * ブラウザが WebCodecs API (VideoEncoder / VideoFrame) をサポートしているか判定
+ */
+export function isWebCodecsSupported(): boolean {
+  return (
+    typeof window !== 'undefined' &&
+    typeof window.VideoEncoder !== 'undefined' &&
+    typeof window.VideoFrame !== 'undefined'
+  );
+}
+
+/**
+ * LINE, Twitter/X, Instagram, Facebook 等のアプリ内ブラウザ（In-App Browser）か判定
+ */
+export function isInAppBrowser(): boolean {
+  if (typeof navigator === 'undefined') return false;
+  const ua = navigator.userAgent || '';
+  return /Line|FBAN|FBAV|Instagram|Twitter|Snapchat|MicroMessenger/i.test(ua);
+}
+
+/**
  * 動画の完全ローカルMP4書き出し（WebCodecs API + mp4-muxer による完全なmoovアトム構築）
  */
 export async function exportMosaicVideo(
@@ -296,9 +316,14 @@ export async function exportMosaicVideo(
   onProgress: (p: ExportProgress) => void
 ): Promise<Blob> {
   // WebCodecs サポートチェック
-  if (typeof window.VideoEncoder === 'undefined' || typeof window.VideoFrame === 'undefined') {
+  if (!isWebCodecsSupported()) {
+    if (isInAppBrowser()) {
+      throw new Error(
+        'LINEやSNS等のアプリ内ブラウザではWebCodecs動画書き出しが制限されています。画面右上のメニュー（︙等）から「ブラウザで開く（SafariまたはChrome）」を選択してご利用ください。'
+      );
+    }
     throw new Error(
-      'お使いのブラウザはWebCodecs API（高精度MP4出力）に対応していません。最新バージョンのChrome、Safari、またはEdgeをご利用ください。'
+      'お使いのブラウザはWebCodecs API（高精度MP4出力）に対応していません。最新バージョンのSafari、Chrome、またはEdgeをご利用ください。'
     );
   }
 

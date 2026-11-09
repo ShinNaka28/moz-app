@@ -2,7 +2,7 @@ import React, { useRef, useEffect, useState, useCallback } from 'react';
 import { EditorMode, MosaicTrack, MosaicType, Point, NormalizedPoint } from '../types';
 import { renderTrackMosaic, renderInverseMosaic, renderTrackOverlay, ProtectedRegion } from '../utils/mosaicRenderer';
 import { interpolateKeyframes, extractFeaturePoints, toGrayscale, trackBox } from '../utils/tracking';
-import { getClampedDimensions, absoluteToNormalizedPoints, resampleClosedPoints, NORMALIZED_POINT_COUNT } from '../utils/geometry';
+import { getClampedDimensions, absoluteToNormalizedPoints, normalizedToAbsolutePoints, resampleClosedPoints, NORMALIZED_POINT_COUNT } from '../utils/geometry';
 
 interface VideoCanvasProps {
   videoRef: React.RefObject<HTMLVideoElement | null>;
@@ -28,6 +28,36 @@ interface VideoCanvasProps {
   onUpdateTrackFrameOut: (trackId: string, isOutOfFrame: boolean) => void;
   onDeleteTrack?: (trackId: string) => void;
   onConvertTrackToPolygon?: (trackId: string) => void;
+}
+
+/**
+ * トラックの現在時刻の形状を安全に取得
+ * 静止画モードの場合はタイムライン補間や画面端ホールド切れ判定を回避し、先頭キーフレームを直接使用
+ */
+function getTrackPos(
+  track: MosaicTrack,
+  targetTime: number,
+  isImage: boolean,
+  sw?: number,
+  sh?: number
+): { x: number; y: number; width: number; height: number; points?: Point[]; normalizedPoints?: NormalizedPoint[] } | null {
+  if (isImage && track.keyframes.length > 0) {
+    const kf = track.keyframes[0];
+    const box = { x: kf.x, y: kf.y, width: kf.width, height: kf.height };
+    const norm =
+      kf.normalizedPoints && kf.normalizedPoints.length > 0
+        ? kf.normalizedPoints
+        : kf.points && kf.points.length >= 3
+        ? absoluteToNormalizedPoints(box, kf.points, NORMALIZED_POINT_COUNT)
+        : undefined;
+    const points = norm ? normalizedToAbsolutePoints(box, norm) : kf.points;
+    return { ...box, points, normalizedPoints: norm };
+  }
+  return interpolateKeyframes(track.keyframes, targetTime, {
+    screenWidth: sw,
+    screenHeight: sh,
+    hasFutureManualKeyframe: track.keyframes.some((k) => k.time > targetTime),
+  });
 }
 
 export const VideoCanvas: React.FC<VideoCanvasProps> = ({
@@ -274,11 +304,7 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
 
     // 現在の表示位置を計算（ドラッグ変形・移動中はリアルタイムに反映）
     const getEffectivePos = (track: MosaicTrack) => {
-      const pos = interpolateKeyframes(track.keyframes, currentTime, {
-        screenWidth: canvas.width,
-        screenHeight: canvas.height,
-        hasFutureManualKeyframe: track.keyframes.some((k) => k.time > currentTime),
-      });
+      const pos = getTrackPos(track, currentTime, isImage, canvas.width, canvas.height);
       if (!pos) return null;
 
       if (transformRef.current && transformRef.current.trackId === track.id) {
@@ -469,12 +495,8 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
     // ※キャンバス上の誤タップによる枠消失を防ぐため、キャンバス内での直接削除判定は行わず、移動・リサイズのみに特化
     if (selectedTrackId) {
       const selectedTrack = tracks.find((t) => t.id === selectedTrackId);
-      if (selectedTrack && currentTime >= selectedTrack.startTime && currentTime <= selectedTrack.endTime) {
-        const pos = interpolateKeyframes(selectedTrack.keyframes, currentTime, {
-          screenWidth: canvas?.width,
-          screenHeight: canvas?.height,
-          hasFutureManualKeyframe: selectedTrack.keyframes.some((k) => k.time > currentTime),
-        });
+      if (selectedTrack && (isImage || (currentTime >= selectedTrack.startTime && currentTime <= selectedTrack.endTime))) {
+        const pos = getTrackPos(selectedTrack, currentTime, isImage, canvas?.width, canvas?.height);
         if (pos) {
           // 1-A. ポリゴン・フリー囲みの「頂点ハンドル（●）」タッチ判定を最優先！
           // 輪郭上の黄色い丸（●）をドラッグすることで、人物の身体のラインに手動でぴったり合わせられる
@@ -585,12 +607,8 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
     // 2. 他の既存トラックをクリックしたか判定（枠の上を触ればいつでもその枠を選択して移動開始）
     for (let i = tracks.length - 1; i >= 0; i--) {
       const track = tracks[i];
-      if (currentTime < track.startTime || currentTime > track.endTime) continue;
-      const pos = interpolateKeyframes(track.keyframes, currentTime, {
-        screenWidth: canvas?.width,
-        screenHeight: canvas?.height,
-        hasFutureManualKeyframe: track.keyframes.some((k) => k.time > currentTime),
-      });
+      if (!isImage && (currentTime < track.startTime || currentTime > track.endTime)) continue;
+      const pos = getTrackPos(track, currentTime, isImage, canvas?.width, canvas?.height);
       if (!pos) continue;
 
       if (
@@ -673,11 +691,7 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
       if (selectedTrackId) {
         const selectedTrack = tracks.find((t) => t.id === selectedTrackId);
         if (selectedTrack) {
-          const pos = interpolateKeyframes(selectedTrack.keyframes, currentTime, {
-            screenWidth: canvasRef.current?.width,
-            screenHeight: canvasRef.current?.height,
-            hasFutureManualKeyframe: selectedTrack.keyframes.some((k) => k.time > currentTime),
-          });
+          const pos = getTrackPos(selectedTrack, currentTime, isImage, canvasRef.current?.width, canvasRef.current?.height);
           if (pos) {
             if (
               (selectedTrack.shape === 'polygon' || selectedTrack.shape === 'lasso') &&
