@@ -423,8 +423,8 @@ async function prepareAudioPipeline(
     if (audioTrack) {
       const codec = await audioTrack.getCodec();
       if (codec === 'aac' || codec === 'opus') {
-        const sampleRate = await audioTrack.getSampleRate();
-        const numberOfChannels = await audioTrack.getNumberOfChannels();
+        const sampleRate = (await audioTrack.getSampleRate()) || 44100;
+        const numberOfChannels = (await audioTrack.getNumberOfChannels()) || 2;
 
         return {
           audioConfig: {
@@ -434,12 +434,29 @@ async function prepareAudioPipeline(
           },
           addAudioChunks: async (muxer: Muxer<any>) => {
             onProgress('音声トラック（無劣化ストリーム）を結合中...');
-            const sink = new EncodedPacketSink(audioTrack);
-            for await (const packet of sink.packets()) {
-              if (packet.timestamp > duration + 0.1) break;
-              const timestampUs = Math.round(Math.max(0, packet.timestamp) * 1e6);
-              const durationUs = Math.round(packet.duration * 1e6);
-              muxer.addAudioChunkRaw(packet.data, packet.type, timestampUs, durationUs);
+            try {
+              const sink = new EncodedPacketSink(audioTrack);
+              let firstTimestamp: number | null = null;
+              let lastTimestampUs = -1;
+
+              for await (const packet of sink.packets()) {
+                if (firstTimestamp === null) {
+                  firstTimestamp = packet.timestamp;
+                }
+                const relativeSec = packet.timestamp - firstTimestamp;
+                if (relativeSec > duration + 0.1) break;
+
+                let timestampUs = Math.round(Math.max(0, relativeSec) * 1e6);
+                if (timestampUs < lastTimestampUs) {
+                  timestampUs = lastTimestampUs; // 単調非減少を保証
+                }
+                lastTimestampUs = timestampUs;
+                const durationUs = Math.max(1, Math.round(packet.duration * 1e6));
+                muxer.addAudioChunkRaw(packet.data, packet.type, timestampUs, durationUs);
+              }
+            } finally {
+              // 抽出完了後にMediabunnyリソースを即座に破棄してメモリリークを完全防止
+              input.dispose();
             }
           },
         };
