@@ -364,16 +364,41 @@ export async function exportMosaicVideo(
     // 1. オリジナル音声のデコードと解析（Web Audio API）
     onProgress({ currentFrame: 0, totalFrames, percent: 0, status: '元動画の音声トラックを展開中...' });
     let audioBuffer: AudioBuffer | null = null;
-    try {
-      const arrayBuffer = await videoFile.arrayBuffer();
-      const AudioCtx =
-        window.AudioContext ||
-        (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-      const audioCtx = new AudioCtx();
-      audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
-      await audioCtx.close().catch(() => {});
-    } catch (err) {
-      console.warn('音声トラックの取得をスキップまたは音声なし:', err);
+    const isMobile =
+      typeof navigator !== 'undefined' &&
+      /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+    // モバイル端末ではRAM制限が極めて厳しいため、120MBを超える動画ファイルは音声展開によるOOMを防止し映像優先にする
+    const MAX_AUDIO_SAFE_FILE_SIZE = isMobile ? 120 * 1024 * 1024 : 350 * 1024 * 1024;
+
+    if (videoFile.size > MAX_AUDIO_SAFE_FILE_SIZE) {
+      console.warn(
+        `動画ファイルサイズ (${Math.round(videoFile.size / 1024 / 1024)}MB) が安全上限 (${Math.round(
+          MAX_AUDIO_SAFE_FILE_SIZE / 1024 / 1024
+        )}MB) を超えているため、メモリクラッシュを防止し映像優先で高速出力します。`
+      );
+      onProgress({
+        currentFrame: 0,
+        totalFrames,
+        percent: 0,
+        status: 'メモリ保護: 大容量動画のため映像を優先して高速処理中...',
+      });
+    } else {
+      try {
+        let arrayBuffer: ArrayBuffer | null = await videoFile.arrayBuffer();
+        const AudioCtx =
+          window.AudioContext ||
+          (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+        const audioCtx = new AudioCtx();
+        try {
+          audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+        } finally {
+          // デコード完了またはエラー発生時に即座にArrayBuffer参照を解放しGCを促す
+          arrayBuffer = null;
+          await audioCtx.close().catch(() => {});
+        }
+      } catch (err) {
+        console.warn('音声トラックの取得をスキップまたは音声なし:', err);
+      }
     }
 
     const supportedAudioConfig = audioBuffer
@@ -388,6 +413,10 @@ export async function exportMosaicVideo(
           supportedAudioConfig.encoderConfig.sampleRate,
           supportedAudioConfig.encoderConfig.numberOfChannels
         );
+        // リサンプリングが行われて別のAudioBufferが作成された場合、不要になった元バッファを即時破棄
+        if (normalizedAudio !== audioBuffer) {
+          audioBuffer = null;
+        }
       } catch (e) {
         console.warn('Audio normalization failed, using original buffer:', e);
         normalizedAudio = audioBuffer;
@@ -441,6 +470,7 @@ export async function exportMosaicVideo(
         },
       });
 
+      let channelArrays: Float32Array[] = [];
       try {
         audioEncoder.configure({
           ...supportedAudioConfig.encoderConfig,
@@ -454,7 +484,7 @@ export async function exportMosaicVideo(
         const totalSamples = Math.min(normalizedAudio.length, maxAudioSamples);
         const samplesPerChunk = 1024; // AAC固定ブロック長
 
-        const channelArrays: Float32Array[] = [];
+        channelArrays = [];
         for (let ch = 0; ch < numChannels; ch++) {
           channelArrays.push(normalizedAudio.getChannelData(ch));
         }
@@ -495,12 +525,21 @@ export async function exportMosaicVideo(
         try { audioEncoder.close(); } catch (_) {}
         try { videoEncoder.close(); } catch (_) {}
         throw aErr;
+      } finally {
+        // 音声エンコード完了後、映像フレームの描画に入る前にすべての音声メモリを即時解放（GC回収）
+        channelArrays.length = 0;
+        normalizedAudio = null;
+        audioBuffer = null;
       }
 
       if (audioEncodeError) {
         try { videoEncoder.close(); } catch (_) {}
         throw audioEncodeError;
       }
+    } else {
+      // 音声なしまたはスキップの場合も確実に参照を破棄
+      normalizedAudio = null;
+      audioBuffer = null;
     }
 
     // 5. 映像フレームの順次レンダリングとエンコード
