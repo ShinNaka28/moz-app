@@ -6,7 +6,7 @@ import { Timeline } from './components/Timeline';
 import { PersonListPanel } from './components/PersonListPanel';
 import { ExportModal } from './components/ExportModal';
 import { EditorMode, MosaicTrack, MosaicType, Point, Keyframe, NormalizedPoint } from './types';
-import { Film, ListFilter, Clock, Play, Pause, RotateCcw, Trash2, Crosshair, Sparkles, AlertTriangle, X } from 'lucide-react';
+import { Film, ListFilter, Clock, Play, Pause, RotateCcw, Trash2, Crosshair, Sparkles, AlertTriangle, X, ChevronLeft, ChevronRight, ChevronFirst, ChevronLast } from 'lucide-react';
 import { initFaceDetector, initPersonSegmenter, detectFacesSafely, segmentPersonSafely, resampleClosedPolygon, BODY_CONTOUR_POINTS, updatePersonTracks, expandBoxWithMargin, estimateBodyBoxFromFace, createBodySilhouettePolygon, isValidFaceDetection, FaceFilterOptions, GatekeeperContext, resetAnalysisState, calcIoU } from './utils/aiDetector';
 import { exportMosaicVideo, ExportProgress, saveOrShareBlob, isWebCodecsSupported, isInAppBrowser } from './utils/videoExporter';
 import { generateDemoVideoBlob } from './utils/sampleGenerator';
@@ -245,7 +245,7 @@ export const App: React.FC = () => {
     setTracks((prev) =>
       prev.map((t) => {
         if (t.id !== selectedTrackId) return t;
-        const filtered = t.keyframes.filter((k) => Math.abs(k.time - currentTime) > 0.05);
+        const filtered = t.keyframes.filter((k) => Math.abs(k.time - currentTime) >= 0.016);
         return {
           ...t,
           keyframes: [
@@ -257,11 +257,53 @@ export const App: React.FC = () => {
               width: pos.width,
               height: pos.height,
               points: pos.points,
+              normalizedPoints: pos.normalizedPoints,
             },
           ].sort((a, b) => a.time - b.time),
         };
       })
     );
+  };
+
+  // 1フレーム送り・戻し（30fps基準、累積誤差を避けるため整数インデックスで計算）
+  const handleStepFrame = (deltaFrames: number) => {
+    if (isImage || duration <= 0) return;
+    setIsPlaying(false);
+    if (videoRef.current) {
+      videoRef.current.pause();
+    }
+    const currentFrame = Math.round(currentTime * 30);
+    const totalFrames = Math.max(1, Math.round(duration * 30));
+    const targetFrame = Math.max(0, Math.min(totalFrames, currentFrame + deltaFrames));
+    const targetTime = targetFrame / 30;
+    handleSeek(targetTime);
+  };
+
+  // 前後のキーフレームへジャンプ
+  const handleJumpToKeyframe = (direction: 'prev' | 'next') => {
+    if (!selectedTrackId) return;
+    const track = tracks.find((t) => t.id === selectedTrackId);
+    if (!track || track.keyframes.length === 0) return;
+    setIsPlaying(false);
+    if (videoRef.current) {
+      videoRef.current.pause();
+    }
+    const times = track.keyframes.map((k) => k.time).sort((a, b) => a - b);
+    if (direction === 'prev') {
+      const prevTimes = times.filter((t) => t < currentTime - 0.016);
+      if (prevTimes.length > 0) {
+        handleSeek(prevTimes[prevTimes.length - 1]);
+      } else {
+        handleSeek(0);
+      }
+    } else {
+      const nextTimes = times.filter((t) => t > currentTime + 0.016);
+      if (nextTimes.length > 0) {
+        handleSeek(nextTimes[0]);
+      } else {
+        handleSeek(duration);
+      }
+    }
   };
 
   const handleUpdateTrackKeyframe = (
@@ -343,10 +385,10 @@ export const App: React.FC = () => {
 
         // 3. ユーザーが手動で外枠操作・32頂点ドラッグ変形した場合：
         // 現在時刻 currentTime に「キーフレーム」として記録する。
-        // 近傍（0.08秒以内）の既存キーフレームがあれば更新し、なければ新規追加。
+        // 近傍（0.016秒以内＝同コマ内）の既存キーフレームがあれば更新し、なければ新規追加（1コマ毎の連続編集を完全保証）。
         // 2つのキーフレーム間（例: 10F目と40F目）は interpolateKeyframes の Lerp で自動変形し、
         // 後続にキーフレームがない場合は直前のキーフレームの状態を維持（ホールド）します。
-        const filtered = t.keyframes.filter((k) => Math.abs(k.time - currentTime) >= 0.08);
+        const filtered = t.keyframes.filter((k) => Math.abs(k.time - currentTime) >= 0.016);
         const newKeyframes = [
           ...filtered,
           {
@@ -1263,7 +1305,7 @@ export const App: React.FC = () => {
 
   const selectedTrack = tracks.find((t) => t.id === selectedTrackId) || null;
   const hasKeyframeAtCurrentTime = Boolean(
-    selectedTrack?.keyframes.some((k) => Math.abs(k.time - currentTime) < 0.1)
+    selectedTrack?.keyframes.some((k) => Math.abs(k.time - currentTime) < 0.016)
   );
 
   const formatTimeStr = (sec: number) => {
@@ -1488,13 +1530,14 @@ export const App: React.FC = () => {
                 onConvertTrackToPolygon={handleConvertTrackToPolygon}
               />
 
-              {/* スマホ専用の直感クイック操作バー（動画を見ながらワンタップで再生・シーク・確認・追従解析可能） */}
+              {/* スマホ専用の直感クイック操作＆1フレーム送り・キーフレーム編集バー */}
               {!isImage && (
-                <div className="md:hidden bg-slate-900 border-t border-slate-800 p-2 flex flex-col gap-1.5 text-xs">
+                <div className="md:hidden bg-slate-900 border-t border-slate-800 p-2 flex flex-col gap-2 text-xs select-none">
+                  {/* Row 1: 再生/停止 + シークバー + 時間表示 */}
                   <div className="flex items-center justify-between gap-2">
                     <button
                       onClick={togglePlay}
-                      className="p-1.5 bg-indigo-600 text-white rounded-lg shadow font-bold flex items-center justify-center shrink-0 w-8 h-8"
+                      className="p-1.5 bg-indigo-600 active:bg-indigo-700 text-white rounded-lg shadow font-bold flex items-center justify-center shrink-0 w-8 h-8"
                       title={isPlaying ? '一時停止' : '再生'}
                     >
                       {isPlaying ? <Pause size={16} /> : <Play size={16} className="ml-0.5" />}
@@ -1505,7 +1548,7 @@ export const App: React.FC = () => {
                         type="range"
                         min="0"
                         max={duration || 1}
-                        step="0.05"
+                        step="0.033333"
                         value={currentTime}
                         onChange={(e) => handleSeek(Number(e.target.value))}
                         className="w-full accent-indigo-500 h-2 bg-slate-800 rounded-lg cursor-pointer"
@@ -1516,11 +1559,82 @@ export const App: React.FC = () => {
                     </div>
                   </div>
 
-                  {/* 選択枠の操作クイックボタン */}
+                  {/* Row 2: 1コマ送り・戻し ＆ キーフレーム固定・移動コントロール */}
+                  <div className="flex items-center justify-between gap-1 bg-slate-950/60 p-1.5 rounded-lg border border-slate-800">
+                    {/* コマ送り/戻し & KFジャンプ */}
+                    <div className="flex items-center gap-1">
+                      <button
+                        onClick={() => handleJumpToKeyframe('prev')}
+                        disabled={!selectedTrack || selectedTrack.keyframes.length === 0}
+                        className="p-1.5 bg-slate-800 hover:bg-slate-700 active:bg-slate-600 disabled:opacity-30 disabled:pointer-events-none text-slate-300 rounded font-semibold flex items-center justify-center"
+                        title="前のキーフレームへ"
+                      >
+                        <ChevronFirst size={15} />
+                      </button>
+                      <button
+                        onClick={() => handleStepFrame(-1)}
+                        className="px-2 py-1 bg-slate-800 hover:bg-slate-700 active:bg-slate-600 text-slate-200 rounded font-mono font-bold flex items-center gap-0.5 text-[11px]"
+                        title="1コマ戻る (-1F)"
+                      >
+                        <ChevronLeft size={13} />
+                        <span>-1F</span>
+                      </button>
+                    </div>
+
+                    {/* フレーム番号表示バッジ */}
+                    <div className="flex flex-col items-center px-1 font-mono text-[10px] text-slate-400">
+                      <span className="text-cyan-400 font-bold text-[11px]">
+                        F{Math.round(currentTime * 30)}
+                      </span>
+                      <span>/ {Math.max(1, Math.round(duration * 30))}</span>
+                    </div>
+
+                    {/* コマ進み & KFジャンプ */}
+                    <div className="flex items-center gap-1">
+                      <button
+                        onClick={() => handleStepFrame(1)}
+                        className="px-2 py-1 bg-slate-800 hover:bg-slate-700 active:bg-slate-600 text-slate-200 rounded font-mono font-bold flex items-center gap-0.5 text-[11px]"
+                        title="1コマ進む (+1F)"
+                      >
+                        <span>+1F</span>
+                        <ChevronRight size={13} />
+                      </button>
+                      <button
+                        onClick={() => handleJumpToKeyframe('next')}
+                        disabled={!selectedTrack || selectedTrack.keyframes.length === 0}
+                        className="p-1.5 bg-slate-800 hover:bg-slate-700 active:bg-slate-600 disabled:opacity-30 disabled:pointer-events-none text-slate-300 rounded font-semibold flex items-center justify-center"
+                        title="次のキーフレームへ"
+                      >
+                        <ChevronLast size={15} />
+                      </button>
+                    </div>
+
+                    {/* 枠固定（キーフレーム登録・更新）ボタン */}
+                    {selectedTrack && (
+                      <button
+                        onClick={handleAddKeyframeAtCurrentTime}
+                        className={`px-2.5 py-1 text-[11px] font-bold rounded flex items-center gap-1 transition-colors ${
+                          hasKeyframeAtCurrentTime
+                            ? 'bg-amber-500/20 text-amber-300 border border-amber-500/50'
+                            : 'bg-emerald-600 hover:bg-emerald-500 active:bg-emerald-700 text-white shadow'
+                        }`}
+                        title="現在コマのモザイク位置・形をキーフレームとして記録"
+                      >
+                        <span>{hasKeyframeAtCurrentTime ? '枠固定済' : '枠固定'}</span>
+                      </button>
+                    )}
+                  </div>
+
+                  {/* Row 3: 選択枠の操作クイックボタン */}
                   {selectedTrack && (
-                    <div className="flex items-center justify-between gap-2 pt-1 border-t border-slate-800/80">
-                      <span className="text-[11px] text-cyan-400 font-semibold truncate max-w-[140px]">
+                    <div className="flex items-center justify-between gap-2 pt-0.5">
+                      <span className="text-[11px] text-cyan-400 font-semibold truncate max-w-[130px]">
                         {selectedTrack.name}
+                        {selectedTrack.keyframes.length > 0 && (
+                          <span className="text-[10px] text-slate-400 font-normal ml-1">
+                            ({selectedTrack.keyframes.length}点)
+                          </span>
+                        )}
                       </span>
                       <div className="flex items-center gap-1.5">
                         {selectedTrack.type === 'tracked' && (
