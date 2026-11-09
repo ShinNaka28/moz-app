@@ -168,8 +168,6 @@ export const ExportModal: React.FC<ExportModalProps> = ({
                 <video
                   src={previewUrl}
                   controls
-                  autoPlay
-                  loop
                   playsInline
                   className="max-h-[50vh] max-w-full object-contain"
                 />
