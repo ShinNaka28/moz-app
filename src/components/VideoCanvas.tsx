@@ -39,7 +39,8 @@ function getTrackPos(
   targetTime: number,
   isImage: boolean,
   sw?: number,
-  sh?: number
+  sh?: number,
+  isSelected?: boolean
 ): { x: number; y: number; width: number; height: number; points?: Point[]; normalizedPoints?: NormalizedPoint[] } | null {
   if (isImage && track.keyframes.length > 0) {
     const kf = track.keyframes[0];
@@ -53,10 +54,11 @@ function getTrackPos(
     const points = norm ? normalizedToAbsolutePoints(box, norm) : kf.points;
     return { ...box, points, normalizedPoints: norm };
   }
+  const isEditing = Boolean(isSelected);
   return interpolateKeyframes(track.keyframes, targetTime, {
     screenWidth: sw,
     screenHeight: sh,
-    hasFutureManualKeyframe: track.keyframes.some((k) => k.time > targetTime),
+    hasFutureManualKeyframe: isEditing || track.keyframes.some((k) => k.time > targetTime),
   });
 }
 
@@ -304,7 +306,7 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
 
     // 現在の表示位置を計算（ドラッグ変形・移動中はリアルタイムに反映）
     const getEffectivePos = (track: MosaicTrack) => {
-      const pos = getTrackPos(track, currentTime, isImage, canvas.width, canvas.height);
+      const pos = getTrackPos(track, currentTime, isImage, canvas.width, canvas.height, track.id === selectedTrackId);
       if (!pos) return null;
 
       if (transformRef.current && transformRef.current.trackId === track.id) {
@@ -496,7 +498,7 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
     if (selectedTrackId) {
       const selectedTrack = tracks.find((t) => t.id === selectedTrackId);
       if (selectedTrack && (isImage || (currentTime >= selectedTrack.startTime && currentTime <= selectedTrack.endTime))) {
-        const pos = getTrackPos(selectedTrack, currentTime, isImage, canvas?.width, canvas?.height);
+        const pos = getTrackPos(selectedTrack, currentTime, isImage, canvas?.width, canvas?.height, true);
         if (pos) {
           // 1-A. ポリゴン・フリー囲みの「頂点ハンドル（●）」タッチ判定を最優先！
           // 輪郭上の黄色い丸（●）をドラッグすることで、人物の身体のラインに手動でぴったり合わせられる
@@ -691,7 +693,7 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
       if (selectedTrackId) {
         const selectedTrack = tracks.find((t) => t.id === selectedTrackId);
         if (selectedTrack) {
-          const pos = getTrackPos(selectedTrack, currentTime, isImage, canvasRef.current?.width, canvasRef.current?.height);
+          const pos = getTrackPos(selectedTrack, currentTime, isImage, canvasRef.current?.width, canvasRef.current?.height, true);
           if (pos) {
             if (
               (selectedTrack.shape === 'polygon' || selectedTrack.shape === 'lasso') &&
