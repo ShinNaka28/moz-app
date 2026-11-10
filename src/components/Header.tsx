@@ -1,5 +1,5 @@
 import React from 'react';
-import { ShieldCheck, Video, Image as ImageIcon, Sparkles, Download, PlayCircle } from 'lucide-react';
+import { ShieldCheck, Video, Image as ImageIcon, Sparkles, Download, PlayCircle, Volume2, VolumeX } from 'lucide-react';
 
 interface HeaderProps {
   onOpenFile: (e: React.ChangeEvent<HTMLInputElement>) => void;
@@ -7,6 +7,9 @@ interface HeaderProps {
   onExport: () => void;
   hasMedia: boolean;
   isProcessing: boolean;
+  isImage?: boolean;
+  includeAudio?: boolean;
+  onToggleAudio?: () => void;
 }
 
 export const Header: React.FC<HeaderProps> = ({
@@ -15,6 +18,9 @@ export const Header: React.FC<HeaderProps> = ({
   onExport,
   hasMedia,
   isProcessing,
+  isImage = false,
+  includeAudio = true,
+  onToggleAudio,
 }) => {
   return (
     <header className="bg-slate-900 border-b border-slate-800 px-3 py-2 sm:px-4 sm:py-2.5 flex flex-wrap items-center justify-between gap-2 shadow-md">
@@ -63,6 +69,26 @@ export const Header: React.FC<HeaderProps> = ({
           <span className="hidden sm:inline">デモ動画を生成</span>
           <span className="sm:hidden">デモ</span>
         </button>
+
+        {hasMedia && !isImage && onToggleAudio && (
+          <button
+            onClick={onToggleAudio}
+            disabled={isProcessing}
+            className={`flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-semibold rounded-lg border transition shadow-sm ${
+              includeAudio
+                ? 'bg-slate-800 hover:bg-slate-700 border-slate-700 text-slate-200'
+                : 'bg-rose-950/70 hover:bg-rose-900/80 border-rose-700/60 text-rose-300'
+            }`}
+            title={includeAudio ? '音声あり（クリックでミュート出力に切替）' : '音声なし（クリックで音声ありに切替）'}
+          >
+            {includeAudio ? (
+              <Volume2 size={14} className="text-cyan-400" />
+            ) : (
+              <VolumeX size={14} className="text-rose-400" />
+            )}
+            <span className="hidden sm:inline">{includeAudio ? '音声あり' : '音声なし'}</span>
+          </button>
+        )}
 
         <button
           onClick={onExport}

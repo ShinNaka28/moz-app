@@ -17,6 +17,7 @@ export interface ExportOptions {
   isInverseMosaic?: boolean;
   inverseMosaicType?: MosaicType;
   inverseStrength?: number;
+  includeAudio?: boolean;
 }
 
 interface MuxerOutputTarget {
@@ -1202,9 +1203,13 @@ export async function exportMosaicVideo(
     if (!srcCtx) throw new Error('Source canvas context error');
 
     // 1. 音声トラックの解析・準備（完全な AudioSpecificConfig / esds 保証付き）
-    const audioPipeline = await prepareAudioPipeline(videoFile, duration, (status) => {
-      onProgress({ currentFrame: 0, totalFrames, percent: 0, status });
-    });
+    // includeAudio が false の場合は音声パイプラインをバイパスして完全ミュート出力（処理時間とファイルサイズを削減）
+    const shouldIncludeAudio = options.includeAudio !== false;
+    const audioPipeline = shouldIncludeAudio
+      ? await prepareAudioPipeline(videoFile, duration, (status) => {
+          onProgress({ currentFrame: 0, totalFrames, percent: 0, status });
+        })
+      : { audioConfig: undefined, chunks: [] };
 
     const hasValidAudio = Boolean(audioPipeline.audioConfig && audioPipeline.chunks.length > 0);
 

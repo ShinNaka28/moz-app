@@ -46,6 +46,7 @@ export const App: React.FC = () => {
   const [exportProgress, setExportProgress] = useState<ExportProgress | null>(null);
   const [exportedBlob, setExportedBlob] = useState<Blob | null>(null);
   const [isExportModalOpen, setIsExportModalOpen] = useState<boolean>(false);
+  const [includeAudio, setIncludeAudio] = useState<boolean>(true);
 
   // 要素参照
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -1326,6 +1327,7 @@ export const App: React.FC = () => {
             isInverseMosaic,
             inverseMosaicType,
             inverseStrength,
+            includeAudio,
           },
           (prog) => setExportProgress(prog)
         );
@@ -1389,6 +1391,9 @@ export const App: React.FC = () => {
         onExport={handleExport}
         hasMedia={Boolean(mediaFile)}
         isProcessing={isAIDetecting || isTrackingProcessing}
+        isImage={isImage}
+        includeAudio={includeAudio}
+        onToggleAudio={() => setIncludeAudio((prev) => !prev)}
       />
 
       {/* ツールバー */}
