@@ -1329,6 +1329,7 @@ export const App: React.FC = () => {
             <img
               ref={imageRef}
               src={mediaUrl}
+              crossOrigin="anonymous"
               alt="Source"
               onLoad={() => {
                 setDuration(1);
@@ -1339,6 +1340,7 @@ export const App: React.FC = () => {
             <video
               ref={videoRef}
               src={mediaUrl}
+              crossOrigin="anonymous"
               preload="auto"
               onLoadedMetadata={handleLoadedMetadata}
               onTimeUpdate={handleTimeUpdate}

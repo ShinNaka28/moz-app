@@ -167,6 +167,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
               ) : (
                 <video
                   src={previewUrl}
+                  crossOrigin="anonymous"
                   controls
                   playsInline
                   className="max-h-[50vh] max-w-full object-contain"

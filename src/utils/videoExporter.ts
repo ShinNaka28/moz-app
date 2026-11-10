@@ -107,7 +107,7 @@ async function prepareMuxerTarget(durationSec: number): Promise<MuxerOutputTarge
 }
 
 /**
- * ビデオ要素の指定秒への確実なシーク（描画完了検知＆待機タイムアウト＆重複シーク防止付き）
+ * ビデオ要素の指定秒への確実なシーク（待機タイムアウト＆重複シーク防止付き）
  */
 async function seekVideoElement(video: HTMLVideoElement, targetTime: number): Promise<void> {
   if (Math.abs(video.currentTime - targetTime) < 0.005) {
@@ -115,34 +115,21 @@ async function seekVideoElement(video: HTMLVideoElement, targetTime: number): Pr
   }
   return new Promise<void>((resolve) => {
     let isDone = false;
-    let rvfcId: number | null = null;
+    const timer = setTimeout(() => {
+      if (!isDone) {
+        isDone = true;
+        video.removeEventListener('seeked', onSeeked);
+        resolve(); // 万一seekedイベントが欠落しても最大800msで自己回復
+      }
+    }, 800);
 
-    const finish = () => {
+    const onSeeked = () => {
       if (!isDone) {
         isDone = true;
         clearTimeout(timer);
-        if (rvfcId !== null && typeof (video as any).cancelVideoFrameCallback === 'function') {
-          try {
-            (video as any).cancelVideoFrameCallback(rvfcId);
-          } catch (_) {}
-        }
         video.removeEventListener('seeked', onSeeked);
         resolve();
       }
-    };
-
-    const timer = setTimeout(finish, 1000);
-
-    const onSeeked = () => {
-      if (typeof (video as any).requestVideoFrameCallback === 'function') {
-        try {
-          rvfcId = (video as any).requestVideoFrameCallback(() => {
-            finish();
-          });
-          return;
-        } catch (_) {}
-      }
-      finish();
     };
 
     video.addEventListener('seeked', onSeeked, { once: true });
@@ -1099,6 +1086,9 @@ export async function exportMosaicVideo(
   };
   document.addEventListener('visibilitychange', handleVisibilityChange);
 
+  let activeVideo: HTMLVideoElement = videoElement;
+  let dedicatedVideoUrl: string | null = null;
+
   try {
     videoElement.pause();
 
@@ -1111,17 +1101,66 @@ export async function exportMosaicVideo(
     const totalFrames = Math.max(1, Math.floor(duration * fps));
 
     // レンダリング用キャンバス準備
-    const exportCanvas = document.createElement('canvas');
+    let exportCanvas = document.createElement('canvas');
     exportCanvas.width = videoWidth;
     exportCanvas.height = videoHeight;
-    const ctx = exportCanvas.getContext('2d', { willReadFrequently: true });
+    let ctx = exportCanvas.getContext('2d', { willReadFrequently: true });
     if (!ctx) throw new Error('Canvas context could not be created');
 
-    const sourceCanvas = document.createElement('canvas');
+    let sourceCanvas = document.createElement('canvas');
     sourceCanvas.width = videoWidth;
     sourceCanvas.height = videoHeight;
-    const srcCtx = sourceCanvas.getContext('2d');
+    let srcCtx = sourceCanvas.getContext('2d');
     if (!srcCtx) throw new Error('Source canvas context error');
+
+    // 【重要】Android Chrome や iOS Safari での Tainted Source (汚染元) 検証と自動修復:
+    // DOM要素（videoElement）が no-cors 属性で読み込まれていた場合や外部由来フラグで汚染されている場合、
+    // そのまま drawImage するとキャンバスが永久に Tainted 状態になり、new VideoFrame(exportCanvas) で
+    // 「Failed to construct 'VideoFrame': VideoFrames can't be created from tainted sources」が発生します。
+    // ここで事前に getImageData によるクリーン判定を行い、汚染を検知した場合はエクスポート専用の独立した
+    // crossOrigin='anonymous' 動画要素を生成して 100% 回復させます。
+    let isOriginClean = true;
+    try {
+      if (videoElement.crossOrigin !== 'anonymous') {
+        videoElement.crossOrigin = 'anonymous';
+      }
+      srcCtx.drawImage(videoElement, 0, 0, 16, 16);
+      srcCtx.getImageData(0, 0, 1, 1);
+      srcCtx.clearRect(0, 0, 16, 16);
+    } catch (_) {
+      isOriginClean = false;
+    }
+
+    if (!isOriginClean) {
+      console.warn('DOM videoElement is tainted. Initializing dedicated clean CORS video for export.');
+      const cleanVideo = document.createElement('video');
+      cleanVideo.crossOrigin = 'anonymous';
+      cleanVideo.preload = 'auto';
+      cleanVideo.playsInline = true;
+      cleanVideo.muted = true;
+      dedicatedVideoUrl = URL.createObjectURL(videoFile);
+      cleanVideo.src = dedicatedVideoUrl;
+
+      await new Promise<void>((resolve) => {
+        cleanVideo.onloadedmetadata = () => resolve();
+        cleanVideo.onerror = () => resolve();
+        setTimeout(resolve, 2000);
+      });
+      activeVideo = cleanVideo;
+
+      // 汚染フラグを完全に破棄するため、新しいクリーンキャンバスを再生成
+      sourceCanvas = document.createElement('canvas');
+      sourceCanvas.width = videoWidth;
+      sourceCanvas.height = videoHeight;
+      srcCtx = sourceCanvas.getContext('2d');
+      if (!srcCtx) throw new Error('Source canvas context error');
+
+      exportCanvas = document.createElement('canvas');
+      exportCanvas.width = videoWidth;
+      exportCanvas.height = videoHeight;
+      ctx = exportCanvas.getContext('2d', { willReadFrequently: true });
+      if (!ctx) throw new Error('Canvas context could not be created');
+    }
 
     // 1. 音声トラックの解析・準備（完全な AudioSpecificConfig / esds 保証付き）
     const audioPipeline = await prepareAudioPipeline(videoFile, duration, (status) => {
@@ -1171,10 +1210,10 @@ export async function exportMosaicVideo(
       }
 
       const currentTime = f / fps;
-      await seekVideoElement(videoElement, currentTime);
+      await seekVideoElement(activeVideo, currentTime);
 
       // 元フレーム描画
-      srcCtx.drawImage(videoElement, 0, 0, videoWidth, videoHeight);
+      srcCtx.drawImage(activeVideo, 0, 0, videoWidth, videoHeight);
       ctx.drawImage(sourceCanvas, 0, 0, videoWidth, videoHeight);
 
       // モザイク適用（反転モザイクまたは通常モザイク）
@@ -1296,6 +1335,18 @@ export async function exportMosaicVideo(
 
     return await outputTarget.finalizeAndGetBlob();
   } finally {
+    if (dedicatedVideoUrl) {
+      try {
+        URL.revokeObjectURL(dedicatedVideoUrl);
+      } catch (_) {}
+    }
+    if (activeVideo && activeVideo !== videoElement) {
+      try {
+        activeVideo.pause();
+        activeVideo.src = '';
+        activeVideo.load();
+      } catch (_) {}
+    }
     document.removeEventListener('visibilitychange', handleVisibilityChange);
     await releaseScreenWakeLock();
   }
