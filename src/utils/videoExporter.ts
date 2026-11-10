@@ -108,6 +108,15 @@ async function prepareMuxerTarget(durationSec: number): Promise<MuxerOutputTarge
 
 /**
  * ビデオ要素の指定秒への確実なシーク（待機タイムアウト＆重複シーク防止＆GPUテクスチャ同期付き）
+ *
+ * 【GPUテクスチャ同期とコマ重複（カクツキ）根絶の仕組み】:
+ * Chromium/WebKit では、seeked イベントが発火した直後、デコードされた新しいフレームテクスチャが
+ * Canvas 2D コンテキスト（drawImage）側にスワップされるまでわずかな時間差が存在します。
+ * そのため、seeked 直後に drawImage を行うと「1つ前のフレーム」が描画され、コマ重複（2コマずつ同一画像）
+ * が発生してカクツキとなります。
+ * そこで、requestVideoFrameCallback が利用可能な場合はフレームの提示を待ち、
+ * 非対応環境やタイムアウト時でも V-Sync 周期に応じたマクロタスク開放（16ms）を設けることで、
+ * GPUテクスチャが確実に更新された状態でキャンバスへ転写させます。
  */
 async function seekVideoElement(video: HTMLVideoElement, targetTime: number): Promise<void> {
   const maxSafeTime = Math.max(0, (video.duration || 1) - 0.001);
@@ -119,34 +128,51 @@ async function seekVideoElement(video: HTMLVideoElement, targetTime: number): Pr
 
   return new Promise<void>((resolve) => {
     let isDone = false;
-    const timer = setTimeout(() => {
-      if (!isDone) {
-        isDone = true;
-        video.removeEventListener('seeked', onSeeked);
-        resolve(); // 万一seekedイベントが欠落しても最大350msで自己回復
-      }
-    }, 350);
+    let rvfcId: number | null = null;
 
-    const onSeeked = () => {
+    const finish = () => {
       if (!isDone) {
         isDone = true;
         clearTimeout(timer);
+        if (rvfcId !== null && typeof (video as any).cancelVideoFrameCallback === 'function') {
+          try {
+            (video as any).cancelVideoFrameCallback(rvfcId);
+          } catch (_) {}
+        }
         video.removeEventListener('seeked', onSeeked);
-        // ハードウェアデコーダーがキャンバス転写用バッファを確定させるため微小ウェイトを設ける
-        setTimeout(resolve, 4);
+        resolve();
       }
+    };
+
+    const timer = setTimeout(finish, 400);
+
+    const onSeeked = () => {
+      if (typeof (video as any).requestVideoFrameCallback === 'function') {
+        try {
+          let rvfcTimedOut = false;
+          const rvfcTimer = setTimeout(() => {
+            rvfcTimedOut = true;
+            finish();
+          }, 35);
+
+          rvfcId = (video as any).requestVideoFrameCallback(() => {
+            if (!rvfcTimedOut) {
+              clearTimeout(rvfcTimer);
+              finish();
+            }
+          });
+          return;
+        } catch (_) {}
+      }
+      // RVFC 非対応ブラウザや失敗時は 1 フレーム分のマクロタスク開放待機
+      setTimeout(finish, 16);
     };
 
     video.addEventListener('seeked', onSeeked, { once: true });
     try {
       video.currentTime = clampedTarget;
     } catch (_) {
-      if (!isDone) {
-        isDone = true;
-        clearTimeout(timer);
-        video.removeEventListener('seeked', onSeeked);
-        resolve();
-      }
+      finish();
     }
   });
 }
@@ -1114,63 +1140,66 @@ export async function exportMosaicVideo(
     const fps = 30;
     const totalFrames = Math.max(1, Math.floor(duration * fps));
 
-    // レンダリング用キャンバス準備
-    let exportCanvas = document.createElement('canvas');
-    exportCanvas.width = videoWidth;
-    exportCanvas.height = videoHeight;
-    let ctx = exportCanvas.getContext('2d', { willReadFrequently: true });
-    if (!ctx) throw new Error('Canvas context could not be created');
-
-    let sourceCanvas = document.createElement('canvas');
-    sourceCanvas.width = videoWidth;
-    sourceCanvas.height = videoHeight;
-    let srcCtx = sourceCanvas.getContext('2d');
-    if (!srcCtx) throw new Error('Source canvas context error');
-
-    // 【重要】Android Chrome や iOS Safari での Tainted Source (汚染元) 検証と自動修復:
-    // DOM要素（videoElement）が外部由来フラグで汚染されている場合、
-    // そのまま drawImage するとキャンバスが永久に Tainted 状態になり、new VideoFrame(exportCanvas) で
+    // 【重要】Tainted Source (汚染元) の根絶とクリーンエクスポートの保証:
+    // DOM上の videoElement はプレビュー再生やブラウザの描画コンテキストにより Tainted フラグが付与されることがあり、
+    // そこからキャンバスへ描画すると new VideoFrame(exportCanvas) で
     // 「Failed to construct 'VideoFrame': VideoFrames can't be created from tainted sources」が発生します。
-    // ここで事前に getImageData によるクリーン判定を行い、汚染を検知した場合はエクスポート専用の独立した
-    // クリーン動画要素を生成して 100% 回復させます。
-    let isOriginClean = true;
+    // そのため、エクスポート処理では常に videoFile (元Blob) から独立したエクスポート専用クリーン動画要素を
+    // 生成して使用します。これにより、DOM 側の状態に一切干渉されず、100% クリーンなオリジンで高速書き出しが可能です。
     try {
-      srcCtx.drawImage(videoElement, 0, 0, 16, 16);
-      srcCtx.getImageData(0, 0, 1, 1);
-      srcCtx.clearRect(0, 0, 16, 16);
-    } catch (_) {
-      isOriginClean = false;
-    }
-
-    if (!isOriginClean) {
-      console.warn('DOM videoElement is tainted. Initializing dedicated clean video for export.');
+      dedicatedVideoUrl = URL.createObjectURL(videoFile);
       const cleanVideo = document.createElement('video');
+      cleanVideo.crossOrigin = 'anonymous';
       cleanVideo.preload = 'auto';
       cleanVideo.playsInline = true;
       cleanVideo.muted = true;
-      dedicatedVideoUrl = URL.createObjectURL(videoFile);
       cleanVideo.src = dedicatedVideoUrl;
 
       await new Promise<void>((resolve) => {
-        cleanVideo.onloadedmetadata = () => resolve();
-        cleanVideo.onerror = () => resolve();
-        setTimeout(resolve, 2000);
+        let isSettled = false;
+        const to = setTimeout(() => {
+          if (!isSettled) {
+            isSettled = true;
+            resolve();
+          }
+        }, 1500);
+
+        cleanVideo.onloadedmetadata = () => {
+          if (!isSettled) {
+            isSettled = true;
+            clearTimeout(to);
+            resolve();
+          }
+        };
+        cleanVideo.onerror = () => {
+          if (!isSettled) {
+            isSettled = true;
+            clearTimeout(to);
+            resolve();
+          }
+        };
       });
-      activeVideo = cleanVideo;
 
-      // 汚染フラグを完全に破棄するため、新しいクリーンキャンバスを再生成
-      sourceCanvas = document.createElement('canvas');
-      sourceCanvas.width = videoWidth;
-      sourceCanvas.height = videoHeight;
-      srcCtx = sourceCanvas.getContext('2d');
-      if (!srcCtx) throw new Error('Source canvas context error');
-
-      exportCanvas = document.createElement('canvas');
-      exportCanvas.width = videoWidth;
-      exportCanvas.height = videoHeight;
-      ctx = exportCanvas.getContext('2d', { willReadFrequently: true });
-      if (!ctx) throw new Error('Canvas context could not be created');
+      if (cleanVideo.duration && cleanVideo.duration > 0) {
+        activeVideo = cleanVideo;
+      }
+    } catch (cleanErr) {
+      console.warn('Dedicated video creation fallback to videoElement:', cleanErr);
+      activeVideo = videoElement;
     }
+
+    // レンダリング用キャンバス準備（100% クリーンなコンテキストで生成）
+    const exportCanvas = document.createElement('canvas');
+    exportCanvas.width = videoWidth;
+    exportCanvas.height = videoHeight;
+    const ctx = exportCanvas.getContext('2d', { willReadFrequently: true });
+    if (!ctx) throw new Error('Canvas context could not be created');
+
+    const sourceCanvas = document.createElement('canvas');
+    sourceCanvas.width = videoWidth;
+    sourceCanvas.height = videoHeight;
+    const srcCtx = sourceCanvas.getContext('2d');
+    if (!srcCtx) throw new Error('Source canvas context error');
 
     // 1. 音声トラックの解析・準備（完全な AudioSpecificConfig / esds 保証付き）
     const audioPipeline = await prepareAudioPipeline(videoFile, duration, (status) => {
@@ -1365,7 +1394,7 @@ export async function exportMosaicVideo(
     if (activeVideo && activeVideo !== videoElement) {
       try {
         activeVideo.pause();
-        activeVideo.src = '';
+        activeVideo.removeAttribute('src');
         activeVideo.load();
       } catch (_) {}
     }

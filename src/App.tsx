@@ -1370,6 +1370,7 @@ export const App: React.FC = () => {
             <video
               ref={videoRef}
               src={mediaUrl}
+              crossOrigin="anonymous"
               preload="auto"
               onLoadedMetadata={handleLoadedMetadata}
               onTimeUpdate={handleTimeUpdate}
