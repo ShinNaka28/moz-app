@@ -56,11 +56,18 @@ export async function releaseScreenWakeLock() {
 
 /**
  * 画面消灯やバックグラウンド遷移が起きてもフリーズしない安全な video シーク関数
+ *
+ * 【長周期キーフレーム（3秒等）・大量Bフレーム動画およびスマホGPU対策】:
+ * 1. 最新の Chrome / Safari でサポートされている `requestVideoFrameCallback` を優先使用し、
+ *    GPUが新しいフレームを実際に画面/テクスチャへレンダリング完了した瞬間を確実に検出。
+ * 2. 非対応ブラウザでは `seeked` イベント待機に加え、微小ディレイ（マクロタスク開放）を挟むことで
+ *    スマホのハードウェアデコーダーのバッファキュー詰まりを防止。
+ * 3. 万一シークイベントが遅延・欠落してもタイムアウトで安全に次へ進み、ループの永久停止を100%防止。
  */
 export async function seekVideoSafely(
   video: HTMLVideoElement,
   targetTime: number,
-  timeoutMs: number = 1500
+  timeoutMs: number = 1800
 ): Promise<void> {
   if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
     await new Promise<void>((resolve) => {
@@ -91,14 +98,35 @@ export async function seekVideoSafely(
 
   return new Promise<void>((resolve) => {
     let settled = false;
+    let rvfcId: number | null = null;
+
     const finish = () => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      video.removeEventListener('seeked', finish);
-      video.removeEventListener('loadeddata', finish);
+      if (rvfcId !== null && typeof (video as any).cancelVideoFrameCallback === 'function') {
+        try {
+          (video as any).cancelVideoFrameCallback(rvfcId);
+        } catch (_) {}
+      }
+      video.removeEventListener('seeked', onSeeked);
+      video.removeEventListener('loadeddata', onSeeked);
       document.removeEventListener('visibilitychange', onVisChange);
-      resolve();
+      // スマホGPUのデコーダーバッファを開放するため、微小ディレイを置いて解決
+      setTimeout(resolve, 8);
+    };
+
+    const onSeeked = () => {
+      // requestVideoFrameCallback が利用可能な場合はフレーム描画完了を待つ
+      if (typeof (video as any).requestVideoFrameCallback === 'function') {
+        try {
+          rvfcId = (video as any).requestVideoFrameCallback(() => {
+            finish();
+          });
+          return;
+        } catch (_) {}
+      }
+      finish();
     };
 
     const onVisChange = () => {
@@ -110,8 +138,8 @@ export async function seekVideoSafely(
     };
 
     const timer = setTimeout(finish, timeoutMs);
-    video.addEventListener('seeked', finish, { once: true });
-    video.addEventListener('loadeddata', finish, { once: true });
+    video.addEventListener('seeked', onSeeked, { once: true });
+    video.addEventListener('loadeddata', onSeeked, { once: true });
     document.addEventListener('visibilitychange', onVisChange);
 
     try {

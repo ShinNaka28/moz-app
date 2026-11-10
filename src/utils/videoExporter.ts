@@ -107,7 +107,7 @@ async function prepareMuxerTarget(durationSec: number): Promise<MuxerOutputTarge
 }
 
 /**
- * ビデオ要素の指定秒への確実なシーク（待機タイムアウト＆重複シーク防止付き）
+ * ビデオ要素の指定秒への確実なシーク（描画完了検知＆待機タイムアウト＆重複シーク防止付き）
  */
 async function seekVideoElement(video: HTMLVideoElement, targetTime: number): Promise<void> {
   if (Math.abs(video.currentTime - targetTime) < 0.005) {
@@ -115,21 +115,34 @@ async function seekVideoElement(video: HTMLVideoElement, targetTime: number): Pr
   }
   return new Promise<void>((resolve) => {
     let isDone = false;
-    const timer = setTimeout(() => {
-      if (!isDone) {
-        isDone = true;
-        video.removeEventListener('seeked', onSeeked);
-        resolve(); // 万一seekedイベントが欠落しても最大800msで自己回復
-      }
-    }, 800);
+    let rvfcId: number | null = null;
 
-    const onSeeked = () => {
+    const finish = () => {
       if (!isDone) {
         isDone = true;
         clearTimeout(timer);
+        if (rvfcId !== null && typeof (video as any).cancelVideoFrameCallback === 'function') {
+          try {
+            (video as any).cancelVideoFrameCallback(rvfcId);
+          } catch (_) {}
+        }
         video.removeEventListener('seeked', onSeeked);
         resolve();
       }
+    };
+
+    const timer = setTimeout(finish, 1000);
+
+    const onSeeked = () => {
+      if (typeof (video as any).requestVideoFrameCallback === 'function') {
+        try {
+          rvfcId = (video as any).requestVideoFrameCallback(() => {
+            finish();
+          });
+          return;
+        } catch (_) {}
+      }
+      finish();
     };
 
     video.addEventListener('seeked', onSeeked, { once: true });

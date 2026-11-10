@@ -663,8 +663,11 @@ export const App: React.FC = () => {
           const scaleX = workW / rawW;
           const scaleY = workH / rawH;
 
-          // キーフレーム補間(Lerp)が滑らかに繋ぐため、スマホでも超高速かつ低負荷な 0.35秒サンプリング
-          const step = 0.35;
+          // キーフレーム補間(Lerp)が滑らかに繋ぐため、スマホでも超高速かつ低負荷なサンプリング
+          // ※モバイル端末での長周期キーフレーム動画（3秒GOP等）のデコーダー詰まりを防止するため、
+          //   端末と動画長さに応じて 0.35s 〜 0.45s でアダプティブ調整
+          const isMobileDevice = typeof navigator !== 'undefined' && /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+          const step = isMobileDevice ? (totalDuration > 10 ? 0.45 : 0.35) : 0.35;
           const totalSteps = Math.max(1, Math.floor(totalDuration / step));
 
           resetAnalysisState();
@@ -1024,7 +1027,8 @@ export const App: React.FC = () => {
       const { width: workW, height: workH } = getClampedDimensions(rawW, rawH, 1280);
       const scaleX = workW / rawW;
       const scaleY = workH / rawH;
-      const step = 0.35;
+      const isMobileDevice = typeof navigator !== 'undefined' && /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+      const step = isMobileDevice ? (totalDuration > 10 ? 0.45 : 0.35) : 0.35;
       const totalSteps = Math.max(1, Math.floor(totalDuration / step));
 
       let currentDetectedPersons: any[] = [];
