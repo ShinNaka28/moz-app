@@ -1,4 +1,5 @@
 import React, { useRef, useEffect, useState, useCallback } from 'react';
+import { X } from 'lucide-react';
 import { EditorMode, MosaicTrack, MosaicType, Point, NormalizedPoint } from '../types';
 import { renderTrackMosaic, renderInverseMosaic, renderTrackOverlay, ProtectedRegion } from '../utils/mosaicRenderer';
 import { interpolateKeyframes } from '../utils/tracking';
@@ -100,6 +101,10 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const sourceCanvasRef = useRef<HTMLCanvasElement>(document.createElement('canvas'));
 
+
+  // 操作ガイドの表示・非表示（ユーザーが✕で消せる）およびドラッグ中のステルス状態
+  const [showEditGuide, setShowEditGuide] = useState<boolean>(true);
+  const [isInteracting, setIsInteracting] = useState<boolean>(false);
 
   // ドラッグ・描画インタラクションの状態
   const [drawingState, setDrawingState] = useState<{
@@ -468,6 +473,7 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
             }
 
             if (bestIdx !== -1) {
+              setIsInteracting(true);
               try {
                 (e.target as HTMLCanvasElement).setPointerCapture(e.pointerId);
               } catch (_) {}
@@ -510,6 +516,7 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
             ];
             for (const c of corners) {
               if (Math.hypot(pt.x - c.cx, pt.y - c.cy) <= handleSize) {
+                setIsInteracting(true);
                 try {
                   (e.target as HTMLCanvasElement).setPointerCapture(e.pointerId);
                 } catch (_) {}
@@ -535,6 +542,7 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
             pt.y <= pos.y + pos.height + touchPad;
 
           if (inBadge || inBox || inInnerCenter) {
+            setIsInteracting(true);
             try {
               (e.target as HTMLCanvasElement).setPointerCapture(e.pointerId);
             } catch (_) {}
@@ -567,6 +575,7 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
         pt.y <= pos.y + pos.height + touchPad
       ) {
         onSelectTrack(track.id);
+        setIsInteracting(true);
         try {
           (e.target as HTMLCanvasElement).setPointerCapture(e.pointerId);
         } catch (_) {}
@@ -589,6 +598,7 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
     if (editorMode === 'select') {
       return;
     } else if (editorMode === 'add_rect' || editorMode === 'add_brush' || editorMode === 'add_lasso') {
+      setIsInteracting(true);
       try {
         (e.target as HTMLCanvasElement).setPointerCapture(e.pointerId);
       } catch (_) {}
@@ -696,6 +706,7 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
 
   // ポインター解放イベント（ドラッグ終了時にキーフレームを確定保存）
   const handlePointerUp = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    setIsInteracting(false);
     try {
       (e.target as HTMLCanvasElement).releasePointerCapture(e.pointerId);
     } catch (_) {}
@@ -929,31 +940,45 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
       className="relative flex-1 bg-slate-950 flex flex-col items-center justify-center p-2 sm:p-4 select-none min-h-[300px] sm:min-h-[420px] w-full relative"
     >
       {/* 選択中の操作ガイドヒント＆頂点編集切替ボタン */}
-      {selectedTrackId && (() => {
+      {selectedTrackId && showEditGuide && !isInteracting && (() => {
         const selTrack = tracks.find((t) => t.id === selectedTrackId);
         const isPoly = selTrack && (selTrack.shape === 'polygon' || selTrack.shape === 'lasso');
         return (
-          <div className="absolute top-3 left-1/2 -translate-x-1/2 bg-slate-900/95 border border-cyan-500/60 shadow-xl px-3 py-1 rounded-full flex flex-wrap items-center justify-center gap-2 text-[11px] font-bold text-cyan-300 backdrop-blur z-10 animate-fade-in max-w-[95%]">
-            {isPoly ? (
-              <>
-                <span className="text-amber-300">● 黄色い頂点をドラッグで身体のラインに調整</span>
-                <span className="text-slate-500">•</span>
-                <span className="text-cyan-300">✥ 内側ドラッグで全体移動</span>
-              </>
-            ) : (
-              <>
-                <span>✥ 内側ドラッグで移動 • 四隅■でサイズ変更</span>
-                {selTrack && selTrack.shape === 'rect' && onConvertTrackToPolygon && (
-                  <button
-                    type="button"
-                    onClick={() => onConvertTrackToPolygon(selTrack.id)}
-                    className="ml-1 px-2 py-0.5 rounded-full bg-amber-500 hover:bg-amber-400 text-slate-950 font-extrabold text-[10px] shadow transition cursor-pointer pointer-events-auto"
-                  >
-                    ✨ 頂点編集モードに変換
-                  </button>
-                )}
-              </>
-            )}
+          <div className="absolute top-2 left-1/2 -translate-x-1/2 bg-slate-900/90 border border-cyan-500/50 shadow-xl px-2.5 py-1 rounded-full flex items-center justify-between gap-2 text-[10px] sm:text-[11px] font-bold text-cyan-300 backdrop-blur z-20 transition-opacity duration-150 max-w-[92%] pointer-events-auto">
+            <div className="flex flex-wrap items-center justify-center gap-1.5 sm:gap-2">
+              {isPoly ? (
+                <>
+                  <span className="text-amber-300">● 頂点をドラッグで調整</span>
+                  <span className="text-slate-500">•</span>
+                  <span className="text-cyan-300">✥ 内側ドラッグで移動</span>
+                </>
+              ) : (
+                <>
+                  <span>✥ 内側ドラッグで移動 • 四隅でサイズ変更</span>
+                  {selTrack && selTrack.shape === 'rect' && onConvertTrackToPolygon && (
+                    <button
+                      type="button"
+                      onClick={() => onConvertTrackToPolygon(selTrack.id)}
+                      className="ml-1 px-2 py-0.5 rounded-full bg-amber-500 hover:bg-amber-400 text-slate-950 font-extrabold text-[9px] sm:text-[10px] shadow transition cursor-pointer"
+                    >
+                      ✨ 頂点編集に変換
+                    </button>
+                  )}
+                </>
+              )}
+            </div>
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                setShowEditGuide(false);
+              }}
+              className="text-slate-400 hover:text-slate-100 p-0.5 rounded-full hover:bg-slate-800 transition cursor-pointer shrink-0 ml-1"
+              title="ガイドを閉じる"
+              aria-label="ガイドを閉じる"
+            >
+              <X size={13} />
+            </button>
           </div>
         );
       })()}
@@ -964,6 +989,7 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
         onPointerMove={handlePointerMove}
         onPointerUp={handlePointerUp}
         onPointerCancel={handlePointerUp}
+        onLostPointerCapture={() => setIsInteracting(false)}
         style={{
           aspectRatio:
             canvasRef.current && canvasRef.current.width > 0 && canvasRef.current.height > 0

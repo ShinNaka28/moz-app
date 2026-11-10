@@ -290,32 +290,6 @@ export function renderTrackOverlay(
       }
       ctx.restore();
     }
-
-    // 枠の中央に操作ガイドを表示
-    if (width >= 40 * scale && height >= 24 * scale) {
-      ctx.save();
-      ctx.fillStyle = 'rgba(15, 23, 42, 0.85)';
-      const moveText =
-        (track.shape === 'polygon' || track.shape === 'lasso') && points && points.length >= 3
-          ? '● 頂点調整 / ■ 四隅拡縮 / ✥ 移動'
-          : '✥ 枠内ドラッグで移動 / ■ 四隅拡縮';
-      const fontSize = Math.round(11 * scale);
-      ctx.font = `bold ${fontSize}px sans-serif`;
-      const moveW = ctx.measureText(moveText).width + 12 * scale;
-      const moveH = 20 * scale;
-      const moveX = x + width / 2 - moveW / 2;
-      const moveY = y + height / 2 - moveH / 2;
-      ctx.fillRect(moveX, moveY, moveW, moveH);
-      ctx.strokeStyle = '#38bdf8';
-      ctx.lineWidth = 1.5 * scale;
-      ctx.strokeRect(moveX, moveY, moveW, moveH);
-
-      ctx.fillStyle = '#38bdf8';
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-      ctx.fillText(moveText, x + width / 2, y + height / 2);
-      ctx.restore();
-    }
   }
 
   // ラベルバッジ（トラック名 + ON/OFFステータス）
