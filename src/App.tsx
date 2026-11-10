@@ -132,23 +132,7 @@ export const App: React.FC = () => {
         setDurationWarning(false);
       }
 
-      // スマホブラウザで初期フレームが未デコード(readyState < 2)のまま画面が黒くなるのを防ぐため、
-      // 0.01秒シークと0秒リセットにより確実に先頭フレームをデコードしてキャンバスに表示
-      if (v.readyState < 2) {
-        try {
-          v.currentTime = 0.01;
-          const onFirstSeeked = () => {
-            v.removeEventListener('seeked', onFirstSeeked);
-            try {
-              v.currentTime = 0;
-            } catch (_) {}
-            setCurrentTime(0);
-          };
-          v.addEventListener('seeked', onFirstSeeked, { once: true });
-        } catch (_) {}
-      } else {
-        setCurrentTime(0);
-      }
+      setCurrentTime(0);
     }
   };
 
@@ -667,9 +651,6 @@ export const App: React.FC = () => {
           setAiDetectProgress(100);
         } else if (videoRef.current) {
           const video = videoRef.current;
-          if (video.readyState < 2) {
-            await seekVideoSafely(video, 0.01);
-          }
           const origTime = video.currentTime;
           const totalDuration = video.duration || 5;
           const rawW = video.videoWidth || 640;
@@ -1059,9 +1040,6 @@ export const App: React.FC = () => {
       }
     } else if (videoRef.current) {
       const video = videoRef.current;
-      if (video.readyState < 2) {
-        await seekVideoSafely(video, 0.01);
-      }
       const origTime = video.currentTime;
       const totalDuration = video.duration || 5;
       const rawW = video.videoWidth || 640;

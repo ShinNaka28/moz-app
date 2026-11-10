@@ -66,7 +66,7 @@ export async function releaseScreenWakeLock() {
 export async function seekVideoSafely(
   video: HTMLVideoElement,
   targetTime: number,
-  timeoutMs: number = 500
+  timeoutMs: number = 1500
 ): Promise<void> {
   if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
     await new Promise<void>((resolve) => {
@@ -87,15 +87,38 @@ export async function seekVideoSafely(
   const maxSafeTime = Math.max(0, (video.duration || 1) - 0.001);
   const clampedTarget = Math.min(maxSafeTime, Math.max(0, targetTime));
 
-  // 既に目標時刻に極めて近く、かつデコーダーの準備が完了している(readyState >= 2)場合は即座に解決してフリーズを回避
-  if (Math.abs(video.currentTime - clampedTarget) < 0.001 && video.readyState >= 2) {
+  // 既に目標時刻に極めて近く、かつシーク中でない場合は即座に解決して高速化
+  if (Math.abs(video.currentTime - clampedTarget) < 0.002 && !video.seeking && video.readyState >= 2) {
     return;
   }
 
-  // 現在の currentTime と同一時刻の場合、ブラウザの仕様で seeked イベントが発火せず
-  // タイムアウトまで待機してカクつく原因となるため、微小オフセット(0.005秒)を与えて確実にデコードを発火
+  // もし前のシークが進行中の場合は、ハードウェアデコーダーの衝突を防ぐため最大600ms待機
+  if (video.seeking) {
+    await new Promise<void>((res) => {
+      let done = false;
+      const t = setTimeout(() => {
+        if (!done) {
+          done = true;
+          res();
+        }
+      }, 600);
+      video.addEventListener(
+        'seeked',
+        () => {
+          if (!done) {
+            done = true;
+            clearTimeout(t);
+            res();
+          }
+        },
+        { once: true }
+      );
+    });
+  }
+
+  // 目標時刻が現在のcurrentTimeと同一かつデコード未完了の場合のみ微小オフセットを与えてデコードをトリガー
   const effectiveTime =
-    Math.abs(video.currentTime - clampedTarget) < 0.001
+    Math.abs(video.currentTime - clampedTarget) < 0.001 && video.readyState < 2
       ? Math.min(maxSafeTime, clampedTarget + 0.005)
       : clampedTarget;
 
@@ -109,8 +132,8 @@ export async function seekVideoSafely(
       video.removeEventListener('seeked', finish);
       video.removeEventListener('loadeddata', finish);
       document.removeEventListener('visibilitychange', onVisChange);
-      // スマホGPUのデコーダーバッファを開放するため、微小ディレイを置いて解決
-      setTimeout(resolve, 8);
+      // スマホGPUのデコーダーバッファを開放・確定させるため、微小ディレイを置いて解決
+      setTimeout(resolve, 10);
     };
 
     const onVisChange = () => {

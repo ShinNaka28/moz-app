@@ -1138,7 +1138,8 @@ export async function segmentPersonSafely(
     return { activeSegmenter: segmenter, contour: null, contours: [] };
   }
 
-  if (isVideo && source.readyState < 2) {
+  // 動画フレームがまだ全くロードされていない場合（readyState === 0）は安全にスキップ
+  if (isVideo && source.readyState === 0) {
     return { activeSegmenter: segmenter, contour: null, contours: [] };
   }
 
@@ -1395,8 +1396,8 @@ export async function detectFacesSafely(
     return { detections: [], activeDetector: detector };
   }
 
-  // 動画フレームがまだデコードされていない場合（readyState < 2）は安全にスキップ
-  if (isVideo && source.readyState < 2) {
+  // 動画フレームがまだ全くロードされていない場合（readyState === 0）は安全にスキップ
+  if (isVideo && source.readyState === 0) {
     return { detections: [], activeDetector: detector };
   }
 
