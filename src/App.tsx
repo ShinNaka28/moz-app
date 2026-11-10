@@ -118,7 +118,8 @@ export const App: React.FC = () => {
   // ビデオのメタデータ読み込み
   const handleLoadedMetadata = () => {
     if (videoRef.current) {
-      const videoDur = videoRef.current.duration || 1;
+      const v = videoRef.current;
+      const videoDur = v.duration || 1;
       setDuration(videoDur);
 
       // 5分（300秒）を超える長尺動画に対する安全装置（OOMクラッシュ防止警告）
@@ -131,11 +132,22 @@ export const App: React.FC = () => {
         setDurationWarning(false);
       }
 
-      // スマホブラウザで初期フレームが未デコード(readyState < 2)のままになるのを防ぐため微小シークで先頭フレームをデコード
-      if (videoRef.current.readyState < 2 && videoRef.current.currentTime === 0) {
+      // スマホブラウザで初期フレームが未デコード(readyState < 2)のまま画面が黒くなるのを防ぐため、
+      // 0.01秒シークと0秒リセットにより確実に先頭フレームをデコードしてキャンバスに表示
+      if (v.readyState < 2) {
         try {
-          videoRef.current.currentTime = 0.001;
+          v.currentTime = 0.01;
+          const onFirstSeeked = () => {
+            v.removeEventListener('seeked', onFirstSeeked);
+            try {
+              v.currentTime = 0;
+            } catch (_) {}
+            setCurrentTime(0);
+          };
+          v.addEventListener('seeked', onFirstSeeked, { once: true });
         } catch (_) {}
+      } else {
+        setCurrentTime(0);
       }
     }
   };
@@ -655,6 +667,9 @@ export const App: React.FC = () => {
           setAiDetectProgress(100);
         } else if (videoRef.current) {
           const video = videoRef.current;
+          if (video.readyState < 2) {
+            await seekVideoSafely(video, 0.01);
+          }
           const origTime = video.currentTime;
           const totalDuration = video.duration || 5;
           const rawW = video.videoWidth || 640;
@@ -871,6 +886,19 @@ export const App: React.FC = () => {
               if (isTimeout) {
                 if (track.currentKeyframes.length >= 3) {
                   const lastKf = track.currentKeyframes[track.currentKeyframes.length - 1];
+                  // 冒頭0.6秒以内から検出されていた場合、動画先頭(0秒/第1フレーム)から存在しているとみなし
+                  // 0秒キーフレームを補完して startTime を 0 に固定（F1から確実に枠を表示）
+                  const kfs = [...track.currentKeyframes];
+                  let trackStart = kfs[0].time;
+                  if (trackStart <= 0.6) {
+                    trackStart = 0;
+                    if (kfs[0].time > 0) {
+                      kfs.unshift({
+                        ...kfs[0],
+                        time: 0,
+                      });
+                    }
+                  }
                   createdTracks.push({
                     id: `ai-body-${Date.now()}-${track.trackId}`,
                     name: `AI人物 #${track.trackId} (体ライン)`,
@@ -879,9 +907,9 @@ export const App: React.FC = () => {
                     enabled: true,
                     mosaicType: 'pixel',
                     strength: 14,
-                    startTime: track.currentKeyframes[0].time,
+                    startTime: trackStart,
                     endTime: isBorder ? (lastKf.time + 0.05) : Math.min(totalDuration, lastKf.time + 1.0),
-                    keyframes: [...track.currentKeyframes],
+                    keyframes: kfs,
                     aiPersonId: track.trackId,
                     aiTarget: 'body',
                   });
@@ -898,6 +926,17 @@ export const App: React.FC = () => {
             if (track.currentKeyframes.length >= 3) {
               const lastKf = track.currentKeyframes[track.currentKeyframes.length - 1];
               const isBorder = isBoxTouchingBorder(track.lastValidBox, workW, workH, 20);
+              const kfs = [...track.currentKeyframes];
+              let trackStart = kfs[0].time;
+              if (trackStart <= 0.6) {
+                trackStart = 0;
+                if (kfs[0].time > 0) {
+                  kfs.unshift({
+                    ...kfs[0],
+                    time: 0,
+                  });
+                }
+              }
               createdTracks.push({
                 id: `ai-body-${Date.now()}-${track.trackId}`,
                 name: `AI人物 #${track.trackId} (体ライン)`,
@@ -906,9 +945,9 @@ export const App: React.FC = () => {
                 enabled: true,
                 mosaicType: 'pixel',
                 strength: 14,
-                startTime: track.currentKeyframes[0].time,
+                startTime: trackStart,
                 endTime: isBorder ? (lastKf.time + 0.05) : Math.min(totalDuration, lastKf.time + 0.3),
-                keyframes: [...track.currentKeyframes],
+                keyframes: kfs,
                 aiPersonId: track.trackId,
                 aiTarget: 'body',
               });
@@ -1020,6 +1059,9 @@ export const App: React.FC = () => {
       }
     } else if (videoRef.current) {
       const video = videoRef.current;
+      if (video.readyState < 2) {
+        await seekVideoSafely(video, 0.01);
+      }
       const origTime = video.currentTime;
       const totalDuration = video.duration || 5;
       const rawW = video.videoWidth || 640;
@@ -1108,6 +1150,17 @@ export const App: React.FC = () => {
           const scores = personScoresMap.get(personId) || [];
           const avgScore = scores.reduce((a, b) => a + b, 0) / (scores.length || 1);
           if (avgScore >= filterOptions.minScore! * 0.95) {
+            const kfsCopy = [...kfs];
+            let trackStart = kfsCopy[0].time;
+            if (trackStart <= 0.6) {
+              trackStart = 0;
+              if (kfsCopy[0].time > 0) {
+                kfsCopy.unshift({
+                  ...kfsCopy[0],
+                  time: 0,
+                });
+              }
+            }
             newTracks.push({
               id: `ai-track-${personId}-${Date.now()}`,
               name: targetMode === 'body' ? `AI人物 (体ライン) #${personId}` : `AI顔 #${personId}`,
@@ -1116,9 +1169,9 @@ export const App: React.FC = () => {
               enabled: true,
               mosaicType: 'pixel',
               strength: 14,
-              startTime: kfs[0].time,
-              endTime: kfs[kfs.length - 1].time + 0.3,
-              keyframes: kfs,
+              startTime: trackStart,
+              endTime: kfsCopy[kfsCopy.length - 1].time + 0.3,
+              keyframes: kfsCopy,
               aiPersonId: personId,
               aiTarget: targetMode,
             });
@@ -1329,7 +1382,6 @@ export const App: React.FC = () => {
             <img
               ref={imageRef}
               src={mediaUrl}
-              crossOrigin="anonymous"
               alt="Source"
               onLoad={() => {
                 setDuration(1);
@@ -1340,7 +1392,6 @@ export const App: React.FC = () => {
             <video
               ref={videoRef}
               src={mediaUrl}
-              crossOrigin="anonymous"
               preload="auto"
               onLoadedMetadata={handleLoadedMetadata}
               onTimeUpdate={handleTimeUpdate}

@@ -107,33 +107,47 @@ async function prepareMuxerTarget(durationSec: number): Promise<MuxerOutputTarge
 }
 
 /**
- * ビデオ要素の指定秒への確実なシーク（待機タイムアウト＆重複シーク防止付き）
+ * ビデオ要素の指定秒への確実なシーク（待機タイムアウト＆重複シーク防止＆GPUテクスチャ同期付き）
  */
 async function seekVideoElement(video: HTMLVideoElement, targetTime: number): Promise<void> {
-  if (Math.abs(video.currentTime - targetTime) < 0.005) {
+  const maxSafeTime = Math.max(0, (video.duration || 1) - 0.001);
+  const clampedTarget = Math.min(maxSafeTime, Math.max(0, targetTime));
+
+  if (Math.abs(video.currentTime - clampedTarget) < 0.002) {
     return;
   }
+
   return new Promise<void>((resolve) => {
     let isDone = false;
     const timer = setTimeout(() => {
       if (!isDone) {
         isDone = true;
         video.removeEventListener('seeked', onSeeked);
-        resolve(); // 万一seekedイベントが欠落しても最大800msで自己回復
+        resolve(); // 万一seekedイベントが欠落しても最大350msで自己回復
       }
-    }, 800);
+    }, 350);
 
     const onSeeked = () => {
       if (!isDone) {
         isDone = true;
         clearTimeout(timer);
         video.removeEventListener('seeked', onSeeked);
-        resolve();
+        // ハードウェアデコーダーがキャンバス転写用バッファを確定させるため微小ウェイトを設ける
+        setTimeout(resolve, 4);
       }
     };
 
     video.addEventListener('seeked', onSeeked, { once: true });
-    video.currentTime = targetTime;
+    try {
+      video.currentTime = clampedTarget;
+    } catch (_) {
+      if (!isDone) {
+        isDone = true;
+        clearTimeout(timer);
+        video.removeEventListener('seeked', onSeeked);
+        resolve();
+      }
+    }
   });
 }
 
@@ -1114,16 +1128,13 @@ export async function exportMosaicVideo(
     if (!srcCtx) throw new Error('Source canvas context error');
 
     // 【重要】Android Chrome や iOS Safari での Tainted Source (汚染元) 検証と自動修復:
-    // DOM要素（videoElement）が no-cors 属性で読み込まれていた場合や外部由来フラグで汚染されている場合、
+    // DOM要素（videoElement）が外部由来フラグで汚染されている場合、
     // そのまま drawImage するとキャンバスが永久に Tainted 状態になり、new VideoFrame(exportCanvas) で
     // 「Failed to construct 'VideoFrame': VideoFrames can't be created from tainted sources」が発生します。
     // ここで事前に getImageData によるクリーン判定を行い、汚染を検知した場合はエクスポート専用の独立した
-    // crossOrigin='anonymous' 動画要素を生成して 100% 回復させます。
+    // クリーン動画要素を生成して 100% 回復させます。
     let isOriginClean = true;
     try {
-      if (videoElement.crossOrigin !== 'anonymous') {
-        videoElement.crossOrigin = 'anonymous';
-      }
       srcCtx.drawImage(videoElement, 0, 0, 16, 16);
       srcCtx.getImageData(0, 0, 1, 1);
       srcCtx.clearRect(0, 0, 16, 16);
@@ -1132,9 +1143,8 @@ export async function exportMosaicVideo(
     }
 
     if (!isOriginClean) {
-      console.warn('DOM videoElement is tainted. Initializing dedicated clean CORS video for export.');
+      console.warn('DOM videoElement is tainted. Initializing dedicated clean video for export.');
       const cleanVideo = document.createElement('video');
-      cleanVideo.crossOrigin = 'anonymous';
       cleanVideo.preload = 'auto';
       cleanVideo.playsInline = true;
       cleanVideo.muted = true;
@@ -1221,11 +1231,18 @@ export async function exportMosaicVideo(
         const protectedRegions: ProtectedRegion[] = [];
         for (const track of tracks) {
           if (!track.enabled) continue;
-          if (currentTime < track.startTime || currentTime > track.endTime) continue;
-          const pos = interpolateKeyframes(track.keyframes, currentTime, {
+          // 冒頭0.6秒以内から始まっているトラックは0秒（第1フレーム）でも確実に保護
+          const effectiveStart = track.startTime <= 0.6 ? 0 : track.startTime;
+          if (currentTime < effectiveStart || currentTime > track.endTime) continue;
+
+          const effectiveTime = (currentTime < track.startTime && track.startTime <= 0.6)
+            ? track.startTime
+            : currentTime;
+
+          const pos = interpolateKeyframes(track.keyframes, effectiveTime, {
             screenWidth: videoWidth,
             screenHeight: videoHeight,
-            hasFutureManualKeyframe: track.keyframes.some((k) => k.time > currentTime),
+            hasFutureManualKeyframe: track.keyframes.some((k) => k.time > effectiveTime),
           });
           if (pos && !track.trackingData?.isOutOfFrame) {
             protectedRegions.push({
@@ -1250,12 +1267,17 @@ export async function exportMosaicVideo(
       } else {
         for (const track of tracks) {
           if (!track.enabled) continue;
-          if (currentTime < track.startTime || currentTime > track.endTime) continue;
+          const effectiveStart = track.startTime <= 0.6 ? 0 : track.startTime;
+          if (currentTime < effectiveStart || currentTime > track.endTime) continue;
 
-          const pos = interpolateKeyframes(track.keyframes, currentTime, {
+          const effectiveTime = (currentTime < track.startTime && track.startTime <= 0.6)
+            ? track.startTime
+            : currentTime;
+
+          const pos = interpolateKeyframes(track.keyframes, effectiveTime, {
             screenWidth: videoWidth,
             screenHeight: videoHeight,
-            hasFutureManualKeyframe: track.keyframes.some((k) => k.time > currentTime),
+            hasFutureManualKeyframe: track.keyframes.some((k) => k.time > effectiveTime),
           });
           if (pos && !track.trackingData?.isOutOfFrame) {
             renderTrackMosaic(ctx, track, pos, sourceCanvas);

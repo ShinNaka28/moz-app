@@ -55,11 +55,24 @@ function getTrackPos(
     return { ...box, points, normalizedPoints: norm };
   }
   const isEditing = Boolean(isSelected);
-  return interpolateKeyframes(track.keyframes, targetTime, {
+  // 動画冒頭(0秒付近)でトラックが0.6秒以内から始まっている場合、0秒(第1フレーム)でも先頭キーフレームを確実に表示
+  const effectiveTime =
+    targetTime < track.startTime && track.startTime <= 0.6
+      ? track.startTime
+      : targetTime;
+
+  return interpolateKeyframes(track.keyframes, effectiveTime, {
     screenWidth: sw,
     screenHeight: sh,
-    hasFutureManualKeyframe: isEditing || track.keyframes.some((k) => k.time > targetTime),
+    hasFutureManualKeyframe: isEditing || track.keyframes.some((k) => k.time > effectiveTime),
   });
+}
+
+function isTrackActiveAtTime(track: MosaicTrack, time: number, isImage: boolean): boolean {
+  if (isImage) return track.enabled;
+  if (!track.enabled) return false;
+  const effectiveStart = track.startTime <= 0.6 ? 0 : track.startTime;
+  return time >= effectiveStart && time <= track.endTime;
 }
 
 export const VideoCanvas: React.FC<VideoCanvasProps> = ({
@@ -302,8 +315,7 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
     if (isInverseMosaic) {
       const protectedRegions: ProtectedRegion[] = [];
       for (const track of tracks) {
-        if (!track.enabled) continue;
-        if (currentTime < track.startTime || currentTime > track.endTime) continue;
+        if (!isTrackActiveAtTime(track, currentTime, isImage)) continue;
 
         const pos = getEffectivePos(track);
         if (pos) {
@@ -328,8 +340,7 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
       );
     } else {
       for (const track of tracks) {
-        if (!track.enabled) continue;
-        if (currentTime < track.startTime || currentTime > track.endTime) continue;
+        if (!isTrackActiveAtTime(track, currentTime, isImage)) continue;
 
         const pos = getEffectivePos(track);
         if (pos) {
@@ -341,7 +352,7 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
     // 各トラックのオーバーレイ（選択枠・ラベル・ハンドル）を描画（プレビューモード時は非表示）
     if (!isPreviewMode) {
       for (const track of tracks) {
-        if (currentTime < track.startTime || currentTime > track.endTime) continue;
+        if (!isTrackActiveAtTime(track, currentTime, isImage)) continue;
 
         const pos = getEffectivePos(track);
         if (pos) {
@@ -545,7 +556,7 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
     // 2. 他の既存トラックをクリックしたか判定（枠の上を触ればいつでもその枠を選択して移動開始）
     for (let i = tracks.length - 1; i >= 0; i--) {
       const track = tracks[i];
-      if (!isImage && (currentTime < track.startTime || currentTime > track.endTime)) continue;
+      if (!isTrackActiveAtTime(track, currentTime, isImage)) continue;
       const pos = getTrackPos(track, currentTime, isImage, canvas?.width, canvas?.height);
       if (!pos) continue;
 

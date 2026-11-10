@@ -66,7 +66,7 @@ export async function releaseScreenWakeLock() {
 export async function seekVideoSafely(
   video: HTMLVideoElement,
   targetTime: number,
-  timeoutMs: number = 1200
+  timeoutMs: number = 500
 ): Promise<void> {
   if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
     await new Promise<void>((resolve) => {
@@ -84,16 +84,20 @@ export async function seekVideoSafely(
     });
   }
 
-  if (Math.abs(video.currentTime - targetTime) < 0.001 && video.readyState >= 2) {
+  const maxSafeTime = Math.max(0, (video.duration || 1) - 0.001);
+  const clampedTarget = Math.min(maxSafeTime, Math.max(0, targetTime));
+
+  // 既に目標時刻に極めて近く、かつデコーダーの準備が完了している(readyState >= 2)場合は即座に解決してフリーズを回避
+  if (Math.abs(video.currentTime - clampedTarget) < 0.001 && video.readyState >= 2) {
     return;
   }
 
-  // スマホブラウザで初期状態 (currentTime=0, readyState<2) のまま currentTime=0 を代入しても
-  // seeked やフレームデコードが発火しないケースを防ぐため、微小オフセット(0.001秒)を与えて確実にデコードさせる
+  // 現在の currentTime と同一時刻の場合、ブラウザの仕様で seeked イベントが発火せず
+  // タイムアウトまで待機してカクつく原因となるため、微小オフセット(0.005秒)を与えて確実にデコードを発火
   const effectiveTime =
-    Math.abs(video.currentTime - targetTime) < 0.001 && video.readyState < 2
-      ? Math.min(video.duration || 0.1, targetTime + 0.001)
-      : targetTime;
+    Math.abs(video.currentTime - clampedTarget) < 0.001
+      ? Math.min(maxSafeTime, clampedTarget + 0.005)
+      : clampedTarget;
 
   return new Promise<void>((resolve) => {
     let settled = false;
