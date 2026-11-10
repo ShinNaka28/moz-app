@@ -1,5 +1,13 @@
 import { Muxer, ArrayBufferTarget, FileSystemWritableFileStreamTarget } from 'mp4-muxer';
-import { Input, ALL_FORMATS, BlobSource, EncodedPacketSink, AudioBufferSink } from 'mediabunny';
+import {
+  Input,
+  ALL_FORMATS,
+  BlobSource,
+  CanvasSink,
+  InputVideoTrack,
+  EncodedPacketSink,
+  AudioBufferSink,
+} from 'mediabunny';
 import { MosaicTrack, MosaicType } from '../types';
 import { interpolateKeyframes } from './tracking';
 import { renderTrackMosaic, renderInverseMosaic, ProtectedRegion } from './mosaicRenderer';
@@ -1098,6 +1106,82 @@ async function prepareAudioPipeline(
 /**
  * 動画の完全ローカルMP4書き出し（WebCodecs API + mp4-muxer による完全なmoovアトム構築）
  */
+/**
+ * 1フレーム分のモザイク・反転モザイクをキャンバスへ描画する統合ヘルパー
+ */
+function applyMosaicToFrame(
+  ctx: CanvasRenderingContext2D,
+  sourceCanvas: HTMLCanvasElement,
+  tracks: MosaicTrack[],
+  currentTime: number,
+  videoWidth: number,
+  videoHeight: number,
+  options: ExportOptions
+) {
+  if (options.isInverseMosaic) {
+    const protectedRegions: ProtectedRegion[] = [];
+    for (const track of tracks) {
+      if (!track.enabled) continue;
+      // 冒頭0.6秒以内から始まっているトラックは0秒（第1フレーム）でも確実に保護
+      const effectiveStart = track.startTime <= 0.6 ? 0 : track.startTime;
+      if (currentTime < effectiveStart || currentTime > track.endTime) continue;
+
+      const effectiveTime =
+        currentTime < track.startTime && track.startTime <= 0.6
+          ? track.startTime
+          : currentTime;
+
+      const pos = interpolateKeyframes(track.keyframes, effectiveTime, {
+        screenWidth: videoWidth,
+        screenHeight: videoHeight,
+        hasFutureManualKeyframe: track.keyframes.some((k) => k.time > effectiveTime),
+      });
+      if (pos && !track.trackingData?.isOutOfFrame) {
+        protectedRegions.push({
+          shape: track.shape,
+          x: pos.x,
+          y: pos.y,
+          width: pos.width,
+          height: pos.height,
+          points: pos.points,
+        });
+      }
+    }
+    renderInverseMosaic(
+      ctx,
+      protectedRegions,
+      videoWidth,
+      videoHeight,
+      options.inverseMosaicType || 'blur',
+      options.inverseStrength || 18,
+      sourceCanvas
+    );
+  } else {
+    for (const track of tracks) {
+      if (!track.enabled) continue;
+      const effectiveStart = track.startTime <= 0.6 ? 0 : track.startTime;
+      if (currentTime < effectiveStart || currentTime > track.endTime) continue;
+
+      const effectiveTime =
+        currentTime < track.startTime && track.startTime <= 0.6
+          ? track.startTime
+          : currentTime;
+
+      const pos = interpolateKeyframes(track.keyframes, effectiveTime, {
+        screenWidth: videoWidth,
+        screenHeight: videoHeight,
+        hasFutureManualKeyframe: track.keyframes.some((k) => k.time > effectiveTime),
+      });
+      if (pos && !track.trackingData?.isOutOfFrame) {
+        renderTrackMosaic(ctx, track, pos, sourceCanvas);
+      }
+    }
+  }
+}
+
+/**
+ * 動画エクスポートの実行（WebCodecs直接デコード + フォールバックシーク）
+ */
 export async function exportMosaicVideo(
   videoFile: File,
   videoElement: HTMLVideoElement,
@@ -1129,6 +1213,7 @@ export async function exportMosaicVideo(
 
   let activeVideo: HTMLVideoElement = videoElement;
   let dedicatedVideoUrl: string | null = null;
+  let videoInput: Input | null = null;
 
   try {
     videoElement.pause();
@@ -1138,55 +1223,96 @@ export async function exportMosaicVideo(
     const rawW = videoElement.videoWidth || 640;
     const rawH = videoElement.videoHeight || 360;
     const { width: videoWidth, height: videoHeight } = getClampedDimensions(rawW, rawH, 1280);
-    const fps = 30;
-    const totalFrames = Math.max(1, Math.floor(duration * fps));
 
-    // 【重要】Tainted Source (汚染元) の根絶とクリーンエクスポートの保証:
-    // DOM上の videoElement はプレビュー再生やブラウザの描画コンテキストにより Tainted フラグが付与されることがあり、
-    // そこからキャンバスへ描画すると new VideoFrame(exportCanvas) で
-    // 「Failed to construct 'VideoFrame': VideoFrames can't be created from tainted sources」が発生します。
-    // そのため、エクスポート処理では常に videoFile (元Blob) から独立したエクスポート専用クリーン動画要素を
-    // 生成して使用します。これにより、DOM 側の状態に一切干渉されず、100% クリーンなオリジンで高速書き出しが可能です。
+    // 【革新】Mediabunny + WebCodecs による動画トラックのネイティブFPS検出とハードウェア直接デコードの準備
+    let videoTrack: InputVideoTrack | null = null;
+    let canUseDirectDecoder = false;
+    let nativeFps = 30;
+    let totalVideoPackets = 0;
+
     try {
-      dedicatedVideoUrl = URL.createObjectURL(videoFile);
-      const cleanVideo = document.createElement('video');
-      cleanVideo.crossOrigin = 'anonymous';
-      cleanVideo.preload = 'auto';
-      cleanVideo.playsInline = true;
-      cleanVideo.muted = true;
-      cleanVideo.src = dedicatedVideoUrl;
-
-      await new Promise<void>((resolve) => {
-        let isSettled = false;
-        const to = setTimeout(() => {
-          if (!isSettled) {
-            isSettled = true;
-            resolve();
-          }
-        }, 1500);
-
-        cleanVideo.onloadedmetadata = () => {
-          if (!isSettled) {
-            isSettled = true;
-            clearTimeout(to);
-            resolve();
-          }
-        };
-        cleanVideo.onerror = () => {
-          if (!isSettled) {
-            isSettled = true;
-            clearTimeout(to);
-            resolve();
-          }
-        };
+      videoInput = new Input({
+        formats: ALL_FORMATS,
+        source: new BlobSource(videoFile),
       });
 
-      if (cleanVideo.duration && cleanVideo.duration > 0) {
-        activeVideo = cleanVideo;
+      const primaryVideo = await videoInput.getPrimaryVideoTrack();
+      if (primaryVideo && (await primaryVideo.canDecode().catch(() => false))) {
+        videoTrack = primaryVideo;
+        canUseDirectDecoder = true;
+
+        try {
+          const stats = await primaryVideo.computePacketStats(60);
+          if (stats && stats.averagePacketRate > 0) {
+            const rawFps = stats.averagePacketRate;
+            // スマートフォンや一般的なカメラの主要フレームレートに整合
+            if (Math.abs(rawFps - 24) < 1.5) nativeFps = 24;
+            else if (Math.abs(rawFps - 25) < 1.0) nativeFps = 25;
+            else if (Math.abs(rawFps - 30) < 1.5) nativeFps = 30;
+            else if (Math.abs(rawFps - 50) < 2.0) nativeFps = 50;
+            else if (Math.abs(rawFps - 60) < 3.5) nativeFps = 60;
+            else nativeFps = Math.min(60, Math.max(15, Math.round(rawFps)));
+
+            if (stats.packetCount && stats.packetCount > 0) {
+              totalVideoPackets = stats.packetCount;
+            }
+          }
+        } catch (_) {}
       }
-    } catch (cleanErr) {
-      console.warn('Dedicated video creation fallback to videoElement:', cleanErr);
-      activeVideo = videoElement;
+    } catch (inputErr) {
+      console.warn('Mediabunny videoTrack init failed, will use videoElement fallback:', inputErr);
+      canUseDirectDecoder = false;
+    }
+
+    const fps = canUseDirectDecoder ? nativeFps : 30;
+    const totalFrames =
+      totalVideoPackets > 0
+        ? totalVideoPackets
+        : Math.max(1, Math.floor(duration * fps));
+
+    // フォールバック用のクリーン動画要素を準備（CanvasSink が万一使えない環境用）
+    if (!canUseDirectDecoder) {
+      try {
+        dedicatedVideoUrl = URL.createObjectURL(videoFile);
+        const cleanVideo = document.createElement('video');
+        cleanVideo.crossOrigin = 'anonymous';
+        cleanVideo.preload = 'auto';
+        cleanVideo.playsInline = true;
+        cleanVideo.muted = true;
+        cleanVideo.src = dedicatedVideoUrl;
+
+        await new Promise<void>((resolve) => {
+          let isSettled = false;
+          const to = setTimeout(() => {
+            if (!isSettled) {
+              isSettled = true;
+              resolve();
+            }
+          }, 1500);
+
+          cleanVideo.onloadedmetadata = () => {
+            if (!isSettled) {
+              isSettled = true;
+              clearTimeout(to);
+              resolve();
+            }
+          };
+          cleanVideo.onerror = () => {
+            if (!isSettled) {
+              isSettled = true;
+              clearTimeout(to);
+              resolve();
+            }
+          };
+        });
+
+        if (cleanVideo.duration && cleanVideo.duration > 0) {
+          activeVideo = cleanVideo;
+        }
+      } catch (cleanErr) {
+        console.warn('Dedicated video creation fallback to videoElement:', cleanErr);
+        activeVideo = videoElement;
+      }
     }
 
     // レンダリング用キャンバス準備（100% クリーンなコンテキストで生成）
@@ -1203,7 +1329,6 @@ export async function exportMosaicVideo(
     if (!srcCtx) throw new Error('Source canvas context error');
 
     // 1. 音声トラックの解析・準備（完全な AudioSpecificConfig / esds 保証付き）
-    // includeAudio が false の場合は音声パイプラインをバイパスして完全ミュート出力（処理時間とファイルサイズを削減）
     const shouldIncludeAudio = options.includeAudio !== false;
     const audioPipeline = shouldIncludeAudio
       ? await prepareAudioPipeline(videoFile, duration, (status) => {
@@ -1229,8 +1354,9 @@ export async function exportMosaicVideo(
       firstTimestampBehavior: 'offset',
     });
 
-    // 3. VideoEncoder の設定
-    const videoConfig = await findSupportedVideoConfig(videoWidth, videoHeight, fps, 2_500_000);
+    // 3. VideoEncoder の設定（60fps等に応じた最適なビットレートとプロファイルを自動選択）
+    const targetBitrate = fps >= 50 ? 3_500_000 : 2_500_000;
+    const videoConfig = await findSupportedVideoConfig(videoWidth, videoHeight, fps, targetBitrate);
     let videoEncoderError: Error | null = null;
     const videoEncoder = new VideoEncoder({
       output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
@@ -1242,122 +1368,190 @@ export async function exportMosaicVideo(
     videoEncoder.configure(videoConfig);
 
     // 4. 映像フレームの順次レンダリングと、タイムスタンプ順の音声チャンク・インターリーブ書き込み
+    let frameCount = 0;
     let nextAudioIndex = 0;
     const audioChunks = audioPipeline.chunks;
+    let lastVideoTimestampUs = -1;
 
-    for (let f = 0; f < totalFrames; f++) {
-      if (videoEncoderError) throw videoEncoderError;
+    // パイプライン1: 【WebCodecs + Mediabunny CanvasSink 直接ハードウェアデコード】
+    // シーク一切なし・重複率0%・ネイティブFPSで超滑らか出力
+    if (canUseDirectDecoder && videoTrack) {
+      try {
+        onProgress({
+          currentFrame: 0,
+          totalFrames,
+          percent: 0,
+          status: `直接ハードウェアデコード開始 (${fps} fps)...`,
+        });
 
-      // バックプレッシャー: 未処理フレームがキューにたまっている場合は待機（GPU/RAMのOOM防止）
-      while (videoEncoder.encodeQueueSize > 2) {
-        await new Promise((r) => setTimeout(r, 10));
+        const sink = new CanvasSink(videoTrack, {
+          width: videoWidth,
+          height: videoHeight,
+          fit: 'fill',
+        });
+
+        for await (const wrappedCanvas of sink.canvases()) {
+          if (videoEncoderError) throw videoEncoderError;
+
+          while (videoEncoder.encodeQueueSize > 2) {
+            await new Promise((r) => setTimeout(r, 10));
+          }
+
+          const currentTime = wrappedCanvas.timestamp;
+
+          // デコードされた完全クリーンな元コマを描画
+          srcCtx.drawImage(wrappedCanvas.canvas, 0, 0, videoWidth, videoHeight);
+          ctx.drawImage(sourceCanvas, 0, 0, videoWidth, videoHeight);
+
+          // モザイク適用
+          applyMosaicToFrame(
+            ctx,
+            sourceCanvas,
+            tracks,
+            currentTime,
+            videoWidth,
+            videoHeight,
+            options
+          );
+
+          // 単調増加を保証した正確なタイムスタンプの算出（ジャダー・コマ飛び根絶）
+          let timestampUs = Math.round(wrappedCanvas.timestamp * 1_000_000);
+          const durationUs = Math.max(1000, Math.round(wrappedCanvas.duration * 1_000_000));
+
+          if (timestampUs <= lastVideoTimestampUs) {
+            timestampUs =
+              lastVideoTimestampUs +
+              Math.max(1000, Math.round((1 / fps) * 1_000_000));
+          }
+          lastVideoTimestampUs = timestampUs;
+
+          const videoFrame = new VideoFrame(exportCanvas, {
+            timestamp: timestampUs,
+            duration: durationUs,
+          });
+
+          // 1秒ごと（fpsフレームごと）に必ずIDRキーフレームを生成してシークバーの移動を軽快にする
+          const isKeyframe = frameCount % fps === 0;
+          videoEncoder.encode(videoFrame, { keyFrame: isKeyframe });
+          videoFrame.close();
+
+          // 現在の映像フレーム時刻までの音声チャンクを順次インターリーブ投入
+          if (hasValidAudio) {
+            while (
+              nextAudioIndex < audioChunks.length &&
+              audioChunks[nextAudioIndex].timestampUs <= timestampUs
+            ) {
+              const aChunk = audioChunks[nextAudioIndex];
+              muxer.addAudioChunkRaw(
+                aChunk.data,
+                aChunk.type,
+                aChunk.timestampUs,
+                aChunk.durationUs,
+                aChunk.meta
+              );
+              (aChunk as any).data = null;
+              nextAudioIndex++;
+            }
+          }
+
+          frameCount++;
+          const currentTotal = Math.max(frameCount, totalFrames);
+          const percent = Math.min(99, Math.round((frameCount / currentTotal) * 100));
+          onProgress({
+            currentFrame: frameCount,
+            totalFrames: currentTotal,
+            percent,
+            status: `高精度フレームをエンコード中 (${frameCount}/${currentTotal})`,
+          });
+        }
+      } catch (directErr) {
+        console.warn('Direct CanvasSink processing failed, fallback to seek loop:', directErr);
+      }
+    }
+
+    // パイプライン2: 【フォールバック・シーク方式】
+    // 直接デコード非対応時、または万一の例外発生時に安全に実行
+    if (frameCount === 0) {
+      if (!dedicatedVideoUrl) {
+        try {
+          dedicatedVideoUrl = URL.createObjectURL(videoFile);
+          const cleanVideo = document.createElement('video');
+          cleanVideo.crossOrigin = 'anonymous';
+          cleanVideo.preload = 'auto';
+          cleanVideo.playsInline = true;
+          cleanVideo.muted = true;
+          cleanVideo.src = dedicatedVideoUrl;
+          await new Promise<void>((r) => {
+            cleanVideo.onloadedmetadata = () => r();
+            cleanVideo.onerror = () => r();
+            setTimeout(r, 1500);
+          });
+          if (cleanVideo.duration && cleanVideo.duration > 0) {
+            activeVideo = cleanVideo;
+          }
+        } catch (_) {}
       }
 
-      const currentTime = f / fps;
-      await seekVideoElement(activeVideo, currentTime);
+      for (let f = 0; f < totalFrames; f++) {
+        if (videoEncoderError) throw videoEncoderError;
 
-      // 元フレーム描画
-      srcCtx.drawImage(activeVideo, 0, 0, videoWidth, videoHeight);
-      ctx.drawImage(sourceCanvas, 0, 0, videoWidth, videoHeight);
-
-      // モザイク適用（反転モザイクまたは通常モザイク）
-      if (options.isInverseMosaic) {
-        const protectedRegions: ProtectedRegion[] = [];
-        for (const track of tracks) {
-          if (!track.enabled) continue;
-          // 冒頭0.6秒以内から始まっているトラックは0秒（第1フレーム）でも確実に保護
-          const effectiveStart = track.startTime <= 0.6 ? 0 : track.startTime;
-          if (currentTime < effectiveStart || currentTime > track.endTime) continue;
-
-          const effectiveTime = (currentTime < track.startTime && track.startTime <= 0.6)
-            ? track.startTime
-            : currentTime;
-
-          const pos = interpolateKeyframes(track.keyframes, effectiveTime, {
-            screenWidth: videoWidth,
-            screenHeight: videoHeight,
-            hasFutureManualKeyframe: track.keyframes.some((k) => k.time > effectiveTime),
-          });
-          if (pos && !track.trackingData?.isOutOfFrame) {
-            protectedRegions.push({
-              shape: track.shape,
-              x: pos.x,
-              y: pos.y,
-              width: pos.width,
-              height: pos.height,
-              points: pos.points,
-            });
-          }
+        while (videoEncoder.encodeQueueSize > 2) {
+          await new Promise((r) => setTimeout(r, 10));
         }
-        renderInverseMosaic(
+
+        const currentTime = f / fps;
+        await seekVideoElement(activeVideo, currentTime);
+
+        srcCtx.drawImage(activeVideo, 0, 0, videoWidth, videoHeight);
+        ctx.drawImage(sourceCanvas, 0, 0, videoWidth, videoHeight);
+
+        applyMosaicToFrame(
           ctx,
-          protectedRegions,
+          sourceCanvas,
+          tracks,
+          currentTime,
           videoWidth,
           videoHeight,
-          options.inverseMosaicType || 'blur',
-          options.inverseStrength || 18,
-          sourceCanvas
+          options
         );
-      } else {
-        for (const track of tracks) {
-          if (!track.enabled) continue;
-          const effectiveStart = track.startTime <= 0.6 ? 0 : track.startTime;
-          if (currentTime < effectiveStart || currentTime > track.endTime) continue;
 
-          const effectiveTime = (currentTime < track.startTime && track.startTime <= 0.6)
-            ? track.startTime
-            : currentTime;
+        const timestampUs = Math.round((f / fps) * 1_000_000);
+        const videoFrame = new VideoFrame(exportCanvas, {
+          timestamp: timestampUs,
+          duration: Math.round((1 / fps) * 1_000_000),
+        });
 
-          const pos = interpolateKeyframes(track.keyframes, effectiveTime, {
-            screenWidth: videoWidth,
-            screenHeight: videoHeight,
-            hasFutureManualKeyframe: track.keyframes.some((k) => k.time > effectiveTime),
-          });
-          if (pos && !track.trackingData?.isOutOfFrame) {
-            renderTrackMosaic(ctx, track, pos, sourceCanvas);
+        const isKeyframe = f % fps === 0;
+        videoEncoder.encode(videoFrame, { keyFrame: isKeyframe });
+        videoFrame.close();
+
+        if (hasValidAudio) {
+          while (
+            nextAudioIndex < audioChunks.length &&
+            audioChunks[nextAudioIndex].timestampUs <= timestampUs
+          ) {
+            const aChunk = audioChunks[nextAudioIndex];
+            muxer.addAudioChunkRaw(
+              aChunk.data,
+              aChunk.type,
+              aChunk.timestampUs,
+              aChunk.durationUs,
+              aChunk.meta
+            );
+            (aChunk as any).data = null;
+            nextAudioIndex++;
           }
         }
+
+        frameCount++;
+        const percent = Math.round(((f + 1) / totalFrames) * 100);
+        onProgress({
+          currentFrame: f + 1,
+          totalFrames,
+          percent,
+          status: `フレームをエンコード中 (${f + 1}/${totalFrames})`,
+        });
       }
-
-      // VideoFrame 作成とエンコード
-      const timestampUs = Math.round((f / fps) * 1_000_000);
-      const videoFrame = new VideoFrame(exportCanvas, {
-        timestamp: timestampUs,
-        duration: Math.round((1 / fps) * 1_000_000),
-      });
-
-      // 1秒ごと（30フレームごと）に必ずIDRキーフレームを生成してシークバーの移動を軽快にする
-      const isKeyframe = f % 30 === 0;
-      videoEncoder.encode(videoFrame, { keyFrame: isKeyframe });
-      videoFrame.close();
-
-      // 現在の映像フレーム時刻までの音声チャンクを順次インターリーブ投入
-      if (hasValidAudio) {
-        while (
-          nextAudioIndex < audioChunks.length &&
-          audioChunks[nextAudioIndex].timestampUs <= timestampUs
-        ) {
-          const aChunk = audioChunks[nextAudioIndex];
-          muxer.addAudioChunkRaw(
-            aChunk.data,
-            aChunk.type,
-            aChunk.timestampUs,
-            aChunk.durationUs,
-            aChunk.meta
-          );
-          // 書き込み済みチャンクの参照を解放
-          (aChunk as any).data = null;
-          nextAudioIndex++;
-        }
-      }
-
-      const percent = Math.round(((f + 1) / totalFrames) * 100);
-      onProgress({
-        currentFrame: f + 1,
-        totalFrames,
-        percent,
-        status: `フレームをエンコード中 (${f + 1}/${totalFrames})`,
-      });
     }
 
     // 5. 残りの音声チャンクをフラッシュ書き込み
@@ -1379,8 +1573,8 @@ export async function exportMosaicVideo(
 
     // 6. 完了処理（moovアトムの書き込みとインデックス構築）
     onProgress({
-      currentFrame: totalFrames,
-      totalFrames,
+      currentFrame: Math.max(frameCount, totalFrames),
+      totalFrames: Math.max(frameCount, totalFrames),
       percent: 100,
       status: 'MP4（moovアトム・シーク目次）を構築中...',
     });
@@ -1391,6 +1585,11 @@ export async function exportMosaicVideo(
 
     return await outputTarget.finalizeAndGetBlob();
   } finally {
+    if (videoInput) {
+      try {
+        (videoInput as any).dispose?.();
+      } catch (_) {}
+    }
     if (dedicatedVideoUrl) {
       try {
         URL.revokeObjectURL(dedicatedVideoUrl);
