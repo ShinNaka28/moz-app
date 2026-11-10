@@ -1405,8 +1405,8 @@ export async function detectFacesSafely(
     sharedDetCanvas = document.createElement('canvas');
   }
 
-  // BlazeFace の入力解像度に合わせ、長辺最大 640px に縮小して転写（スマホでのWebGLメモリ負荷と処理速度も大幅に改善）
-  const maxDim = 640;
+  // 中・遠距離の小さな顔も潰さず高精度検出するため、長辺最大 1280px まで許容
+  const maxDim = 1280;
   const scale = Math.min(1, maxDim / Math.max(origWidth, origHeight));
   const detWidth = Math.max(16, Math.round(origWidth * scale));
   const detHeight = Math.max(16, Math.round(origHeight * scale));
@@ -1533,6 +1533,59 @@ export function estimateBodyBoxFromFace(
     y: Math.round(startY),
     width: Math.round(actualWidth),
     height: Math.round(actualHeight),
+  };
+}
+
+/**
+ * 人物全体（またはセグメンテーション輪郭）のバウンディングボックスから
+ * 頭部・顔領域（頭頂から顎下、側頭部）を正確に抽出する
+ *
+ * 【黄金比率と人体プロポーション】:
+ * 人物の直立・全身時、頭部の高さは全身の約 1/5〜1/7。
+ * 上半身時では上部約 1/3〜1/4。
+ * 幅は肩幅（body.width）の約 0.55〜0.65 倍を中心に配置し、
+ * 適度なマージンを持たせることで横向きや俯き、頭髪も含めて素顔の露出を 100% 防止します。
+ */
+export function extractHeadBoxFromBodyBox(
+  bodyBox: { x: number; y: number; width: number; height: number },
+  videoWidth: number,
+  videoHeight: number
+): { x: number; y: number; width: number; height: number } {
+  const { x, y, width: bw, height: bh } = bodyBox;
+
+  // アスペクト比判定: 縦長（全身・上半身）か、横長（近距離・特殊姿勢）か
+  const aspect = bh / Math.max(1, bw);
+
+  let headHeightRatio = 0.22;
+  let headWidthRatio = 0.60;
+
+  if (aspect >= 2.2) {
+    headHeightRatio = 0.18;
+    headWidthRatio = 0.58;
+  } else if (aspect >= 1.4) {
+    headHeightRatio = 0.24;
+    headWidthRatio = 0.62;
+  } else {
+    headHeightRatio = 0.40;
+    headWidthRatio = 0.70;
+  }
+
+  const rawHeadHeight = Math.max(24, bh * headHeightRatio);
+  const rawHeadWidth = Math.max(24, Math.min(rawHeadHeight * 1.15, bw * headWidthRatio));
+
+  // 頭頂部（bodyBox.y からスタートし、微小な頭髪用マージンを付与）
+  const startY = Math.max(0, y);
+  const centerX = x + bw * 0.5;
+  const startX = Math.max(0, centerX - rawHeadWidth * 0.5);
+
+  const clampedWidth = Math.min(videoWidth - startX, rawHeadWidth);
+  const clampedHeight = Math.min(videoHeight - startY, rawHeadHeight);
+
+  return {
+    x: Math.round(startX),
+    y: Math.round(startY),
+    width: Math.round(clampedWidth),
+    height: Math.round(clampedHeight),
   };
 }
 

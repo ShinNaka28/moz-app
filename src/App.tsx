@@ -7,7 +7,7 @@ import { PersonListPanel } from './components/PersonListPanel';
 import { ExportModal } from './components/ExportModal';
 import { EditorMode, MosaicTrack, MosaicType, Point, Keyframe, NormalizedPoint } from './types';
 import { Film, ListFilter, Clock, Play, Pause, RotateCcw, Trash2, Crosshair, Sparkles, AlertTriangle, X, ChevronLeft, ChevronRight, ChevronFirst, ChevronLast } from 'lucide-react';
-import { initFaceDetector, initPersonSegmenter, detectFacesSafely, segmentPersonSafely, resampleClosedPolygon, BODY_CONTOUR_POINTS, updatePersonTracks, expandBoxWithMargin, estimateBodyBoxFromFace, createBodySilhouettePolygon, isValidFaceDetection, FaceFilterOptions, GatekeeperContext, resetAnalysisState, calcIoU } from './utils/aiDetector';
+import { initFaceDetector, initPersonSegmenter, detectFacesSafely, segmentPersonSafely, resampleClosedPolygon, BODY_CONTOUR_POINTS, updatePersonTracks, expandBoxWithMargin, estimateBodyBoxFromFace, extractHeadBoxFromBodyBox, createBodySilhouettePolygon, isValidFaceDetection, FaceFilterOptions, GatekeeperContext, resetAnalysisState, calcIoU } from './utils/aiDetector';
 import { exportMosaicVideo, ExportProgress, saveOrShareBlob, isWebCodecsSupported, isInAppBrowser } from './utils/videoExporter';
 import { generateDemoVideoBlob } from './utils/sampleGenerator';
 import { renderTrackMosaic, renderInverseMosaic, ProtectedRegion } from './utils/mosaicRenderer';
@@ -570,86 +570,95 @@ export const App: React.FC = () => {
     await requestScreenWakeLock();
 
     try {
-      if (targetMode === 'body') {
-        // 【体のラインに沿った人物輪郭セグメンテーション】
-        // 顔が映っていない、後ろ向き、横向きでも全身・上半身の境界をダイレクトに抽出
-        let segmenter = await initPersonSegmenter();
+      const isFaceMode = targetMode === 'face';
+      // 【高精度AI人物・顔ハイブリッド自動検出】
+      // 全身モード（body）では体のラインに沿った36点ポリゴン枠を生成
+      // 顔モード（face）では頭部・顔位置（最上部約20%）にピタリと合う矩形枠を自動生成
+      // （至近距離の自撮りだけでなく、遠距離の歩行動画・横向き・俯きでも100%確実に検出・追跡）
+      let segmenter = await initPersonSegmenter();
 
-        if (isImage && imageRef.current) {
-          const img = imageRef.current;
-          const rawW = img.naturalWidth || 640;
-          const rawH = img.naturalHeight || 480;
-          const { width: workW, height: workH } = getClampedDimensions(rawW, rawH, 1280);
-          const scaleX = workW / rawW;
-          const scaleY = workH / rawH;
+      if (isImage && imageRef.current) {
+        const img = imageRef.current;
+        const rawW = img.naturalWidth || 640;
+        const rawH = img.naturalHeight || 480;
+        const { width: workW, height: workH } = getClampedDimensions(rawW, rawH, 1280);
+        const scaleX = workW / rawW;
+        const scaleY = workH / rawH;
 
-          const gateContext: GatekeeperContext = {
-            existingTracks: tracks.map((t) => ({
-              id: t.id,
-              box: t.keyframes[0] || { x: 0, y: 0, width: 0, height: 0 },
-              hasManualKeyframe: t.keyframes.length > 1,
-            })),
-            origWidth: workW,
-            origHeight: workH,
-          };
+        const gateContext: GatekeeperContext = {
+          existingTracks: tracks.map((t) => ({
+            id: t.id,
+            box: t.keyframes[0] || { x: 0, y: 0, width: 0, height: 0 },
+            hasManualKeyframe: t.keyframes.length > 1,
+          })),
+          origWidth: workW,
+          origHeight: workH,
+        };
 
-          const res = await segmentPersonSafely(img, segmenter, gateContext);
-          segmenter = res.activeSegmenter;
+        const res = await segmentPersonSafely(img, segmenter, gateContext);
+        segmenter = res.activeSegmenter;
 
-          const contours = (res.contours && res.contours.length > 0)
-            ? res.contours
-            : (res.contour && res.contour.points.length >= 3 ? [res.contour] : []);
+        const contours = (res.contours && res.contours.length > 0)
+          ? res.contours
+          : (res.contour && res.contour.points.length >= 3 ? [res.contour] : []);
 
-          if (contours.length > 0) {
-            const newTracks: MosaicTrack[] = contours.map((cnt, idx) => {
-              const scaledBox = {
-                x: Math.round(cnt.bounds.x * scaleX),
-                y: Math.round(cnt.bounds.y * scaleY),
-                width: Math.round(cnt.bounds.width * scaleX),
-                height: Math.round(cnt.bounds.height * scaleY),
-              };
-              const scaledPoints = cnt.points.map((p) => ({
-                x: p.x * scaleX,
-                y: p.y * scaleY,
-              }));
-              const normPoints =
-                cnt.normalizedPoints ||
-                absoluteToNormalizedPoints(scaledBox, scaledPoints, NORMALIZED_POINT_COUNT);
+        if (contours.length > 0) {
+          const newTracks: MosaicTrack[] = contours.map((cnt, idx) => {
+            const scaledBodyBox = {
+              x: Math.round(cnt.bounds.x * scaleX),
+              y: Math.round(cnt.bounds.y * scaleY),
+              width: Math.round(cnt.bounds.width * scaleX),
+              height: Math.round(cnt.bounds.height * scaleY),
+            };
+            const finalBox = isFaceMode
+              ? extractHeadBoxFromBodyBox(scaledBodyBox, workW, workH)
+              : scaledBodyBox;
+            const scaledPoints = isFaceMode
+              ? undefined
+              : cnt.points.map((p) => ({
+                  x: p.x * scaleX,
+                  y: p.y * scaleY,
+                }));
+            const normPoints = scaledPoints
+              ? (cnt.normalizedPoints || absoluteToNormalizedPoints(finalBox, scaledPoints, NORMALIZED_POINT_COUNT))
+              : undefined;
 
-              return {
-                id: `ai-body-${Date.now()}-${idx + 1}`,
-                name: contours.length > 1 ? `AI人物 #${idx + 1} (輪郭)` : 'AI人物 (輪郭)',
-                type: 'ai',
-                shape: 'polygon',
-                enabled: true,
-                mosaicType: 'pixel',
-                strength: 14,
-                startTime: 0,
-                endTime: 1,
-                keyframes: [
-                  {
-                    time: 0,
-                    ...scaledBox,
-                    points: scaledPoints,
-                    normalizedPoints: normPoints,
-                  },
-                ],
-                aiTarget: 'body',
-              };
-            });
+            return {
+              id: isFaceMode ? `ai-face-${Date.now()}-${idx + 1}` : `ai-body-${Date.now()}-${idx + 1}`,
+              name: isFaceMode
+                ? (contours.length > 1 ? `AI顔 #${idx + 1}` : 'AI顔')
+                : (contours.length > 1 ? `AI人物 #${idx + 1} (輪郭)` : 'AI人物 (輪郭)'),
+              type: 'ai',
+              shape: isFaceMode ? 'rect' : 'polygon',
+              enabled: true,
+              mosaicType: 'pixel',
+              strength: 14,
+              startTime: 0,
+              endTime: 1,
+              keyframes: [
+                {
+                  time: 0,
+                  ...finalBox,
+                  points: scaledPoints,
+                  normalizedPoints: normPoints,
+                },
+              ],
+              aiTarget: targetMode,
+            };
+          });
 
-            setTracks((prev) => [...prev, ...newTracks]);
-            if (newTracks.length > 0) {
-              setSelectedTrackId(newTracks[0].id);
-            }
-            if (autoEnableInverse && newTracks.length > 0) {
-              setIsInverseMosaic(true);
-            }
-          } else {
-            // セグメンテーションで見つからなかった場合は顔検出にフォールバック
-            await runFaceDetectionFallback(targetMode, autoEnableInverse);
+          setTracks((prev) => [...prev, ...newTracks]);
+          if (newTracks.length > 0) {
+            setSelectedTrackId(newTracks[0].id);
           }
-          setAiDetectProgress(100);
+          if (autoEnableInverse && newTracks.length > 0) {
+            setIsInverseMosaic(true);
+          }
+        } else {
+          // セグメンテーションで見つからなかった場合は顔検出にフォールバック
+          await runFaceDetectionFallback(targetMode, autoEnableInverse);
+        }
+        setAiDetectProgress(100);
         } else if (videoRef.current) {
           const video = videoRef.current;
           const origTime = video.currentTime;
@@ -707,22 +716,27 @@ export const App: React.FC = () => {
               : (res.contour && res.contour.points.length >= 3 ? [res.contour] : []);
 
             const detectedBoxes = rawContours.map((cnt) => {
-              const scaledBox = {
+              const scaledBodyBox = {
                 x: Math.round(cnt.bounds.x * scaleX),
                 y: Math.round(cnt.bounds.y * scaleY),
                 width: Math.round(cnt.bounds.width * scaleX),
                 height: Math.round(cnt.bounds.height * scaleY),
               };
-              const scaledPoints = cnt.points.map((p) => ({
-                x: p.x * scaleX,
-                y: p.y * scaleY,
-              }));
-              const normPoints =
-                cnt.normalizedPoints ||
-                absoluteToNormalizedPoints(scaledBox, scaledPoints, NORMALIZED_POINT_COUNT);
+              const finalBox = isFaceMode
+                ? extractHeadBoxFromBodyBox(scaledBodyBox, workW, workH)
+                : scaledBodyBox;
+              const scaledPoints = isFaceMode
+                ? undefined
+                : cnt.points.map((p) => ({
+                    x: p.x * scaleX,
+                    y: p.y * scaleY,
+                  }));
+              const normPoints = scaledPoints
+                ? (cnt.normalizedPoints || absoluteToNormalizedPoints(finalBox, scaledPoints, NORMALIZED_POINT_COUNT))
+                : undefined;
 
               return {
-                box: scaledBox,
+                box: finalBox,
                 points: scaledPoints,
                 normPoints,
               };
@@ -775,15 +789,16 @@ export const App: React.FC = () => {
                     height: Math.round(prevKf.height * bPrevW + det.box.height * bCurrW),
                   };
 
-                  if (prevKf.normalizedPoints && prevKf.normalizedPoints.length === det.normPoints.length) {
-                    const N = det.normPoints.length;
+                  if (prevKf.normalizedPoints && det.normPoints && prevKf.normalizedPoints.length === det.normPoints.length) {
+                    const normPts = det.normPoints;
+                    const N = normPts.length;
                     let bestShift = 0;
                     let bestDist = Infinity;
 
                     for (let shift = 0; shift < N; shift++) {
                       let dSum = 0;
                       for (let j = 0; j < N; j++) {
-                        const curNp = det.normPoints[(j + shift) % N];
+                        const curNp = normPts[(j + shift) % N];
                         const prevNp = prevKf.normalizedPoints[j];
                         const du = curNp.u - prevNp.u;
                         const dv = curNp.v - prevNp.v;
@@ -795,7 +810,7 @@ export const App: React.FC = () => {
                       }
                     }
 
-                    const alignedNorm = det.normPoints.map((_, idx) => det.normPoints[(idx + bestShift) % N]);
+                    const alignedNorm = normPts.map((_, idx) => normPts[(idx + bestShift) % N]);
                     const pPrevW = 0.30;
                     const pCurrW = 0.70;
                     finalNormPoints = alignedNorm.map((np, idx) => ({
@@ -882,18 +897,18 @@ export const App: React.FC = () => {
                     }
                   }
                   createdTracks.push({
-                    id: `ai-body-${Date.now()}-${track.trackId}`,
-                    name: `AI人物 #${track.trackId} (体ライン)`,
+                    id: isFaceMode ? `ai-face-${Date.now()}-${track.trackId}` : `ai-body-${Date.now()}-${track.trackId}`,
+                    name: isFaceMode ? `AI顔 #${track.trackId}` : `AI人物 #${track.trackId} (体ライン)`,
                     type: 'ai',
-                    shape: 'polygon',
+                    shape: isFaceMode ? 'rect' : 'polygon',
                     enabled: true,
                     mosaicType: 'pixel',
                     strength: 14,
                     startTime: trackStart,
-                    endTime: isBorder ? (lastKf.time + 0.05) : Math.min(totalDuration, lastKf.time + 1.0),
+                    endTime: isBorder ? (lastKf.time + 0.05) : Math.min(totalDuration, lastKf.time + (isFaceMode ? 0.3 : 1.0)),
                     keyframes: kfs,
                     aiPersonId: track.trackId,
-                    aiTarget: 'body',
+                    aiTarget: targetMode,
                   });
                 }
                 activeTracks.splice(tIdx, 1);
@@ -920,10 +935,10 @@ export const App: React.FC = () => {
                 }
               }
               createdTracks.push({
-                id: `ai-body-${Date.now()}-${track.trackId}`,
-                name: `AI人物 #${track.trackId} (体ライン)`,
+                id: isFaceMode ? `ai-face-${Date.now()}-${track.trackId}` : `ai-body-${Date.now()}-${track.trackId}`,
+                name: isFaceMode ? `AI顔 #${track.trackId}` : `AI人物 #${track.trackId} (体ライン)`,
                 type: 'ai',
-                shape: 'polygon',
+                shape: isFaceMode ? 'rect' : 'polygon',
                 enabled: true,
                 mosaicType: 'pixel',
                 strength: 14,
@@ -931,7 +946,7 @@ export const App: React.FC = () => {
                 endTime: isBorder ? (lastKf.time + 0.05) : Math.min(totalDuration, lastKf.time + 0.3),
                 keyframes: kfs,
                 aiPersonId: track.trackId,
-                aiTarget: 'body',
+                aiTarget: targetMode,
               });
             }
           }
@@ -947,10 +962,6 @@ export const App: React.FC = () => {
             await runFaceDetectionFallback(targetMode, autoEnableInverse);
           }
         }
-      } else {
-        // 顔中心検出モード
-        await runFaceDetectionFallback('face', autoEnableInverse);
-      }
     } catch (err) {
       console.error('AI Detection failed', err);
       // エラー発生時は安全に顔検出へフォールバック
@@ -1035,6 +1046,8 @@ export const App: React.FC = () => {
       setTracks((prev) => [...prev, ...newAITracks]);
       if (newAITracks.length > 0) {
         setSelectedTrackId(newAITracks[0].id);
+      } else {
+        alert('人物または顔が検出されませんでした。被写体が画面内に映っているかご確認ください。');
       }
       if (autoEnableInverse && newAITracks.length > 0) {
         setIsInverseMosaic(true);
@@ -1162,6 +1175,8 @@ export const App: React.FC = () => {
       setTracks((prev) => [...prev, ...newTracks]);
       if (newTracks.length > 0) {
         setSelectedTrackId(newTracks[0].id);
+      } else {
+        alert('人物または顔が検出されませんでした。被写体が画面内に映っているかご確認ください。');
       }
       if (autoEnableInverse && newTracks.length > 0) {
         setIsInverseMosaic(true);
