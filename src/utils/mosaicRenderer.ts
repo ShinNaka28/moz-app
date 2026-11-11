@@ -5,6 +5,15 @@ import { drawSmoothClosedCurve } from './geometry';
  * モザイク描画ユーティリティ
  */
 
+// 毎フレームの大量DOM生成・破棄によるガベージコレクション（GC）停止・メモリリークを防ぐための共有オフスクリーンキャンバス
+let sharedOffscreenCanvas: HTMLCanvasElement | null = null;
+function getSharedOffscreenCanvas(): HTMLCanvasElement {
+  if (!sharedOffscreenCanvas) {
+    sharedOffscreenCanvas = document.createElement('canvas');
+  }
+  return sharedOffscreenCanvas;
+}
+
 export function applyMosaicEffect(
   ctx: CanvasRenderingContext2D,
   type: MosaicType,
@@ -47,8 +56,8 @@ export function applyMosaicEffect(
     const smallW = Math.max(1, Math.floor(width / pixelSize));
     const smallH = Math.max(1, Math.floor(height / pixelSize));
 
-    // 一時オフスクリーンキャンバスでモザイク化
-    const offscreen = document.createElement('canvas');
+    // 共有オフスクリーンキャンバスでモザイク化（毎フレームの新規生成を防止）
+    const offscreen = getSharedOffscreenCanvas();
     offscreen.width = smallW;
     offscreen.height = smallH;
     const offCtx = offscreen.getContext('2d');
@@ -176,7 +185,7 @@ export function renderInverseMosaic(
     const smallW = Math.max(1, Math.floor(canvasWidth / pixelSize));
     const smallH = Math.max(1, Math.floor(canvasHeight / pixelSize));
 
-    const offscreen = document.createElement('canvas');
+    const offscreen = getSharedOffscreenCanvas();
     offscreen.width = smallW;
     offscreen.height = smallH;
     const offCtx = offscreen.getContext('2d');

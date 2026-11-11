@@ -712,7 +712,8 @@ async function encodePcmToAudioChunks(
       sampleRate,
     });
 
-    const maxAudioSamples = Math.ceil(duration * sampleRate);
+    // 動画末尾の端数丸め誤差やデコーダ遅延によるコマ末尾の音声抜けを防ぐため、+0.5秒のマージンを許容
+    const maxAudioSamples = Math.ceil((duration + 0.5) * sampleRate);
     const totalSamples = Math.min(normalizedAudio.length, maxAudioSamples);
     const samplesPerChunk = 1024; // AAC固定ブロック長
 
@@ -952,7 +953,8 @@ async function prepareAudioPipeline(
             firstTimestamp = packet.timestamp;
           }
           const relativeSec = packet.timestamp - firstTimestamp;
-          if (relativeSec > duration + 0.1) break;
+          // 動画末尾の端数丸め誤差やデコーダ遅延によるコマ末尾の音声抜けを防ぐため、+0.5秒のマージンを確保
+          if (relativeSec > duration + 0.5) break;
 
           let timestampUs = Math.round(Math.max(0, relativeSec) * 1_000_000);
           if (timestampUs < lastTimestampUs) {
