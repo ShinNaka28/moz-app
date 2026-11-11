@@ -541,6 +541,14 @@ export const App: React.FC = () => {
         });
       }
 
+      // 動画終端付近まで追従した場合、最後のフレームまで確実にモザイクを維持するため endT に最終キーフレームを配置
+      if (generatedKeyframes.length > 0 && generatedKeyframes[generatedKeyframes.length - 1].time < endT) {
+        generatedKeyframes.push({
+          ...generatedKeyframes[generatedKeyframes.length - 1],
+          time: endT,
+        });
+      }
+
       setTracks((prev) =>
         prev.map((t) =>
           t.id === targetTrackId
@@ -896,6 +904,18 @@ export const App: React.FC = () => {
                       });
                     }
                   }
+                  let trackEnd = isBorder ? (lastKf.time + 0.05) : Math.min(totalDuration, lastKf.time + (isFaceMode ? 0.3 : 1.0));
+                  // 動画末尾付近（1.2秒以内）で検出が途切れた場合は、動画終了まで人物が存在したとみなして末尾まで100%保護
+                  if (totalDuration - lastKf.time <= 1.2) {
+                    trackEnd = totalDuration;
+                    if (kfs[kfs.length - 1].time < totalDuration) {
+                      kfs.push({
+                        ...lastKf,
+                        time: totalDuration,
+                      });
+                    }
+                  }
+
                   createdTracks.push({
                     id: isFaceMode ? `ai-face-${Date.now()}-${track.trackId}` : `ai-body-${Date.now()}-${track.trackId}`,
                     name: isFaceMode ? `AI顔 #${track.trackId}` : `AI人物 #${track.trackId} (体ライン)`,
@@ -905,7 +925,7 @@ export const App: React.FC = () => {
                     mosaicType: 'pixel',
                     strength: 14,
                     startTime: trackStart,
-                    endTime: isBorder ? (lastKf.time + 0.05) : Math.min(totalDuration, lastKf.time + (isFaceMode ? 0.3 : 1.0)),
+                    endTime: trackEnd,
                     keyframes: kfs,
                     aiPersonId: track.trackId,
                     aiTarget: targetMode,
@@ -918,11 +938,10 @@ export const App: React.FC = () => {
 
           await seekVideoSafely(video, origTime);
 
-          // ループ終了時に残っているアクティブトラックを確定
+          // ループ終了時に残っているアクティブトラックを確定（動画末尾まで検出が続いたトラック）
           for (const track of activeTracks) {
             if (track.currentKeyframes.length >= 3) {
               const lastKf = track.currentKeyframes[track.currentKeyframes.length - 1];
-              const isBorder = isBoxTouchingBorder(track.lastValidBox, workW, workH, 20);
               const kfs = [...track.currentKeyframes];
               let trackStart = kfs[0].time;
               if (trackStart <= 0.6) {
@@ -934,6 +953,15 @@ export const App: React.FC = () => {
                   });
                 }
               }
+              // 動画終了時点まで存続したトラックは、末尾のコマ抜けを確実に防ぐため totalDuration まで延長し最終キーフレームを補完
+              const trackEnd = totalDuration;
+              if (kfs[kfs.length - 1].time < totalDuration) {
+                kfs.push({
+                  ...lastKf,
+                  time: totalDuration,
+                });
+              }
+
               createdTracks.push({
                 id: isFaceMode ? `ai-face-${Date.now()}-${track.trackId}` : `ai-body-${Date.now()}-${track.trackId}`,
                 name: isFaceMode ? `AI顔 #${track.trackId}` : `AI人物 #${track.trackId} (体ライン)`,
@@ -943,7 +971,7 @@ export const App: React.FC = () => {
                 mosaicType: 'pixel',
                 strength: 14,
                 startTime: trackStart,
-                endTime: isBorder ? (lastKf.time + 0.05) : Math.min(totalDuration, lastKf.time + 0.3),
+                endTime: trackEnd,
                 keyframes: kfs,
                 aiPersonId: track.trackId,
                 aiTarget: targetMode,

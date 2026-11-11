@@ -1116,7 +1116,8 @@ function applyMosaicToFrame(
   currentTime: number,
   videoWidth: number,
   videoHeight: number,
-  options: ExportOptions
+  options: ExportOptions,
+  videoDuration?: number
 ) {
   if (options.isInverseMosaic) {
     const protectedRegions: ProtectedRegion[] = [];
@@ -1124,7 +1125,13 @@ function applyMosaicToFrame(
       if (!track.enabled) continue;
       // 冒頭0.6秒以内から始まっているトラックは0秒（第1フレーム）でも確実に保護
       const effectiveStart = track.startTime <= 0.6 ? 0 : track.startTime;
-      if (currentTime < effectiveStart || currentTime > track.endTime) continue;
+      // 動画末尾（1.0秒以内）まで延びているトラックは動画終端まで確実に保護し、最後のコマ抜けを防止
+      const effectiveEnd =
+        videoDuration && videoDuration > 0 && videoDuration - track.endTime <= 1.0
+          ? videoDuration + 0.5
+          : track.endTime;
+
+      if (currentTime < effectiveStart || currentTime > effectiveEnd) continue;
 
       const effectiveTime =
         currentTime < track.startTime && track.startTime <= 0.6
@@ -1135,6 +1142,8 @@ function applyMosaicToFrame(
         screenWidth: videoWidth,
         screenHeight: videoHeight,
         hasFutureManualKeyframe: track.keyframes.some((k) => k.time > effectiveTime),
+        trackEndTime: effectiveEnd,
+        videoDuration,
       });
       if (pos && !track.trackingData?.isOutOfFrame) {
         protectedRegions.push({
@@ -1160,7 +1169,12 @@ function applyMosaicToFrame(
     for (const track of tracks) {
       if (!track.enabled) continue;
       const effectiveStart = track.startTime <= 0.6 ? 0 : track.startTime;
-      if (currentTime < effectiveStart || currentTime > track.endTime) continue;
+      const effectiveEnd =
+        videoDuration && videoDuration > 0 && videoDuration - track.endTime <= 1.0
+          ? videoDuration + 0.5
+          : track.endTime;
+
+      if (currentTime < effectiveStart || currentTime > effectiveEnd) continue;
 
       const effectiveTime =
         currentTime < track.startTime && track.startTime <= 0.6
@@ -1171,6 +1185,8 @@ function applyMosaicToFrame(
         screenWidth: videoWidth,
         screenHeight: videoHeight,
         hasFutureManualKeyframe: track.keyframes.some((k) => k.time > effectiveTime),
+        trackEndTime: effectiveEnd,
+        videoDuration,
       });
       if (pos && !track.trackingData?.isOutOfFrame) {
         renderTrackMosaic(ctx, track, pos, sourceCanvas);
@@ -1411,7 +1427,8 @@ export async function exportMosaicVideo(
             currentTime,
             videoWidth,
             videoHeight,
-            options
+            options,
+            duration
           );
 
           // 単調増加を保証した正確なタイムスタンプの算出（ジャダー・コマ飛び根絶）
@@ -1512,7 +1529,8 @@ export async function exportMosaicVideo(
           currentTime,
           videoWidth,
           videoHeight,
-          options
+          options,
+          duration
         );
 
         const timestampUs = Math.round((f / fps) * 1_000_000);

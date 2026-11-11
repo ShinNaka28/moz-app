@@ -41,8 +41,10 @@ function getTrackPos(
   isImage: boolean,
   sw?: number,
   sh?: number,
-  isSelected?: boolean
+  isSelected?: boolean,
+  totalDuration = 0
 ): { x: number; y: number; width: number; height: number; points?: Point[]; normalizedPoints?: NormalizedPoint[] } | null {
+  if (!isTrackActiveAtTime(track, targetTime, isImage, totalDuration)) return null;
   if (isImage && track.keyframes.length > 0) {
     const kf = track.keyframes[0];
     const box = { x: kf.x, y: kf.y, width: kf.width, height: kf.height };
@@ -62,18 +64,29 @@ function getTrackPos(
       ? track.startTime
       : targetTime;
 
+  const effectiveEnd =
+    totalDuration > 0 && totalDuration - track.endTime <= 1.0
+      ? totalDuration + 0.5
+      : track.endTime;
+
   return interpolateKeyframes(track.keyframes, effectiveTime, {
     screenWidth: sw,
     screenHeight: sh,
     hasFutureManualKeyframe: isEditing || track.keyframes.some((k) => k.time > effectiveTime),
+    trackEndTime: effectiveEnd,
+    videoDuration: totalDuration,
   });
 }
 
-function isTrackActiveAtTime(track: MosaicTrack, time: number, isImage: boolean): boolean {
+function isTrackActiveAtTime(track: MosaicTrack, time: number, isImage: boolean, totalDuration = 0): boolean {
   if (isImage) return track.enabled;
   if (!track.enabled) return false;
   const effectiveStart = track.startTime <= 0.6 ? 0 : track.startTime;
-  return time >= effectiveStart && time <= track.endTime;
+  const effectiveEnd =
+    totalDuration > 0 && totalDuration - track.endTime <= 1.0
+      ? totalDuration + 0.5
+      : track.endTime;
+  return time >= effectiveStart && time <= effectiveEnd;
 }
 
 export const VideoCanvas: React.FC<VideoCanvasProps> = ({
@@ -261,8 +274,9 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
     ctx.drawImage(sourceCanvasRef.current, 0, 0, mediaWidth, mediaHeight);
 
     // 現在の表示位置を計算（ドラッグ変形・移動中はリアルタイムに反映）
+    const totalDuration = (!isImage && videoRef && videoRef.current) ? (videoRef.current.duration || 0) : 0;
     const getEffectivePos = (track: MosaicTrack) => {
-      const pos = getTrackPos(track, currentTime, isImage, canvas.width, canvas.height, track.id === selectedTrackId);
+      const pos = getTrackPos(track, currentTime, isImage, canvas.width, canvas.height, track.id === selectedTrackId, totalDuration);
       if (!pos) return null;
 
       if (transformRef.current && transformRef.current.trackId === track.id) {
@@ -445,12 +459,14 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
     const uiScale = canvas && rect && rect.width > 0 ? Math.max(1, canvas.width / rect.width) : 1;
     const touchPad = 14 * uiScale;
 
+    const totalDuration = (!isImage && videoRef && videoRef.current) ? (videoRef.current.duration || 0) : 0;
+
     // 1. 選択中のトラックがある場合、そのハンドル・枠内移動を最優先判定（モード問わず）
     // ※キャンバス上の誤タップによる枠消失を防ぐため、キャンバス内での直接削除判定は行わず、移動・リサイズのみに特化
     if (selectedTrackId) {
       const selectedTrack = tracks.find((t) => t.id === selectedTrackId);
-      if (selectedTrack && (isImage || (currentTime >= selectedTrack.startTime && currentTime <= selectedTrack.endTime))) {
-        const pos = getTrackPos(selectedTrack, currentTime, isImage, canvas?.width, canvas?.height, true);
+      if (selectedTrack && (isImage || isTrackActiveAtTime(selectedTrack, currentTime, isImage, totalDuration))) {
+        const pos = getTrackPos(selectedTrack, currentTime, isImage, canvas?.width, canvas?.height, true, totalDuration);
         if (pos) {
           // 1-A. ポリゴン・フリー囲みの「頂点ハンドル（●）」タッチ判定を最優先！
           // 輪郭上の黄色い丸（●）をドラッグすることで、人物の身体のラインに手動でぴったり合わせられる
@@ -564,8 +580,8 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
     // 2. 他の既存トラックをクリックしたか判定（枠の上を触ればいつでもその枠を選択して移動開始）
     for (let i = tracks.length - 1; i >= 0; i--) {
       const track = tracks[i];
-      if (!isTrackActiveAtTime(track, currentTime, isImage)) continue;
-      const pos = getTrackPos(track, currentTime, isImage, canvas?.width, canvas?.height);
+      if (!isTrackActiveAtTime(track, currentTime, isImage, totalDuration)) continue;
+      const pos = getTrackPos(track, currentTime, isImage, canvas?.width, canvas?.height, false, totalDuration);
       if (!pos) continue;
 
       if (
@@ -648,9 +664,10 @@ export const VideoCanvas: React.FC<VideoCanvasProps> = ({
     // ホバー時のカーソルスタイル更新（マウス操作時）
     if (e.pointerType === 'mouse') {
       if (selectedTrackId) {
+        const totalDuration = (!isImage && videoRef && videoRef.current) ? (videoRef.current.duration || 0) : 0;
         const selectedTrack = tracks.find((t) => t.id === selectedTrackId);
         if (selectedTrack) {
-          const pos = getTrackPos(selectedTrack, currentTime, isImage, canvasRef.current?.width, canvasRef.current?.height, true);
+          const pos = getTrackPos(selectedTrack, currentTime, isImage, canvasRef.current?.width, canvasRef.current?.height, true, totalDuration);
           if (pos) {
             if (
               (selectedTrack.shape === 'polygon' || selectedTrack.shape === 'lasso') &&

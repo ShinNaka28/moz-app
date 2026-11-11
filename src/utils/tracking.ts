@@ -306,6 +306,8 @@ export function interpolateKeyframes(
     screenWidth?: number;
     screenHeight?: number;
     hasFutureManualKeyframe?: boolean;
+    trackEndTime?: number;
+    videoDuration?: number;
   }
 ): { x: number; y: number; width: number; height: number; points?: Point[]; normalizedPoints?: NormalizedPoint[] } | null {
   if (keyframes.length === 0) return null;
@@ -333,10 +335,15 @@ export function interpolateKeyframes(
   if (keyframes.length === 1) {
     const kf = keyframes[0];
     if (time > kf.time && !options?.hasFutureManualKeyframe) {
-      const isBorder = isBoxTouchingBorder(kf, sw, sh, 20);
-      const maxHold = isBorder ? 0.05 : 1.0;
-      if (time > kf.time + maxHold) {
-        return null;
+      // トラック終了時間内、または動画終端付近（1.2秒以内）であれば枠を維持
+      const isWithinTrackEnd = options?.trackEndTime !== undefined && time <= options.trackEndTime + 0.1;
+      const isNearVideoEnd = options?.videoDuration !== undefined && (options.videoDuration - time <= 1.2 || (options.trackEndTime !== undefined && options.videoDuration - options.trackEndTime <= 1.2));
+      if (!isWithinTrackEnd && !isNearVideoEnd) {
+        const isBorder = isBoxTouchingBorder(kf, sw, sh, 20);
+        const maxHold = isBorder ? 0.05 : 1.0;
+        if (time > kf.time + maxHold) {
+          return null;
+        }
       }
     }
     return buildResult(kf);
@@ -354,13 +361,24 @@ export function interpolateKeyframes(
 
   // 最後のキーフレーム以降:
   // 1. 未来に手動キーフレームがある場合は絶対に枠を破棄せず維持（手動キーフレームの絶対保護）
-  // 2. 画面境界（端から20px以内）に接していた場合は「画面外への退場」と確定し即時破棄（ホールド即解除）
-  // 3. 画面中央付近で見失った場合は連続約1秒（1.0秒）経過後にホールド解除・枠消去
+  // 2. トラック終了時間（trackEndTime）内、または動画終端付近（1.2秒以内）の場合は動画末尾まで100%維持
+  // 3. 上記以外で画面境界（端から20px以内）に接していた場合は「画面外への退場」と確定し即時破棄
+  // 4. 画面中央付近で見失った場合は連続約1秒（1.0秒）経過後にホールド解除・枠消去
   const lastKf = sorted[sorted.length - 1];
   if (time >= lastKf.time) {
     if (options?.hasFutureManualKeyframe) {
       return buildResult(lastKf);
     }
+    // トラックの有効時間内、あるいは動画の末尾近くであれば末尾フレームまで絶対にモザイクを外さない
+    const isWithinTrackEnd = options?.trackEndTime !== undefined && time <= options.trackEndTime + 0.1;
+    const isNearVideoEnd =
+      options?.videoDuration !== undefined &&
+      (options.videoDuration - time <= 1.2 || (options.trackEndTime !== undefined && options.videoDuration - options.trackEndTime <= 1.2));
+
+    if (isWithinTrackEnd || isNearVideoEnd) {
+      return buildResult(lastKf);
+    }
+
     const isBorder = isBoxTouchingBorder(lastKf, sw, sh, 20);
     const maxHold = isBorder ? 0.05 : 1.0;
     if (time > lastKf.time + maxHold) {
