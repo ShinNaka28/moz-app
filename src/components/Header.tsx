@@ -1,5 +1,6 @@
 import React from 'react';
 import { ShieldCheck, Video, Image as ImageIcon, Sparkles, Download, PlayCircle, Volume2, VolumeX } from 'lucide-react';
+import { APP_VERSION } from '../version';
 
 interface HeaderProps {
   onOpenFile: (e: React.ChangeEvent<HTMLInputElement>) => void;
@@ -31,9 +32,14 @@ export const Header: React.FC<HeaderProps> = ({
             M
           </div>
           <div>
-            <h1 className="text-sm sm:text-base font-bold text-slate-100 flex items-center gap-1.5">
-              ローカルAIモザイクエディター
-            </h1>
+            <div className="flex items-center gap-1.5">
+              <h1 className="text-sm sm:text-base font-bold text-slate-100">
+                ローカルAIモザイクエディター
+              </h1>
+              <span className="px-1.5 py-0.5 rounded text-[10px] font-mono font-bold bg-slate-800 text-cyan-400 border border-slate-700 shadow-xs" title={`バージョン ${APP_VERSION}`}>
+                {APP_VERSION}
+              </span>
+            </div>
             <p className="text-[10px] text-slate-400 hidden sm:block">
               AI顔追跡 & 任意領域オプティカルフロー追従
             </p>

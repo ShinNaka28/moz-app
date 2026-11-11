@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { ExportProgress, saveOrShareBlob } from '../utils/videoExporter';
 import { Download, Share2, CheckCircle2, Loader2, X, ArrowLeft, Play, Eye, Sun, AlertTriangle } from 'lucide-react';
+import { APP_VERSION } from '../version';
 
 interface ExportModalProps {
   isOpen: boolean;
@@ -206,6 +207,12 @@ export const ExportModal: React.FC<ExportModalProps> = ({
             </div>
           </div>
         )}
+
+        {/* バージョンフッター */}
+        <div className="mt-3 pt-2.5 border-t border-slate-800/80 flex items-center justify-between text-[10px] text-slate-500 font-mono">
+          <span>ローカルAIモザイクエディター</span>
+          <span className="text-cyan-500/80 font-bold">Ver {APP_VERSION}</span>
+        </div>
       </div>
     </div>
   );
