@@ -3,6 +3,7 @@ import {
   Input,
   ALL_FORMATS,
   BlobSource,
+  BufferSource,
   CanvasSink,
   InputVideoTrack,
   EncodedPacketSink,
@@ -26,6 +27,8 @@ export interface ExportOptions {
   inverseMosaicType?: MosaicType;
   inverseStrength?: number;
   includeAudio?: boolean;
+  mediaBuffer?: ArrayBuffer | null;
+  cachedAudioPipeline?: PreparedAudioPipeline | null;
 }
 
 interface MuxerOutputTarget {
@@ -629,7 +632,7 @@ export function isInAppBrowser(): boolean {
   return /Line|FBAN|FBAV|Instagram|Twitter|Snapchat|MicroMessenger/i.test(ua);
 }
 
-interface PreparedAudioChunk {
+export interface PreparedAudioChunk {
   data: Uint8Array;
   type: 'key' | 'delta';
   timestampUs: number;
@@ -637,7 +640,7 @@ interface PreparedAudioChunk {
   meta?: EncodedAudioChunkMetadata;
 }
 
-interface PreparedAudioPipeline {
+export interface PreparedAudioPipeline {
   audioConfig?: {
     codec: 'aac' | 'opus';
     numberOfChannels: number;
@@ -645,6 +648,95 @@ interface PreparedAudioPipeline {
   };
   chunks: PreparedAudioChunk[];
   hasSourceAudio?: boolean;
+}
+
+/**
+ * キャッシュ済みの音声パイプラインを破壊せずに何度でもエクスポートへ再利用できるようディープクローン
+ */
+export function cloneAudioPipeline(
+  pipeline: PreparedAudioPipeline,
+  maxDurationSec?: number
+): PreparedAudioPipeline {
+  const maxTimestampUs =
+    maxDurationSec && maxDurationSec > 0 && Number.isFinite(maxDurationSec)
+      ? Math.round((maxDurationSec + 0.8) * 1_000_000)
+      : Infinity;
+
+  const clonedChunks: PreparedAudioChunk[] = [];
+  for (const c of pipeline.chunks) {
+    if (!c.data || c.data.byteLength === 0) continue;
+    if (c.timestampUs > maxTimestampUs) break;
+
+    let clonedMeta: EncodedAudioChunkMetadata | undefined;
+    if (c.meta?.decoderConfig) {
+      const desc = toUint8Array(c.meta.decoderConfig.description);
+      clonedMeta = {
+        decoderConfig: {
+          ...c.meta.decoderConfig,
+          ...(desc ? { description: new Uint8Array(desc) } : {}),
+        },
+      };
+    }
+
+    clonedChunks.push({
+      data: new Uint8Array(c.data),
+      type: c.type,
+      timestampUs: c.timestampUs,
+      durationUs: c.durationUs,
+      ...(clonedMeta ? { meta: clonedMeta } : {}),
+    });
+  }
+
+  return {
+    audioConfig: pipeline.audioConfig ? { ...pipeline.audioConfig } : undefined,
+    chunks: clonedChunks,
+    hasSourceAudio: pipeline.hasSourceAudio,
+  };
+}
+
+/**
+ * Mediabunny 用の安全な入力ソースを生成
+ *
+ * 【重要バグ修正】:
+ * スマホ（Android Chrome 等）では、`<input type="file">` の `File` 参照に対して
+ * `BlobSource` のデフォルトである `slice.stream().getReader()` を複数並行オープンしたり、
+ * 編集時間が経過した後に読み取ろうとすると `NotReadableError` やストリーム中断が発生します。
+ * そのため、オンメモリの `ArrayBuffer` がある場合は非同期ストリームを一切使わない `BufferSource` を最優先で使用し、
+ * フォールバック時も `useStreamReader: false` を明示指定してストリーム競合を100%根絶します。
+ */
+async function createMediabunnySource(
+  videoFile: File,
+  mediaBuffer?: ArrayBuffer | null
+): Promise<BufferSource | BlobSource> {
+  if (mediaBuffer && mediaBuffer.byteLength > 0) {
+    return new BufferSource(mediaBuffer);
+  }
+  const MAX_BUFFER_SOURCE_SIZE = 250 * 1024 * 1024;
+  if (videoFile.size <= MAX_BUFFER_SOURCE_SIZE) {
+    try {
+      const buf = await videoFile.arrayBuffer();
+      if (buf && buf.byteLength > 0) {
+        return new BufferSource(buf);
+      }
+    } catch (_) {}
+  }
+  return new BlobSource(videoFile, { useStreamReader: false });
+}
+
+/**
+ * HTMLVideoElement から音声トラックの存在を補助検出
+ */
+function detectVideoElementHasAudio(videoElement?: HTMLVideoElement | null): boolean {
+  if (!videoElement) return false;
+  const v = videoElement as any;
+  if (v.mozHasAudio === true) return true;
+  if (typeof v.webkitAudioDecodedByteCount === 'number' && v.webkitAudioDecodedByteCount > 0) {
+    return true;
+  }
+  if (v.audioTracks && typeof v.audioTracks.length === 'number' && v.audioTracks.length > 0) {
+    return true;
+  }
+  return false;
 }
 
 /**
@@ -808,21 +900,28 @@ async function encodePcmToAudioChunks(
 async function decodeAudioFileToBuffer(
   videoFile: File,
   audioTrack: any | null,
-  duration: number
+  duration: number,
+  mediaBuffer?: ArrayBuffer | null
 ): Promise<AudioBuffer | null> {
   const isMobile =
     typeof navigator !== 'undefined' &&
     /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
   const MAX_AUDIO_SAFE_FILE_SIZE = isMobile ? 120 * 1024 * 1024 : 350 * 1024 * 1024;
+  const effectiveDuration = duration > 0 && Number.isFinite(duration) ? duration : 600;
 
   // 1. Web Audio API decodeAudioData（ネイティブ C++ デコーダーで HE-AAC / AAC / MP3 / Opus を高速展開）
+  // ※ decodeAudioData は渡された ArrayBuffer を Detach（所有権移譲）するため、
+  //    オンメモリキャッシュ(mediaBuffer)がある場合は必ず slice(0) のコピーを渡す
   if (videoFile.size <= MAX_AUDIO_SAFE_FILE_SIZE) {
     try {
       const AudioCtx =
         window.AudioContext ||
         (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
       if (AudioCtx) {
-        let arrayBuffer: ArrayBuffer | null = await videoFile.arrayBuffer();
+        let arrayBuffer: ArrayBuffer | null =
+          mediaBuffer && mediaBuffer.byteLength > 0
+            ? mediaBuffer.slice(0)
+            : await videoFile.arrayBuffer();
         const audioCtx = new AudioCtx();
         try {
           const decoded = await audioCtx.decodeAudioData(arrayBuffer);
@@ -840,15 +939,26 @@ async function decodeAudioFileToBuffer(
   }
 
   // 2. Mediabunny AudioBufferSink によるパケット単位デコード結合
-  if (audioTrack) {
-    try {
-      const sink = new AudioBufferSink(audioTrack);
+  let tempInput: Input | null = null;
+  try {
+    let targetAudioTrack = audioTrack;
+    if (!targetAudioTrack) {
+      const source = await createMediabunnySource(videoFile, mediaBuffer);
+      tempInput = new Input({
+        formats: ALL_FORMATS,
+        source,
+      });
+      targetAudioTrack = await tempInput.getPrimaryAudioTrack();
+    }
+
+    if (targetAudioTrack) {
+      const sink = new AudioBufferSink(targetAudioTrack);
       const buffers: AudioBuffer[] = [];
       let totalFrames = 0;
       let sampleRate = 48000;
       let numberOfChannels = 2;
 
-      for await (const wrapped of sink.buffers(0, duration + 0.5)) {
+      for await (const wrapped of sink.buffers(0, effectiveDuration + 0.8)) {
         if (wrapped && wrapped.buffer && wrapped.buffer.length > 0) {
           if (buffers.length === 0) {
             sampleRate = wrapped.buffer.sampleRate;
@@ -877,8 +987,14 @@ async function decodeAudioFileToBuffer(
         }
         return combined;
       }
-    } catch (sinkErr) {
-      console.warn('Mediabunny AudioBufferSink fallback failed:', sinkErr);
+    }
+  } catch (sinkErr) {
+    console.warn('Mediabunny AudioBufferSink fallback failed:', sinkErr);
+  } finally {
+    if (tempInput) {
+      try {
+        tempInput.dispose();
+      } catch (_) {}
     }
   }
 
@@ -889,20 +1005,19 @@ async function decodeAudioFileToBuffer(
  * 音声トラックの抽出・エンコードパイプラインを準備
  *
  * 【根本原因への完全対策】:
- * 1. Mediabunny で直接パケットを抽出する際、必ず `audioTrack.getDecoderConfig()` を取得して
- *    オリジナルの `AudioSpecificConfig (description)` を解析・保持し、先頭チャンクの `meta` に渡します。
- *    （これを行わないと、SNS動画等で多用される HE-AAC / SBR 24kHz 音声が mp4-muxer の 48kHz AAC-LC 推測ヘッダーで
- *      上書きされて esds ボックスが破損し、スマホで無音になります）
- * 2. さらに、元動画が HE-AAC (SBR / PS) や特殊プロファイルであり、かつ端末が WebCodecs AudioEncoder に対応している場合、
- *    デバイスのプレイヤー互換性を100%にするため、標準 AAC-LC (mp4a.40.2) へのクリーン再エンコードを試み、
- *    万一失敗しても上記の完全な `decoderConfig` 付き直接ストリームコピーへ即座にフォールバックします。
- * 3. iOS Safari 等の AudioEncoder 非搭載環境では、完全な `decoderConfig.description` 付きの直接ストリームコピーを行います。
- * 4. すべての音声チャンクをこの関数内で事前に確定・検証するため、0パケットのまま成功扱いになることもありません。
+ * 1. `BlobSource` の非同期ストリームリーダー競合・File参照失効を回避するため、オンメモリ `BufferSource` を優先使用します。
+ * 2. Mediabunny による直接パケット抽出（Branch A/C）と、Web Audio API + WebCodecs AudioEncoder 再エンコード（Branch B）の
+ *    `try-catch` を完全に分離し、万一 Mediabunny 側で例外が発生しても必ず Branch B の救済ルートが実行されるようにします。
+ * 3. `getPrimaryAudioTrack()` がエラーなく完了して `null` を返した場合のみ「元から音声なし動画」と判定し、
+ *    読み取り例外時や `<video>` 要素側で音声が検出されている場合は `hasSourceAudio = true` として扱うことで、
+ *    サイレント無音化（エラーを出さずに音声0トラックで出力される現象）を100%阻止します。
  */
-async function prepareAudioPipeline(
+export async function prepareAudioPipeline(
   videoFile: File,
   duration: number,
-  onProgress: (status: string) => void
+  onProgress: (status: string) => void,
+  mediaBuffer?: ArrayBuffer | null,
+  videoElement?: HTMLVideoElement | null
 ): Promise<PreparedAudioPipeline> {
   onProgress('元動画の音声トラックを解析中...');
 
@@ -915,104 +1030,122 @@ async function prepareAudioPipeline(
   let directChunks: PreparedAudioChunk[] = [];
   let isHeAacOrExtended = false;
 
+  // Mediabunny が正常に moov を解析した上で「音声トラックが存在しない(null)」と確定したかどうか
+  let mediabunnyConfirmedNoAudio = false;
+  // 元動画に音声が存在することを確認できたかどうか
+  let hasDetectedSourceAudio = detectVideoElementHasAudio(videoElement);
+
+  const maxRelativeSec =
+    duration > 0 && Number.isFinite(duration) ? duration + 0.8 : Infinity;
+
   try {
-    input = new Input({
-      formats: ALL_FORMATS,
-      source: new BlobSource(videoFile),
-    });
+    // ステップ1: Mediabunny (BufferSource優先) による音声トラック検査＆直接パケット抽出
+    try {
+      const source = await createMediabunnySource(videoFile, mediaBuffer);
+      input = new Input({
+        formats: ALL_FORMATS,
+        source,
+      });
 
-    audioTrack = await input.getPrimaryAudioTrack();
-    if (audioTrack) {
-      directCodec = await audioTrack.getCodec();
-      directSampleRate = (await audioTrack.getSampleRate()) || 48000;
-      directChannels = (await audioTrack.getNumberOfChannels()) || 2;
+      audioTrack = await input.getPrimaryAudioTrack();
+      if (audioTrack === null) {
+        mediabunnyConfirmedNoAudio = true;
+      } else if (audioTrack) {
+        hasDetectedSourceAudio = true;
+        directCodec = await audioTrack.getCodec();
+        directSampleRate = (await audioTrack.getSampleRate()) || 48000;
+        directChannels = (await audioTrack.getNumberOfChannels()) || 2;
 
-      try {
-        directDecoderConfig = await audioTrack.getDecoderConfig();
-      } catch (_) {
-        directDecoderConfig = null;
-      }
+        try {
+          directDecoderConfig = await audioTrack.getDecoderConfig();
+        } catch (_) {
+          directDecoderConfig = null;
+        }
 
-      if (directCodec === 'aac' || directCodec === 'opus') {
-        const ascInfo =
-          directCodec === 'aac'
-            ? inspectAacAudioSpecificConfig(directDecoderConfig?.description)
-            : null;
+        if (directCodec === 'aac' || directCodec === 'opus') {
+          const ascInfo =
+            directCodec === 'aac'
+              ? inspectAacAudioSpecificConfig(directDecoderConfig?.description)
+              : null;
 
-        isHeAacOrExtended = Boolean(ascInfo?.isHeAacOrExtended);
+          isHeAacOrExtended = Boolean(ascInfo?.isHeAacOrExtended);
 
-        // HE-AAC 等で esds のコアサンプルレートと出力サンプルレートが異なる場合でも、
-        // 元の description (AudioSpecificConfig) をそのまま渡すことでデコーダーが SBR を正しく認識できるようにする
-        const sink = new EncodedPacketSink(audioTrack);
-        let firstTimestamp: number | null = null;
-        let lastTimestampUs = -1;
-        let adtsDerivedAsc: Uint8Array | null = null;
+          try {
+            const sink = new EncodedPacketSink(audioTrack);
+            let firstTimestamp: number | null = null;
+            let lastTimestampUs = -1;
+            let adtsDerivedAsc: Uint8Array | null = null;
 
-        for await (const packet of sink.packets()) {
-          if (!packet.data || packet.data.byteLength === 0) continue;
-          if (firstTimestamp === null) {
-            firstTimestamp = packet.timestamp;
-          }
-          const relativeSec = packet.timestamp - firstTimestamp;
-          // 動画末尾の端数丸め誤差やデコーダ遅延によるコマ末尾の音声抜けを防ぐため、+0.5秒のマージンを確保
-          if (relativeSec > duration + 0.5) break;
+            for await (const packet of sink.packets()) {
+              if (!packet.data || packet.data.byteLength === 0) continue;
+              if (firstTimestamp === null) {
+                firstTimestamp = packet.timestamp;
+              }
+              const relativeSec = packet.timestamp - firstTimestamp;
+              if (relativeSec > maxRelativeSec) break;
 
-          let timestampUs = Math.round(Math.max(0, relativeSec) * 1_000_000);
-          if (timestampUs < lastTimestampUs) {
-            timestampUs = lastTimestampUs;
-          }
-          lastTimestampUs = timestampUs;
-          const durationUs = Math.max(1, Math.round(packet.duration * 1_000_000));
+              let timestampUs = Math.round(Math.max(0, relativeSec) * 1_000_000);
+              if (timestampUs < lastTimestampUs) {
+                timestampUs = lastTimestampUs;
+              }
+              lastTimestampUs = timestampUs;
+              const durationUs = Math.max(1, Math.round(packet.duration * 1_000_000));
 
-          let payload = new Uint8Array(packet.data);
-          if (directCodec === 'aac') {
-            const adts = parseAdtsHeader(payload);
-            if (adts) {
-              payload = payload.subarray(adts.headerLength);
-              if (!adtsDerivedAsc) {
-                adtsDerivedAsc = adts.asc;
+              let payload = new Uint8Array(packet.data);
+              if (directCodec === 'aac') {
+                const adts = parseAdtsHeader(payload);
+                if (adts) {
+                  payload = payload.subarray(adts.headerLength);
+                  if (!adtsDerivedAsc) {
+                    adtsDerivedAsc = adts.asc;
+                  }
+                }
+              }
+              if (payload.byteLength === 0) continue;
+
+              directChunks.push({
+                data: payload,
+                type: packet.type === 'delta' ? 'delta' : 'key',
+                timestampUs,
+                durationUs,
+              });
+            }
+
+            if (directChunks.length > 0) {
+              if (directCodec === 'aac') {
+                const validDesc = ensureValidAacDescription(
+                  directDecoderConfig?.description,
+                  directSampleRate,
+                  directChannels,
+                  adtsDerivedAsc
+                );
+                directChunks[0].meta = {
+                  decoderConfig: {
+                    codec: directDecoderConfig?.codec || 'mp4a.40.2',
+                    sampleRate: directSampleRate,
+                    numberOfChannels: directChannels,
+                    description: validDesc,
+                  },
+                };
+              } else if (directDecoderConfig) {
+                const descBytes = toUint8Array(directDecoderConfig.description);
+                directChunks[0].meta = {
+                  decoderConfig: {
+                    codec: directDecoderConfig.codec || 'opus',
+                    sampleRate: directSampleRate,
+                    numberOfChannels: directChannels,
+                    ...(descBytes && descBytes.byteLength > 0 ? { description: descBytes } : {}),
+                  },
+                };
               }
             }
-          }
-          if (payload.byteLength === 0) continue;
-
-          directChunks.push({
-            data: payload,
-            type: packet.type === 'delta' ? 'delta' : 'key',
-            timestampUs,
-            durationUs,
-          });
-        }
-
-        if (directChunks.length > 0) {
-          if (directCodec === 'aac') {
-            const validDesc = ensureValidAacDescription(
-              directDecoderConfig?.description,
-              directSampleRate,
-              directChannels,
-              adtsDerivedAsc
-            );
-            directChunks[0].meta = {
-              decoderConfig: {
-                codec: directDecoderConfig?.codec || 'mp4a.40.2',
-                sampleRate: directSampleRate,
-                numberOfChannels: directChannels,
-                description: validDesc,
-              },
-            };
-          } else if (directDecoderConfig) {
-            const descBytes = toUint8Array(directDecoderConfig.description);
-            directChunks[0].meta = {
-              decoderConfig: {
-                codec: directDecoderConfig.codec || 'opus',
-                sampleRate: directSampleRate,
-                numberOfChannels: directChannels,
-                ...(descBytes && descBytes.byteLength > 0 ? { description: descBytes } : {}),
-              },
-            };
+          } catch (pktErr) {
+            console.warn('Direct packet extraction encountered an error, will try Branch B:', pktErr);
           }
         }
       }
+    } catch (mbErr) {
+      console.warn('Mediabunny audio track inspection failed, proceeding to WebAudio fallback:', mbErr);
     }
 
     // 分岐A: 元動画が標準 AAC-LC であり、直接パケット抽出に成功している場合
@@ -1030,13 +1163,21 @@ async function prepareAudioPipeline(
     }
 
     // 分岐B: WebCodecs AudioEncoder が利用可能な場合
-    // （元動画が HE-AAC / SBR / PS、Opus、MP3 等の場合、または直接抽出が0チャンクだった場合に
-    //   全端末で100%再生可能なクリーンな AAC-LC (mp4a.40.2) へ変換）
-    if (typeof window.AudioEncoder !== 'undefined') {
+    // （元動画が HE-AAC / SBR / PS、Opus、MP3 等の場合、または直接抽出が失敗/0チャンクだった場合に
+    //   ステップ1の成否に関わらず独立して実行し、全端末で100%再生可能なクリーンな AAC-LC へ変換）
+    if ((!mediabunnyConfirmedNoAudio || hasDetectedSourceAudio) && typeof window.AudioEncoder !== 'undefined') {
       try {
         onProgress('音声トラックを標準AAC形式へ最適化中...');
-        const decodedBuffer = await decodeAudioFileToBuffer(videoFile, audioTrack, duration);
+        const decodedBuffer = await decodeAudioFileToBuffer(
+          videoFile,
+          audioTrack,
+          duration,
+          mediaBuffer
+        );
         if (decodedBuffer && decodedBuffer.length > 0) {
+          hasDetectedSourceAudio = true;
+          const encodeDuration =
+            duration > 0 && Number.isFinite(duration) ? duration : decodedBuffer.duration;
           const supportedAudioConfig = await findSupportedAudioConfig(
             decodedBuffer.sampleRate,
             decodedBuffer.numberOfChannels
@@ -1057,11 +1198,10 @@ async function prepareAudioPipeline(
               normalizedAudio,
               supportedAudioConfig.encoderConfig,
               supportedAudioConfig.muxerCodec,
-              duration
+              encodeDuration
             );
 
             if (encodedChunks.length > 0) {
-              // メモリ節約のため不要になった直接抽出チャンクをクリア
               directChunks = [];
               return {
                 audioConfig: {
@@ -1093,8 +1233,6 @@ async function prepareAudioPipeline(
         hasSourceAudio: true,
       };
     }
-  } catch (err) {
-    console.warn('Audio pipeline preparation encountered an error:', err);
   } finally {
     if (input) {
       try {
@@ -1104,9 +1242,13 @@ async function prepareAudioPipeline(
   }
 
   // 分岐D: 音声トラックなし動画（または抽出不能）
+  // ※ Mediabunny が正常にコンテナを解析して「音声トラックなし(null)」と確認でき、
+  //    かつ videoElement でも音声が検出されていない場合のみ hasSourceAudio = false とする。
+  //    読み取りエラー等で解析自体が失敗した場合は true とし、無音のままサイレント出力されるのを防ぐ。
+  const trulyNoAudio = mediabunnyConfirmedNoAudio && !hasDetectedSourceAudio;
   return {
     chunks: [],
-    hasSourceAudio: Boolean(audioTrack),
+    hasSourceAudio: !trulyNoAudio,
   };
 }
 
@@ -1247,6 +1389,19 @@ export async function exportMosaicVideo(
     const rawH = videoElement.videoHeight || 360;
     const { width: videoWidth, height: videoHeight } = getClampedDimensions(rawW, rawH, 1280);
 
+    // オンメモリ ArrayBuffer の確保（スマホでの File 参照期限切れ NotReadableError を完全回避）
+    let activeBuffer: ArrayBuffer | null =
+      options.mediaBuffer && options.mediaBuffer.byteLength > 0
+        ? options.mediaBuffer
+        : null;
+    if (!activeBuffer && videoFile.size <= 250 * 1024 * 1024) {
+      try {
+        activeBuffer = await videoFile.arrayBuffer();
+      } catch (_) {
+        activeBuffer = null;
+      }
+    }
+
     // 【革新】Mediabunny + WebCodecs による動画トラックのネイティブFPS検出とハードウェア直接デコードの準備
     let videoTrack: InputVideoTrack | null = null;
     let canUseDirectDecoder = false;
@@ -1254,18 +1409,17 @@ export async function exportMosaicVideo(
     let totalVideoPackets = 0;
 
     try {
+      const videoSource = await createMediabunnySource(videoFile, activeBuffer);
       videoInput = new Input({
         formats: ALL_FORMATS,
-        source: new BlobSource(videoFile),
+        source: videoSource,
       });
 
       const primaryVideo = await videoInput.getPrimaryVideoTrack();
-      if (primaryVideo && (await primaryVideo.canDecode().catch(() => false))) {
-        videoTrack = primaryVideo;
-        canUseDirectDecoder = true;
-
+      if (primaryVideo) {
+        // 1. まずメタデータ（stts/stsz）から正確な総フレーム数とネイティブFPSを取得（canDecodeの成否に関わらず実行）
         try {
-          const stats = await primaryVideo.computePacketStats(60);
+          const stats = await primaryVideo.computePacketStats();
           if (stats && stats.averagePacketRate > 0) {
             const rawFps = stats.averagePacketRate;
             // スマートフォンや一般的なカメラの主要フレームレートに整合
@@ -1281,22 +1435,43 @@ export async function exportMosaicVideo(
             }
           }
         } catch (_) {}
+
+        // 2. WebCodecs 直接デコードが可能か判定
+        if (await primaryVideo.canDecode().catch(() => false)) {
+          videoTrack = primaryVideo;
+          canUseDirectDecoder = true;
+        } else {
+          try {
+            videoInput.dispose();
+          } catch (_) {}
+          videoInput = null;
+        }
       }
     } catch (inputErr) {
       console.warn('Mediabunny videoTrack init failed, will use videoElement fallback:', inputErr);
       canUseDirectDecoder = false;
+      if (videoInput) {
+        try {
+          videoInput.dispose();
+        } catch (_) {}
+        videoInput = null;
+      }
     }
 
-    const fps = canUseDirectDecoder ? nativeFps : 30;
+    const fps = nativeFps || 30;
     const totalFrames =
       totalVideoPackets > 0
         ? totalVideoPackets
-        : Math.max(1, Math.floor(duration * fps));
+        : Math.max(1, Math.round(duration * fps));
 
     // フォールバック用のクリーン動画要素を準備（CanvasSink が万一使えない環境用）
     if (!canUseDirectDecoder) {
       try {
-        dedicatedVideoUrl = URL.createObjectURL(videoFile);
+        const cleanBlob =
+          activeBuffer && activeBuffer.byteLength > 0
+            ? new Blob([activeBuffer], { type: videoFile.type || 'video/mp4' })
+            : videoFile;
+        dedicatedVideoUrl = URL.createObjectURL(cleanBlob);
         const cleanVideo = document.createElement('video');
         cleanVideo.crossOrigin = 'anonymous';
         cleanVideo.preload = 'auto';
@@ -1351,13 +1526,29 @@ export async function exportMosaicVideo(
     const srcCtx = sourceCanvas.getContext('2d');
     if (!srcCtx) throw new Error('Source canvas context error');
 
-    // 1. 音声トラックの解析・準備（完全な AudioSpecificConfig / esds 保証付き）
+    // 1. 音声トラックの解析・準備（事前キャッシュ優先 ＋ BufferSource ＋ 完全な esds 保証付き）
     const shouldIncludeAudio = options.includeAudio !== false;
-    const audioPipeline = shouldIncludeAudio
-      ? await prepareAudioPipeline(videoFile, duration, (status) => {
+    let audioPipeline: PreparedAudioPipeline;
+    if (!shouldIncludeAudio) {
+      audioPipeline = { audioConfig: undefined, chunks: [], hasSourceAudio: false };
+    } else if (
+      options.cachedAudioPipeline &&
+      options.cachedAudioPipeline.audioConfig &&
+      options.cachedAudioPipeline.chunks.length > 0
+    ) {
+      // ファイル読み込み直後に事前抽出・キャッシュされた音声チャンクを複製して即座に使用
+      audioPipeline = cloneAudioPipeline(options.cachedAudioPipeline, duration);
+    } else {
+      audioPipeline = await prepareAudioPipeline(
+        videoFile,
+        duration,
+        (status) => {
           onProgress({ currentFrame: 0, totalFrames, percent: 0, status });
-        })
-      : { audioConfig: undefined, chunks: [], hasSourceAudio: false };
+        },
+        activeBuffer,
+        videoElement
+      );
+    }
 
     // 元動画に音声が存在し、かつユーザーが音声ONを選択しているのに抽出できなかった場合はサイレント無音化を防ぐ
     if (
@@ -1509,7 +1700,11 @@ export async function exportMosaicVideo(
     if (frameCount === 0) {
       if (!dedicatedVideoUrl) {
         try {
-          dedicatedVideoUrl = URL.createObjectURL(videoFile);
+          const cleanBlob =
+            activeBuffer && activeBuffer.byteLength > 0
+              ? new Blob([activeBuffer], { type: videoFile.type || 'video/mp4' })
+              : videoFile;
+          dedicatedVideoUrl = URL.createObjectURL(cleanBlob);
           const cleanVideo = document.createElement('video');
           cleanVideo.crossOrigin = 'anonymous';
           cleanVideo.preload = 'auto';

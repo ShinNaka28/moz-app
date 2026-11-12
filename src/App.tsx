@@ -8,7 +8,7 @@ import { ExportModal } from './components/ExportModal';
 import { EditorMode, MosaicTrack, MosaicType, Point, Keyframe, NormalizedPoint } from './types';
 import { Film, ListFilter, Clock, Play, Pause, RotateCcw, Trash2, Crosshair, Sparkles, AlertTriangle, X, ChevronLeft, ChevronRight, ChevronFirst, ChevronLast } from 'lucide-react';
 import { initFaceDetector, initPersonSegmenter, detectFacesSafely, segmentPersonSafely, resampleClosedPolygon, BODY_CONTOUR_POINTS, updatePersonTracks, expandBoxWithMargin, estimateBodyBoxFromFace, extractHeadBoxFromBodyBox, createBodySilhouettePolygon, isValidFaceDetection, FaceFilterOptions, GatekeeperContext, resetAnalysisState, calcIoU } from './utils/aiDetector';
-import { exportMosaicVideo, ExportProgress, saveOrShareBlob, isWebCodecsSupported, isInAppBrowser } from './utils/videoExporter';
+import { exportMosaicVideo, ExportProgress, saveOrShareBlob, isWebCodecsSupported, isInAppBrowser, prepareAudioPipeline, PreparedAudioPipeline } from './utils/videoExporter';
 import { generateDemoVideoBlob } from './utils/sampleGenerator';
 import { renderTrackMosaic, renderInverseMosaic, ProtectedRegion } from './utils/mosaicRenderer';
 import { extractFeaturePoints, toGrayscale, trackBox, interpolateKeyframes } from './utils/tracking';
@@ -51,18 +51,37 @@ export const App: React.FC = () => {
   // 要素参照
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const imageRef = useRef<HTMLImageElement | null>(null);
+  const mediaBufferRef = useRef<ArrayBuffer | null>(null);
+  const cachedAudioPipelineRef = useRef<PreparedAudioPipeline | null>(null);
 
   // ファイルオープンハンドラ
-  const handleOpenFile = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleOpenFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
 
     if (mediaUrl) URL.revokeObjectURL(mediaUrl);
 
-    const url = URL.createObjectURL(file);
     const isImg = file.type.startsWith('image/');
+    let fileToUse = file;
+    let loadedBuffer: ArrayBuffer | null = null;
 
-    setMediaFile(file);
+    try {
+      // OSファイルハンドルの失効やBlobストリーム競合を防ぐため、選択直後にオンメモリ化する
+      loadedBuffer = await file.arrayBuffer();
+      fileToUse = new File([loadedBuffer], file.name, {
+        type: file.type || (isImg ? 'image/png' : 'video/mp4'),
+        lastModified: file.lastModified,
+      });
+    } catch (readErr) {
+      console.warn('In-memory buffer preload warning, falling back to direct File:', readErr);
+    }
+
+    mediaBufferRef.current = loadedBuffer;
+    cachedAudioPipelineRef.current = null;
+
+    const url = URL.createObjectURL(fileToUse);
+
+    setMediaFile(fileToUse);
     setMediaUrl(url);
     setIsImage(isImg);
     setTracks([]);
@@ -73,6 +92,17 @@ export const App: React.FC = () => {
 
     if (isImg) {
       setDuration(1);
+    } else {
+      // 読み込み直後のクリーンなメモリ状態で音声トラックを事前抽出してキャッシュする
+      prepareAudioPipeline(fileToUse, 0, () => {}, loadedBuffer)
+        .then((pipeline) => {
+          if (mediaBufferRef.current === loadedBuffer && pipeline.chunks.length > 0) {
+            cachedAudioPipelineRef.current = pipeline;
+          }
+        })
+        .catch((err) => {
+          console.warn('Background audio pre-extraction warning:', err);
+        });
     }
   };
 
@@ -81,6 +111,16 @@ export const App: React.FC = () => {
     try {
       const demoFile = await generateDemoVideoBlob();
       if (mediaUrl) URL.revokeObjectURL(mediaUrl);
+
+      let loadedBuffer: ArrayBuffer | null = null;
+      try {
+        loadedBuffer = await demoFile.arrayBuffer();
+      } catch {
+        // ignore
+      }
+      mediaBufferRef.current = loadedBuffer;
+      cachedAudioPipelineRef.current = null;
+
       const url = URL.createObjectURL(demoFile);
 
       setMediaFile(demoFile);
@@ -91,6 +131,16 @@ export const App: React.FC = () => {
       setCurrentTime(0);
       setIsPlaying(false);
       setDurationWarning(false);
+
+      prepareAudioPipeline(demoFile, 0, () => {}, loadedBuffer)
+        .then((pipeline) => {
+          if (mediaBufferRef.current === loadedBuffer && pipeline.chunks.length > 0) {
+            cachedAudioPipelineRef.current = pipeline;
+          }
+        })
+        .catch(() => {
+          // ignore
+        });
     } catch (e) {
       console.error('Demo video generation failed:', e);
       alert('デモ動画の生成に失敗しました');
@@ -1385,6 +1435,8 @@ export const App: React.FC = () => {
             inverseMosaicType,
             inverseStrength,
             includeAudio,
+            mediaBuffer: mediaBufferRef.current,
+            cachedAudioPipeline: cachedAudioPipelineRef.current,
           },
           (prog) => setExportProgress(prog)
         );
