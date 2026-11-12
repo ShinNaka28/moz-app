@@ -66,7 +66,7 @@ export async function releaseScreenWakeLock() {
 export async function seekVideoSafely(
   video: HTMLVideoElement,
   targetTime: number,
-  timeoutMs: number = 1500
+  timeoutMs: number = 800
 ): Promise<void> {
   if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
     await new Promise<void>((resolve) => {
@@ -80,7 +80,7 @@ export async function seekVideoSafely(
       setTimeout(() => {
         document.removeEventListener('visibilitychange', onVisible);
         resolve();
-      }, 2500);
+      }, 1500);
     });
   }
 
@@ -92,7 +92,7 @@ export async function seekVideoSafely(
     return;
   }
 
-  // もし前のシークが進行中の場合は、ハードウェアデコーダーの衝突を防ぐため最大600ms待機
+  // もし前のシークが進行中の場合は、ハードウェアデコーダーの衝突を防ぐため最大300ms待機
   if (video.seeking) {
     await new Promise<void>((res) => {
       let done = false;
@@ -101,7 +101,7 @@ export async function seekVideoSafely(
           done = true;
           res();
         }
-      }, 600);
+      }, 300);
       video.addEventListener(
         'seeked',
         () => {

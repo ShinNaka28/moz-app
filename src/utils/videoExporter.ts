@@ -644,6 +644,7 @@ interface PreparedAudioPipeline {
     sampleRate: number;
   };
   chunks: PreparedAudioChunk[];
+  hasSourceAudio?: boolean;
 }
 
 /**
@@ -1024,6 +1025,7 @@ async function prepareAudioPipeline(
           sampleRate: directSampleRate,
         },
         chunks: directChunks,
+        hasSourceAudio: true,
       };
     }
 
@@ -1068,6 +1070,7 @@ async function prepareAudioPipeline(
                   sampleRate: normalizedAudio.sampleRate,
                 },
                 chunks: encodedChunks,
+                hasSourceAudio: true,
               };
             }
           }
@@ -1087,6 +1090,7 @@ async function prepareAudioPipeline(
           sampleRate: directSampleRate,
         },
         chunks: directChunks,
+        hasSourceAudio: true,
       };
     }
   } catch (err) {
@@ -1099,9 +1103,10 @@ async function prepareAudioPipeline(
     }
   }
 
-  // 分岐D: 音声トラックなし動画
+  // 分岐D: 音声トラックなし動画（または抽出不能）
   return {
     chunks: [],
+    hasSourceAudio: Boolean(audioTrack),
   };
 }
 
@@ -1352,7 +1357,18 @@ export async function exportMosaicVideo(
       ? await prepareAudioPipeline(videoFile, duration, (status) => {
           onProgress({ currentFrame: 0, totalFrames, percent: 0, status });
         })
-      : { audioConfig: undefined, chunks: [] };
+      : { audioConfig: undefined, chunks: [], hasSourceAudio: false };
+
+    // 元動画に音声が存在し、かつユーザーが音声ONを選択しているのに抽出できなかった場合はサイレント無音化を防ぐ
+    if (
+      shouldIncludeAudio &&
+      audioPipeline.hasSourceAudio &&
+      (!audioPipeline.audioConfig || audioPipeline.chunks.length === 0)
+    ) {
+      throw new Error(
+        '元動画の音声トラックの抽出・エンコードに失敗しました。\n音声を含めずに書き出す場合は、ヘッダーの「音声OFF」に切り替えてから再度保存してください。'
+      );
+    }
 
     const hasValidAudio = Boolean(audioPipeline.audioConfig && audioPipeline.chunks.length > 0);
 

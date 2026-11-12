@@ -80,19 +80,19 @@ export const Header: React.FC<HeaderProps> = ({
           <button
             onClick={onToggleAudio}
             disabled={isProcessing}
-            className={`flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-semibold rounded-lg border transition shadow-sm ${
+            className={`flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-semibold rounded-lg border transition shadow-sm mr-1 sm:mr-2 ${
               includeAudio
                 ? 'bg-slate-800 hover:bg-slate-700 border-slate-700 text-slate-200'
-                : 'bg-rose-950/70 hover:bg-rose-900/80 border-rose-700/60 text-rose-300'
+                : 'bg-rose-950/80 hover:bg-rose-900 border-rose-600/80 text-rose-300 ring-1 ring-rose-500'
             }`}
             title={includeAudio ? '音声あり（クリックでミュート出力に切替）' : '音声なし（クリックで音声ありに切替）'}
           >
             {includeAudio ? (
-              <Volume2 size={14} className="text-cyan-400" />
+              <Volume2 size={14} className="text-cyan-400 shrink-0" />
             ) : (
-              <VolumeX size={14} className="text-rose-400" />
+              <VolumeX size={14} className="text-rose-400 shrink-0" />
             )}
-            <span className="hidden sm:inline">{includeAudio ? '音声あり' : '音声なし'}</span>
+            <span className="text-[11px] font-bold">{includeAudio ? '音声ON' : '音声OFF'}</span>
           </button>
         )}
 

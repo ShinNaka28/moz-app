@@ -502,6 +502,7 @@ export interface GatekeeperContext {
   }>;
   origWidth: number;
   origHeight: number;
+  sensitivity?: 'strict' | 'standard' | 'high';
 }
 
 /**
@@ -1349,7 +1350,9 @@ export async function segmentPersonSafely(
       const isHandArmShape = skinSolidity >= 0.28 && skinSolidity <= 0.88;
 
       // 静止し続けている広大なベージュ背景は除外、本物の人体手足（動体 or 境界接地 or 塊）のみ救済
-      if ((hasMotion || isBorder || context?.prevBox) && isHandArmShape) {
+      // （※「高精度（手を除外）」時は、前フレームと無関係に画面端から入ってきた単独の手や指先の誤拡張を抑制）
+      const isIsolatedHand = context?.sensitivity === 'strict' && !context.prevBox && (skinW < ANALYSIS_W * 0.18 || skinH < ANALYSIS_H * 0.18);
+      if ((hasMotion || isBorder || context?.prevBox) && isHandArmShape && !isIsolatedHand) {
         for (let i = 0; i < TOTAL_ANALYSIS_PIXELS; i++) {
           if (skinMask[i]) {
             personProb[i] = Math.max(personProb[i], 0.92);

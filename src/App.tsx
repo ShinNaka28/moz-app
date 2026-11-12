@@ -601,6 +601,7 @@ export const App: React.FC = () => {
           })),
           origWidth: workW,
           origHeight: workH,
+          sensitivity: aiSensitivity,
         };
 
         const res = await segmentPersonSafely(img, segmenter, gateContext);
@@ -714,6 +715,7 @@ export const App: React.FC = () => {
               })),
               origWidth: workW,
               origHeight: workH,
+              sensitivity: aiSensitivity,
             };
 
             const res = await segmentPersonSafely(video, segmenter, gateContext);
@@ -1181,6 +1183,18 @@ export const App: React.FC = () => {
                 });
               }
             }
+            const lastKf = kfsCopy[kfsCopy.length - 1];
+            let trackEnd = Math.min(totalDuration, lastKf.time + 1.2);
+            if (totalDuration - lastKf.time <= 1.2) {
+              trackEnd = totalDuration;
+              if (lastKf.time < totalDuration) {
+                kfsCopy.push({
+                  ...lastKf,
+                  time: totalDuration,
+                });
+              }
+            }
+
             newTracks.push({
               id: `ai-track-${personId}-${Date.now()}`,
               name: targetMode === 'body' ? `AI人物 (体ライン) #${personId}` : `AI顔 #${personId}`,
@@ -1190,7 +1204,7 @@ export const App: React.FC = () => {
               mosaicType: 'pixel',
               strength: 14,
               startTime: trackStart,
-              endTime: kfsCopy[kfsCopy.length - 1].time + 0.3,
+              endTime: trackEnd,
               keyframes: kfsCopy,
               aiPersonId: personId,
               aiTarget: targetMode,
@@ -1818,6 +1832,8 @@ export const App: React.FC = () => {
         progress={exportProgress}
         exportedBlob={exportedBlob}
         isImage={isImage}
+        includeAudio={includeAudio}
+        onToggleAudio={() => setIncludeAudio((prev) => !prev)}
       />
     </div>
   );

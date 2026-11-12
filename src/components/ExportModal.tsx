@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { ExportProgress, saveOrShareBlob } from '../utils/videoExporter';
-import { Download, Share2, CheckCircle2, Loader2, X, ArrowLeft, Play, Eye, Sun, AlertTriangle } from 'lucide-react';
+import { Download, Share2, CheckCircle2, Loader2, X, ArrowLeft, Play, Eye, Sun, AlertTriangle, Volume2, VolumeX } from 'lucide-react';
 import { APP_VERSION } from '../version';
 
 interface ExportModalProps {
@@ -9,6 +9,8 @@ interface ExportModalProps {
   progress: ExportProgress | null;
   exportedBlob: Blob | null;
   isImage: boolean;
+  includeAudio?: boolean;
+  onToggleAudio?: () => void;
 }
 
 export const ExportModal: React.FC<ExportModalProps> = ({
@@ -17,6 +19,8 @@ export const ExportModal: React.FC<ExportModalProps> = ({
   progress,
   exportedBlob,
   isImage,
+  includeAudio = true,
+  onToggleAudio,
 }) => {
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
 
@@ -130,6 +134,24 @@ export const ExportModal: React.FC<ExportModalProps> = ({
               </span>
             </div>
 
+            {/* 音声出力ステータス明示 */}
+            {!isImage && (
+              <div className="flex items-center justify-between p-2.5 bg-slate-950/80 rounded-xl border border-slate-800 text-xs">
+                <span className="text-slate-400 font-medium">出力音声設定:</span>
+                {includeAudio ? (
+                  <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-cyan-950/80 border border-cyan-500/50 text-cyan-300 font-bold">
+                    <Volume2 size={13} className="text-cyan-400" />
+                    <span>音声あり（元の音声を保持）</span>
+                  </span>
+                ) : (
+                  <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-rose-950/80 border border-rose-500/60 text-rose-300 font-bold">
+                    <VolumeX size={13} className="text-rose-400" />
+                    <span>音声なし（無音で出力）</span>
+                  </span>
+                )}
+              </div>
+            )}
+
             {/* 画面消灯防止バッジ */}
             <div className="flex items-center gap-2 p-2.5 bg-indigo-950/70 border border-indigo-700/60 rounded-xl text-indigo-200 text-[11px] leading-relaxed">
               <Sun size={16} className="text-amber-400 shrink-0 animate-pulse" />
@@ -152,9 +174,24 @@ export const ExportModal: React.FC<ExportModalProps> = ({
                 <Eye size={14} />
                 <span>再生してモザイクの追従と音声をご確認ください</span>
               </span>
-              <span className="font-mono bg-slate-950 px-2 py-0.5 rounded border border-slate-800 text-slate-300">
-                {formatFileSize(exportedBlob.size)}
-              </span>
+              <div className="flex items-center gap-2">
+                {!isImage && (
+                  includeAudio ? (
+                    <span className="inline-flex items-center gap-1 text-[11px] font-bold text-cyan-300 bg-cyan-950/80 px-2 py-0.5 rounded border border-cyan-500/40">
+                      <Volume2 size={12} className="text-cyan-400" />
+                      <span>音声あり</span>
+                    </span>
+                  ) : (
+                    <span className="inline-flex items-center gap-1 text-[11px] font-bold text-rose-300 bg-rose-950/80 px-2 py-0.5 rounded border border-rose-500/50">
+                      <VolumeX size={12} className="text-rose-400" />
+                      <span>音声なし</span>
+                    </span>
+                  )
+                )}
+                <span className="font-mono bg-slate-950 px-2 py-0.5 rounded border border-slate-800 text-slate-300">
+                  {formatFileSize(exportedBlob.size)}
+                </span>
+              </div>
             </div>
 
             {/* プレビューメディアプレーヤー */}
