@@ -38,6 +38,30 @@ interface MuxerOutputTarget {
 }
 
 /**
+ * OPFS（Origin Private File System）に残っている一時エクスポートファイルを完全削除
+ * （アプリ起動時・モーダル終了時・新規ファイル読み込み時に呼び出し、スマホへのキャッシュ残存を100%防止）
+ */
+export async function cleanupOpfsTempFiles(): Promise<void> {
+  if (
+    typeof navigator === 'undefined' ||
+    !navigator.storage ||
+    typeof navigator.storage.getDirectory !== 'function'
+  ) {
+    return;
+  }
+  try {
+    const root = await navigator.storage.getDirectory();
+    for await (const [name] of (root as any).entries()) {
+      if (name.startsWith('export_temp_') && name.endsWith('.mp4')) {
+        await root.removeEntry(name).catch(() => {});
+      }
+    }
+  } catch (_) {
+    // ignore
+  }
+}
+
+/**
  * MP4 出力ターゲットの初期化
  *
  * 【重要バグ修正】:
@@ -60,16 +84,8 @@ async function prepareMuxerTarget(durationSec: number): Promise<MuxerOutputTarge
 
   if (useOpfsForLongVideo) {
     try {
+      await cleanupOpfsTempFiles();
       const root = await navigator.storage.getDirectory();
-
-      // 過去の一時エクスポートファイルを安全にクリーンアップ
-      try {
-        for await (const [name] of (root as any).entries()) {
-          if (name.startsWith('export_temp_') && name.endsWith('.mp4')) {
-            await root.removeEntry(name).catch(() => {});
-          }
-        }
-      } catch (_) {}
 
       const tempFileName = `export_temp_${Date.now()}_${Math.random().toString(36).slice(2)}.mp4`;
       const draftHandle = await root.getFileHandle(tempFileName, { create: true });
@@ -1379,6 +1395,7 @@ export async function exportMosaicVideo(
   let activeVideo: HTMLVideoElement = videoElement;
   let dedicatedVideoUrl: string | null = null;
   let videoInput: Input | null = null;
+  let activeBuffer: ArrayBuffer | null = null;
 
   try {
     videoElement.pause();
@@ -1389,12 +1406,12 @@ export async function exportMosaicVideo(
     const rawH = videoElement.videoHeight || 360;
     const { width: videoWidth, height: videoHeight } = getClampedDimensions(rawW, rawH, 1280);
 
-    // オンメモリ ArrayBuffer の確保（スマホでの File 参照期限切れ NotReadableError を完全回避）
-    let activeBuffer: ArrayBuffer | null =
+    // オンメモリ ArrayBuffer の一時確保（エクスポート中のみ使用し、完了後または不要になり次第即座に解放）
+    activeBuffer =
       options.mediaBuffer && options.mediaBuffer.byteLength > 0
         ? options.mediaBuffer
         : null;
-    if (!activeBuffer && videoFile.size <= 250 * 1024 * 1024) {
+    if (!activeBuffer && videoFile.size <= 150 * 1024 * 1024) {
       try {
         activeBuffer = await videoFile.arrayBuffer();
       } catch (_) {
@@ -1467,11 +1484,7 @@ export async function exportMosaicVideo(
     // フォールバック用のクリーン動画要素を準備（CanvasSink が万一使えない環境用）
     if (!canUseDirectDecoder) {
       try {
-        const cleanBlob =
-          activeBuffer && activeBuffer.byteLength > 0
-            ? new Blob([activeBuffer], { type: videoFile.type || 'video/mp4' })
-            : videoFile;
-        dedicatedVideoUrl = URL.createObjectURL(cleanBlob);
+        dedicatedVideoUrl = URL.createObjectURL(videoFile);
         const cleanVideo = document.createElement('video');
         cleanVideo.crossOrigin = 'anonymous';
         cleanVideo.preload = 'auto';
@@ -1548,6 +1561,11 @@ export async function exportMosaicVideo(
         activeBuffer,
         videoElement
       );
+    }
+
+    // 直接デコーダ(CanvasSink)を使わない場合は、この時点でオンメモリ ArrayBuffer の役目が完了するため即座に解放してRAMを空ける
+    if (!canUseDirectDecoder) {
+      activeBuffer = null;
     }
 
     // 元動画に音声が存在し、かつユーザーが音声ONを選択しているのに抽出できなかった場合はサイレント無音化を防ぐ
@@ -1698,13 +1716,10 @@ export async function exportMosaicVideo(
     // パイプライン2: 【フォールバック・シーク方式】
     // 直接デコード非対応時、または万一の例外発生時に安全に実行
     if (frameCount === 0) {
+      activeBuffer = null;
       if (!dedicatedVideoUrl) {
         try {
-          const cleanBlob =
-            activeBuffer && activeBuffer.byteLength > 0
-              ? new Blob([activeBuffer], { type: videoFile.type || 'video/mp4' })
-              : videoFile;
-          dedicatedVideoUrl = URL.createObjectURL(cleanBlob);
+          dedicatedVideoUrl = URL.createObjectURL(videoFile);
           const cleanVideo = document.createElement('video');
           cleanVideo.crossOrigin = 'anonymous';
           cleanVideo.preload = 'auto';
@@ -1816,10 +1831,12 @@ export async function exportMosaicVideo(
 
     return await outputTarget.finalizeAndGetBlob();
   } finally {
+    activeBuffer = null;
     if (videoInput) {
       try {
         (videoInput as any).dispose?.();
       } catch (_) {}
+      videoInput = null;
     }
     if (dedicatedVideoUrl) {
       try {

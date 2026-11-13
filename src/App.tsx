@@ -8,7 +8,7 @@ import { ExportModal } from './components/ExportModal';
 import { EditorMode, MosaicTrack, MosaicType, Point, Keyframe, NormalizedPoint } from './types';
 import { Film, ListFilter, Clock, Play, Pause, RotateCcw, Trash2, Crosshair, Sparkles, AlertTriangle, X, ChevronLeft, ChevronRight, ChevronFirst, ChevronLast } from 'lucide-react';
 import { initFaceDetector, initPersonSegmenter, detectFacesSafely, segmentPersonSafely, resampleClosedPolygon, BODY_CONTOUR_POINTS, updatePersonTracks, expandBoxWithMargin, estimateBodyBoxFromFace, extractHeadBoxFromBodyBox, createBodySilhouettePolygon, isValidFaceDetection, FaceFilterOptions, GatekeeperContext, resetAnalysisState, calcIoU } from './utils/aiDetector';
-import { exportMosaicVideo, ExportProgress, saveOrShareBlob, isWebCodecsSupported, isInAppBrowser, prepareAudioPipeline, PreparedAudioPipeline } from './utils/videoExporter';
+import { exportMosaicVideo, ExportProgress, saveOrShareBlob, isWebCodecsSupported, isInAppBrowser, prepareAudioPipeline, PreparedAudioPipeline, cleanupOpfsTempFiles } from './utils/videoExporter';
 import { generateDemoVideoBlob } from './utils/sampleGenerator';
 import { renderTrackMosaic, renderInverseMosaic, ProtectedRegion } from './utils/mosaicRenderer';
 import { extractFeaturePoints, toGrayscale, trackBox, interpolateKeyframes } from './utils/tracking';
@@ -51,33 +51,65 @@ export const App: React.FC = () => {
   // 要素参照
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const imageRef = useRef<HTMLImageElement | null>(null);
-  const mediaBufferRef = useRef<ArrayBuffer | null>(null);
+  const sessionTokenRef = useRef<number>(0);
   const cachedAudioPipelineRef = useRef<PreparedAudioPipeline | null>(null);
+
+  // アプリ起動時・終了時に万一残っている一時ファイル（OPFS）を完全クリーンアップ
+  useEffect(() => {
+    cleanupOpfsTempFiles();
+    const handlePageHide = () => {
+      cachedAudioPipelineRef.current = null;
+      cleanupOpfsTempFiles();
+    };
+    window.addEventListener('pagehide', handlePageHide);
+    return () => {
+      window.removeEventListener('pagehide', handlePageHide);
+      cachedAudioPipelineRef.current = null;
+      cleanupOpfsTempFiles();
+    };
+  }, []);
+
+  // エクスポートモーダルを閉じる際に完成動画Blobと一時ファイルを即座にメモリ・ストレージから解放
+  const handleCloseExportModal = useCallback(() => {
+    setIsExportModalOpen(false);
+    setExportedBlob(null);
+    setExportProgress(null);
+    cleanupOpfsTempFiles();
+  }, []);
 
   // ファイルオープンハンドラ
   const handleOpenFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
 
+    const token = ++sessionTokenRef.current;
     if (mediaUrl) URL.revokeObjectURL(mediaUrl);
+
+    // 前回の完成動画データや音声キャッシュ・OPFS一時ファイルを即座に解放
+    cachedAudioPipelineRef.current = null;
+    setExportedBlob(null);
+    setExportProgress(null);
+    cleanupOpfsTempFiles();
 
     const isImg = file.type.startsWith('image/');
     let fileToUse = file;
-    let loadedBuffer: ArrayBuffer | null = null;
+    let tempBuffer: ArrayBuffer | null = null;
 
-    try {
-      // OSファイルハンドルの失効やBlobストリーム競合を防ぐため、選択直後にオンメモリ化する
-      loadedBuffer = await file.arrayBuffer();
-      fileToUse = new File([loadedBuffer], file.name, {
-        type: file.type || (isImg ? 'image/png' : 'video/mp4'),
-        lastModified: file.lastModified,
-      });
-    } catch (readErr) {
-      console.warn('In-memory buffer preload warning, falling back to direct File:', readErr);
+    // 150MB以下のファイルは選択直後にオンメモリ File 化し、OSファイル参照切れを防止
+    // ※ tempBuffer(ArrayBuffer) は音声の事前抽出が完了した瞬間に null 破棄し、RAM二重保持を防ぐ
+    const MAX_IN_MEMORY_FILE_SIZE = 150 * 1024 * 1024;
+    if (file.size <= MAX_IN_MEMORY_FILE_SIZE) {
+      try {
+        tempBuffer = await file.arrayBuffer();
+        fileToUse = new File([tempBuffer], file.name, {
+          type: file.type || (isImg ? 'image/png' : 'video/mp4'),
+          lastModified: file.lastModified,
+        });
+      } catch (readErr) {
+        console.warn('In-memory file preload warning, falling back to direct File:', readErr);
+        tempBuffer = null;
+      }
     }
-
-    mediaBufferRef.current = loadedBuffer;
-    cachedAudioPipelineRef.current = null;
 
     const url = URL.createObjectURL(fileToUse);
 
@@ -91,12 +123,16 @@ export const App: React.FC = () => {
     setDurationWarning(false);
 
     if (isImg) {
+      tempBuffer = null;
       setDuration(1);
     } else {
-      // 読み込み直後のクリーンなメモリ状態で音声トラックを事前抽出してキャッシュする
-      prepareAudioPipeline(fileToUse, 0, () => {}, loadedBuffer)
+      // 読み込み直後のクリーンな状態で音声パケットのみ事前抽出（約数十KB〜1MB程度）し、
+      // 完了直後に巨大な tempBuffer は即座に破棄してスマホのRAMを解放する
+      const bufForAudio = tempBuffer;
+      tempBuffer = null;
+      prepareAudioPipeline(fileToUse, 0, () => {}, bufForAudio)
         .then((pipeline) => {
-          if (mediaBufferRef.current === loadedBuffer && pipeline.chunks.length > 0) {
+          if (sessionTokenRef.current === token && pipeline.chunks.length > 0) {
             cachedAudioPipelineRef.current = pipeline;
           }
         })
@@ -110,16 +146,20 @@ export const App: React.FC = () => {
   const handleLoadDemo = async () => {
     try {
       const demoFile = await generateDemoVideoBlob();
+      const token = ++sessionTokenRef.current;
       if (mediaUrl) URL.revokeObjectURL(mediaUrl);
 
-      let loadedBuffer: ArrayBuffer | null = null;
-      try {
-        loadedBuffer = await demoFile.arrayBuffer();
-      } catch {
-        // ignore
-      }
-      mediaBufferRef.current = loadedBuffer;
       cachedAudioPipelineRef.current = null;
+      setExportedBlob(null);
+      setExportProgress(null);
+      cleanupOpfsTempFiles();
+
+      let tempBuffer: ArrayBuffer | null = null;
+      try {
+        tempBuffer = await demoFile.arrayBuffer();
+      } catch {
+        tempBuffer = null;
+      }
 
       const url = URL.createObjectURL(demoFile);
 
@@ -132,9 +172,11 @@ export const App: React.FC = () => {
       setIsPlaying(false);
       setDurationWarning(false);
 
-      prepareAudioPipeline(demoFile, 0, () => {}, loadedBuffer)
+      const bufForAudio = tempBuffer;
+      tempBuffer = null;
+      prepareAudioPipeline(demoFile, 0, () => {}, bufForAudio)
         .then((pipeline) => {
-          if (mediaBufferRef.current === loadedBuffer && pipeline.chunks.length > 0) {
+          if (sessionTokenRef.current === token && pipeline.chunks.length > 0) {
             cachedAudioPipelineRef.current = pipeline;
           }
         })
@@ -1435,7 +1477,6 @@ export const App: React.FC = () => {
             inverseMosaicType,
             inverseStrength,
             includeAudio,
-            mediaBuffer: mediaBufferRef.current,
             cachedAudioPipeline: cachedAudioPipelineRef.current,
           },
           (prog) => setExportProgress(prog)
@@ -1444,7 +1485,7 @@ export const App: React.FC = () => {
       } catch (err) {
         console.error('Export failed', err);
         alert('エクスポートに失敗しました: ' + (err as Error).message);
-        setIsExportModalOpen(false);
+        handleCloseExportModal();
       }
     }
   };
@@ -1880,7 +1921,7 @@ export const App: React.FC = () => {
       {/* エクスポート進行＆完成プレビューモーダル */}
       <ExportModal
         isOpen={isExportModalOpen}
-        onClose={() => setIsExportModalOpen(false)}
+        onClose={handleCloseExportModal}
         progress={exportProgress}
         exportedBlob={exportedBlob}
         isImage={isImage}
